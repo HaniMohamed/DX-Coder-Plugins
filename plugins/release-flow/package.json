@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "dxcoder-plugin-release-flow",
+  "version": "0.1.0",
+  "description": "Implement, pause for human approval, then ship: a DXcoder release flow",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./index.ts",
+    "./server": "./index.ts"
+  },
+  "files": ["index.ts"],
+  "scripts": {
+    "typecheck": "tsgo --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.29",
+    "effect": "^4.0.0"
+  }
+}

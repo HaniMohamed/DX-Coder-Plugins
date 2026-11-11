@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig.json",
+  "extends": "@tsconfig/bun/tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "noUncheckedIndexedAccess": false,
+    // Type-check against the DXcoder sources in the sibling checkout. At runtime the
+    // DXcoder host swaps these imports for its own instances, so nothing is bundled.
+    "paths": {
+      "@opencode/plugin": ["../gosi_coder/packages/plugin/src/promise/index.ts"],
+      "@opencode/plugin/*": ["../gosi_coder/packages/plugin/src/*"],
+      "effect": ["../gosi_coder/node_modules/effect"],
+      "effect/*": ["../gosi_coder/node_modules/effect/*"]
+    }
+  }
+}
