@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "dxcoder-plugin-jira-planner",
+  "version": "0.1.0",
+  "description": "Plan a Jira story against the repo, break it into estimated subtasks, audit existing subtasks, and push the gaps to Jira after approval",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./index.ts",
+    "./server": "./index.ts"
+  },
+  "files": ["index.ts", "src", "skills"],
+  "scripts": {
+    "typecheck": "tsgo --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "exceljs": "4.4.0",
+    "gray-matter": "4.0.3",
+    "mammoth": "1.13.0",
+    "unpdf": "2.1.0"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.29",
+    "effect": "^4.0.0"
+  }
+}
