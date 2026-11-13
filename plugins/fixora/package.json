@@ -8,10 +8,12 @@
   "exports": {
     ".": "./index.ts",
     "./server": "./index.ts",
+    "./tui": "./tui.tsx",
     "./rpc": "./src/rpc.ts"
   },
   "files": [
     "index.ts",
+    "tui.tsx",
     "src",
     "skills",
     "script"
@@ -27,6 +29,14 @@
   },
   "peerDependencies": {
     "@opencode/plugin": "^2.0.29",
-    "effect": "^4.0.0"
+    "effect": "^4.0.0",
+    "@opentui/core": ">=0.5.17",
+    "@opentui/solid": ">=0.5.17",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": { "optional": true },
+    "@opentui/solid": { "optional": true },
+    "solid-js": { "optional": true }
   }
 }

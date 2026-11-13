@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import { COMMAND, parseCommand, USAGE, type Flags } from "./src/command.js"
 import { prepareRun, presentList, refreshServices, runClean, runFeedback, runFix, runFixed, runList, runPaste, runReport, runRestart, runRetry, runStatus, runSync, runTop, startPipeline } from "./src/flows.js"
+import { ackGate, decideGate } from "./src/gate.js"
 import { decideAutoAllow, pendingCalls } from "./src/mcp.js"
 import { DEFAULTS, readOptions, type FixoraOptions } from "./src/options.js"
 import { guardWorkerShell, guardWorkerWrite, SHELL_TOOLS, WRITE_TOOLS } from "./src/permissions.js"
@@ -29,12 +30,17 @@ const summary = (r: RunRecord) => ({
   status: r.status,
   confidence: r.triage?.confidence,
   jiraKey: r.jiraKey,
+  jiraUrl: r.jiraUrl,
   mrUrl: r.mrUrl,
   mrStatus: r.mrStatus,
   branch: r.branch,
+  worktree: r.worktree,
+  originSessionID: r.originSessionID,
+  fixerSessionID: r.sessions.fixer,
   createdAt: r.createdAt,
   updatedAt: r.updatedAt,
   totalMs: r.totalMs,
+  error: r.error,
   counters: { fixRounds: r.counters.fixRounds, reviewRounds: r.counters.reviewRounds, feedback: r.counters.feedback, restarts: r.counters.restarts },
 })
 
@@ -143,6 +149,18 @@ export default Plugin.define({
           const controller = rt.inflight.get(i.runId)
           controller?.abort()
           return { cancelled: !!controller }
+        },
+        "run.ack": async (input) => {
+          const i = input as { runId: string; gateId: string }
+          return { accepted: ackGate(i.gateId, i.runId) }
+        },
+        "run.approve": async (input) => {
+          const i = input as { runId: string; gateId: string }
+          return { accepted: decideGate(i.gateId, i.runId, { approved: true }) }
+        },
+        "run.reject": async (input) => {
+          const i = input as { runId: string; gateId: string; feedback?: string }
+          return { accepted: decideGate(i.gateId, i.runId, { approved: false, feedback: i.feedback }) }
         },
         "crash.markFixed": async (input, c) => {
           const i = input as { runId: string; release: string; platform?: string }

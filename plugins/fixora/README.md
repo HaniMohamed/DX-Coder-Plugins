@@ -60,6 +60,33 @@ Run folder `.dxcoder/fixora/<runId>/`: `crash.json`, `crash.md`, `mapping.md`, `
 `verification.<n>.json`, `checks/*.log`, `review.<n>.json`, `publish-preview.md`, `mr.md`, `run.log`.
 `.dxcoder/fixora/.gitignore` is created with `*`.
 
+## TUI
+
+The package also ships a TUI entry (`./tui`, loaded automatically by DXcoder next to the server
+entry). With it:
+
+- **`/fixora`** opens a searchable picker of the top crashes grouped by source (users affected,
+  version, age, NEW / REOPENED / MR badges), with `ctrl+t` "fix top 3" and `ctrl+r` refresh, plus a
+  "paste a stack trace" entry. Picking a crash shows a one-line confirmation, then starts the run.
+- A **live pipeline panel** opens in the session (`/fixora panel` or the palette toggles it): stage
+  checklist with spinner and timings, retry counters, the root-cause card with a confidence meter and
+  "introduced by" line, the diff / checks / review summary, the Jira key, and the MR link when done.
+  Keys: `a` answer approval, `r` retry, `R` restart, `c` cancel, `w` jump to the worker session,
+  `d` feedback, `y` copy the MR URL, `l` all runs, `f` fullscreen, `esc` close.
+- **Approvals** become a dialog: branch, files and line counts, checks, review verdict, confidence
+  and risk, the MR title and body (`v` expands it). `a` approves, `r` rejects with feedback, `esc`
+  decides later (the composer strip, the sidebar badge, the footer chip and the palette command
+  "Fixora: answer pending approval" bring it back). Without a TUI, or when nobody answers within
+  the acknowledgement window, the host's permission prompt is used instead.
+- **Pages:** `/fixora status` (or `/fixora runs`) lists every run with status, step, Jira and MR
+  (`enter` opens its session and panel, `a`/`r`/`R`/`x`/`m` act on it, `s` syncs MR statuses);
+  `/fixora report` shows the funnel, the 30-day trend, timings, MR and reopen statistics.
+- Toasts and OS notifications (with sounds) on start, decision needed, done, failed and reopened crashes.
+
+Everything else (`fix`, `paste`, `top`, `batch`, `fixed`, `clean`, flags) is forwarded to the server
+command, so the two entries behave the same. `bun run build` bundles the TUI entry as `dist/tui.js`
+with `solid-js` and `@opentui/*` left external (the host provides them).
+
 ## Setup
 
 Add at least one crash source MCP server to `opencode.jsonc`, optional Jira and GitLab/GitHub

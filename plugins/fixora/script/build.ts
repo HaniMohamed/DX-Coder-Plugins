@@ -19,19 +19,38 @@ const pkg = JSON.parse(await Bun.file(join(root, "package.json")).text()) as {
 await rm(dist, { recursive: true, force: true })
 await mkdir(dist, { recursive: true })
 
+const external = ["@opencode/plugin", "@opencode/plugin/*", "effect", "effect/*", "solid-js", "solid-js/*", "@opentui/core", "@opentui/core/*", "@opentui/solid", "@opentui/solid/*"]
 const result = await Bun.build({
   entrypoints: [join(root, "index.ts"), join(root, "src", "rpc.ts")],
   outdir: dist,
   target: "bun",
   format: "esm",
   // The host supplies these at runtime and swaps the imports for its own instances.
-  external: ["@opencode/plugin", "@opencode/plugin/*", "effect", "effect/*"],
+  external,
   naming: "[name].js",
   sourcemap: "none",
   minify: false,
 })
 if (!result.success) {
   for (const log of result.logs) console.error(String(log))
+  process.exit(1)
+}
+// The TUI entry keeps its JSX (the host transpiles .tsx with its own Solid runtime), so it is
+// bundled as a single .tsx: imports of the shared src modules are inlined, host packages stay external.
+const tui = await Bun.build({
+  entrypoints: [join(root, "tui.tsx")],
+  outdir: dist,
+  target: "bun",
+  format: "esm",
+  external,
+  naming: "tui.js",
+  sourcemap: "none",
+  minify: false,
+  // Keep Solid's JSX transform identical to the host's: use its jsx runtime, not React's.
+  jsx: { runtime: "automatic", importSource: "@opentui/solid" },
+} as never)
+if (!tui.success) {
+  for (const log of tui.logs) console.error(String(log))
   process.exit(1)
 }
 
@@ -47,7 +66,7 @@ await writeFile(
       description: pkg.description,
       type: "module",
       private: true,
-      exports: { ".": "./index.js", "./server": "./index.js", "./rpc": "./rpc.js" },
+      exports: { ".": "./index.js", "./server": "./index.js", "./tui": "./tui.js", "./rpc": "./rpc.js" },
       peerDependencies: pkg.peerDependencies,
       dxcoder: { bundled: true, builtAt: new Date().toISOString() },
     },

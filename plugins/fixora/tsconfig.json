@@ -1,9 +1,29 @@
 {
   "$schema": "https://json.schemastore.org/tsconfig.json",
   "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "preserve",
+    "jsxImportSource": "@opentui/solid",
+    "paths": {
+      "@opencode/plugin": ["../../../gosi_coder/packages/plugin/src/promise/index.ts"],
+      "@opencode/plugin/tui": ["../../../gosi_coder/packages/plugin/src/tui/index.ts"],
+      "@opencode/plugin/tui/context": ["../../../gosi_coder/packages/plugin/src/tui/context.ts"],
+      "@opencode/plugin/*": ["../../../gosi_coder/packages/plugin/src/*"],
+      "effect": ["../../../gosi_coder/node_modules/effect"],
+      "effect/*": ["../../../gosi_coder/node_modules/effect/*"],
+      "solid-js": ["../../../gosi_coder/node_modules/.bun/solid-js@1.9.15/node_modules/solid-js"],
+      "solid-js/*": ["../../../gosi_coder/node_modules/.bun/solid-js@1.9.15/node_modules/solid-js/*"],
+      "@opentui/core": ["../../../gosi_coder/node_modules/@opentui/core"],
+      "@opentui/core/*": ["../../../gosi_coder/node_modules/@opentui/core/*"],
+      "@opentui/solid": ["../../../gosi_coder/node_modules/.bun/@opentui+solid@0.5.17+b80727ad73327db2/node_modules/@opentui/solid"],
+      "@opentui/solid/*": ["../../../gosi_coder/node_modules/.bun/@opentui+solid@0.5.17+b80727ad73327db2/node_modules/@opentui/solid/*"]
+    }
+  },
   "include": [
     "index.ts",
+    "tui.tsx",
     "src/**/*.ts",
+    "src/**/*.tsx",
     "test/**/*.ts",
     "script/**/*.ts"
   ]

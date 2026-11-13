@@ -427,6 +427,8 @@ export class Pipeline {
     run.counters.workerPrompts = fresh.counters.workerPrompts
     await saveRun(this.ctx, run)
     const t = run.triage
+    const sc = t.suspectCommits[0]
+    await this.rt.emit("run.card", { runId: run.runId, sessionID: run.originSessionID, kind: "triage", data: { rootCause: t.rootCause, confidence: t.confidence, category: t.category, risk: t.risk.level, classification: t.classification, introducedBy: sc ? `${sc.sha.slice(0, 10)} ${sc.subject}${t.introducedInRelease ? ` · ${t.introducedInRelease}` : ""}` : undefined, reopened: run.reopened ? (t.reopenReason ?? run.reopened.reason) : undefined } })
     await present(this.ctx, run.originSessionID, `fixora ${run.runId}: root cause — ${t.classification}, ${Math.round(t.confidence * 100)}%`, renderTriageCard(run, this.crash))
     if (t.classification !== "fixable" || t.confidence < this.opts.confidence.minToFix) {
       const why = t.classification !== "fixable" ? `classified as ${t.classification}` : `confidence ${Math.round(t.confidence * 100)}% is below minToFix ${Math.round(this.opts.confidence.minToFix * 100)}%`
@@ -466,12 +468,18 @@ export class Pipeline {
     const issue = renderJiraIssue(run, this.crash)
     if (decision.decision === "ask") {
       await writeFile(join(run.folder, "ticket-preview.md"), `${renderApprovalPreview(run, { kind: "ticket", jira: { project, issueType: this.opts.jira.issueType, summary: issue.summary }, crashUrl: this.crashUrl() })}\n\n${issue.description}\n`)
-      await approve(this.rt, run, "ticket", { resources: [`create Jira ${this.opts.jira.issueType} in ${project}: ${issue.summary}`, `labels: ${[...this.opts.jira.labels, "fixora"].join(", ")}`], summary: `create a Jira ${this.opts.jira.issueType} in ${project}`, previewPath: join(run.folder, "ticket-preview.md") })
+      await approve(this.rt, run, "ticket", {
+        resources: [`create Jira ${this.opts.jira.issueType} in ${project}: ${issue.summary}`, `labels: ${[...this.opts.jira.labels, "fixora"].join(", ")}`],
+        summary: `create a Jira ${this.opts.jira.issueType} in ${project}`,
+        previewPath: join(run.folder, "ticket-preview.md"),
+        preview: { jira: { project, issueType: this.opts.jira.issueType, summary: issue.summary }, rootCause: run.triage?.rootCause, confidence: run.triage?.confidence, risk: run.triage?.risk.level, crashUrl: this.crashUrl(), previewPath: join(run.folder, "ticket-preview.md") },
+      })
     } else run.approvals.ticket = "auto"
     const created = await port.create({ project: project!, issueType: this.opts.jira.issueType, summary: issue.summary, description: issue.description, labels: [...new Set([...this.opts.jira.labels, "fixora"])] })
     run.jiraKey = created.key
     run.jiraUrl = created.url
     run.pipeline.ticketed = true
+    await this.rt.emit("run.card", { runId: run.runId, sessionID: run.originSessionID, kind: "ticket", data: { jiraKey: created.key, jiraUrl: created.url } })
     await stageEnd(this.rt, run, "ticket", "ok", `${created.key}${created.url ? ` ${created.url}` : ""}`)
     return "next"
   }
@@ -620,6 +628,7 @@ export class Pipeline {
     }
     run.pipeline.reviewed = true
     await stageEnd(this.rt, run, "review", "ok", `${verdict.verdict} — ${verdict.summary.slice(0, 100)}`)
+    await this.rt.emit("run.card", { runId: run.runId, sessionID: run.originSessionID, kind: "validation", data: { files: run.fix?.filesChanged ?? [], checks: run.tests ? summarizeChecks(run.tests) : "", review: `${verdict.verdict} (round ${run.reviews.length})` } })
     await present(this.ctx, run.originSessionID, `fixora ${run.runId}: fix verified and reviewed (${verdict.verdict})`, renderValidationCard(run))
     return "next"
   }
@@ -697,7 +706,12 @@ export class Pipeline {
         `review: ${run.reviews[run.reviews.length - 1]?.verdict ?? "none"} · confidence ${Math.round((run.triage?.confidence ?? 0) * 100)}%`,
       ]
       if (gates.push === "publish" && run.flags.mr) resources.push(`open ${this.opts.mr.draft ? "draft " : ""}MR via ${this.mrProvider} → ${target}: ${mr.title}`)
-      await approve(this.rt, run, gates.push, { resources, summary: gates.push === "publish" ? `push ${run.branch} and open a ${this.opts.mr.draft ? "draft " : ""}MR` : `push ${run.branch}`, previewPath: join(run.folder, "publish-preview.md") })
+      await approve(this.rt, run, gates.push, {
+        resources,
+        summary: gates.push === "publish" ? `push ${run.branch} and open a ${this.opts.mr.draft ? "draft " : ""}MR` : `push ${run.branch}`,
+        previewPath: join(run.folder, "publish-preview.md"),
+        preview: this.gatePreview({ mrTitle: gates.push === "publish" && run.flags.mr ? mr.title : undefined, mrBody: gates.push === "publish" && run.flags.mr ? mr.body : undefined, target }),
+      })
     } else {
       run.approvals[gates.push] = "auto"
       await notify(this.ctx, run.originSessionID, `fixora ${run.runId}: auto-approved (${decision.reason})`)
@@ -730,7 +744,7 @@ export class Pipeline {
       await stageEnd(this.rt, run, "mr", "ok", `updated ${run.mrUrl}`)
       return "next"
     }
-    if (gates.mr) await approve(this.rt, run, "mr", { resources: [`open ${this.opts.mr.draft ? "draft " : ""}MR via ${this.mrProvider} → ${target}: ${mr.title}`], summary: `open a merge request via ${this.mrProvider}`, previewPath: join(run.folder, "mr.md") })
+    if (gates.mr) await approve(this.rt, run, "mr", { resources: [`open ${this.opts.mr.draft ? "draft " : ""}MR via ${this.mrProvider} → ${target}: ${mr.title}`], summary: `open a merge request via ${this.mrProvider}`, previewPath: join(run.folder, "mr.md"), preview: this.gatePreview({ mrTitle: mr.title, mrBody: mr.body, target }) })
     try {
       const result = await createMr(this.ctx, { provider: this.mrProvider, target: mrTarget, title: mr.title, body: mr.body, draft: this.opts.mr.draft, labels: this.opts.mr.labels, reviewers: this.opts.mr.reviewers, services: this.rt.services, sessionID: run.originSessionID, cwd: this.worktree })
       if (result.provider === "url") {
@@ -784,6 +798,29 @@ export class Pipeline {
     run.totalMs = Object.values(run.timings).reduce((s, x) => s + (x?.durationMs ?? 0), 0)
     await this.finish()
     return "stop"
+  }
+
+  /** What the TUI approval dialog shows; the markdown preview file stays the source for the permission fallback. */
+  private gatePreview(o: { mrTitle?: string; mrBody?: string; target: string }) {
+    const run = this.run
+    const review = run.reviews[run.reviews.length - 1]
+    return {
+      branch: run.branch,
+      remote: this.remote?.web ?? this.remoteUrl,
+      target: o.target,
+      files: run.fix?.filesChanged ?? [],
+      checks: run.tests ? summarizeChecks(run.tests) : undefined,
+      review: review ? `${review.verdict} (round ${run.reviews.length})` : undefined,
+      confidence: run.triage?.confidence,
+      rootCause: run.triage?.rootCause,
+      risk: run.fix?.risk.level ?? run.triage?.risk.level,
+      mrTitle: o.mrTitle,
+      mrBody: o.mrBody ? o.mrBody.slice(0, 6000) : undefined,
+      mrProvider: this.mrProvider,
+      jiraKey: run.jiraKey,
+      crashUrl: this.crashUrl(),
+      previewPath: join(run.folder, "publish-preview.md"),
+    }
   }
 
   // ---------- helpers used by flows ----------
