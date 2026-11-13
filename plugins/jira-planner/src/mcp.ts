@@ -105,3 +105,69 @@ export const INSTALL_INSTRUCTIONS = `Jira planner needs a local mcp-atlassian MC
 
 export const notConnectedInstructions = (jira: DetectedJira) =>
   `The Jira MCP server "${jira.serverName}" is configured but its status is "${jira.status}". Connect it from /mcps (check the command, JIRA_URL and the token in its environment), then re-run /jira-planner.`
+
+export interface WorkerPermissionRule {
+  action: string
+  resource: string
+  effect: "allow" | "deny" | "ask"
+}
+
+/**
+ * Permission rules for the planning worker session. The host evaluates rules with wildcard
+ * matching and the LAST matching rule wins. File edits are left to the agent's defaults; the
+ * "only inside the issue folder" rule is enforced by `guardWorkerWrite` (a tool hook) because the
+ * host's permission resource format for files differs between builds.
+ */
+export function workerPermissions(input: { namespace: string; shell: "allow" | "deny" | "ask" }): WorkerPermissionRule[] {
+  const ns = input.namespace
+  return [
+    { action: `${ns}_*`, resource: "*", effect: "deny" }, // all tools of the Jira MCP server…
+    { action: `${ns}_*get*`, resource: "*", effect: "allow" }, // …except read-only ones
+    { action: `${ns}_*search*`, resource: "*", effect: "allow" },
+    { action: "*_jira_create*", resource: "*", effect: "deny" }, // belt and braces for other server names
+    { action: "*_jira_update*", resource: "*", effect: "deny" },
+    { action: "*_jira_delete*", resource: "*", effect: "deny" },
+    { action: "*_jira_add*", resource: "*", effect: "deny" },
+    { action: "*_jira_transition*", resource: "*", effect: "deny" },
+    { action: "*_jira_download*", resource: "*", effect: "deny" },
+    { action: "*_confluence_create*", resource: "*", effect: "deny" },
+    { action: "*_confluence_update*", resource: "*", effect: "deny" },
+    { action: "*_confluence_delete*", resource: "*", effect: "deny" },
+    { action: "webfetch", resource: "*", effect: "deny" },
+    { action: "websearch", resource: "*", effect: "deny" },
+    { action: "shell", resource: "*", effect: input.shell },
+  ]
+}
+
+export const WRITE_TOOLS = new Set(["write", "edit", "patch", "multiedit"])
+
+/**
+ * Returns an error message when a write/edit/patch call from a worker session targets a path
+ * outside its issue folder, otherwise undefined. `patch` carries several paths in one call and is
+ * refused outright. Paths are resolved against the session's project directory.
+ */
+export function guardWorkerWrite(input: { tool: string; input: unknown; folder: string; directory: string }): string | undefined {
+  if (!WRITE_TOOLS.has(input.tool)) return undefined
+  const folder = normalizePath(input.folder)
+  if (input.tool === "patch") return `jira-planner worker: the patch tool is not allowed; use write or edit inside ${folder}`
+  const raw = input.input as Record<string, unknown> | undefined
+  const candidate = [raw?.path, raw?.filePath, raw?.file_path, raw?.file].find((v) => typeof v === "string") as string | undefined
+  if (!candidate) return `jira-planner worker: ${input.tool} call without a path is not allowed`
+  const absolute = normalizePath(isAbsolutePath(candidate) ? candidate : `${input.directory.replace(/[\\/]+$/, "")}/${candidate}`)
+  if (absolute === folder || absolute.startsWith(`${folder}/`)) return undefined
+  return `jira-planner worker: writing outside the issue folder is not allowed (${candidate}). Only ${folder} may be modified.`
+}
+
+const isAbsolutePath = (p: string) => p.startsWith("/") || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("\\\\")
+
+function normalizePath(p: string): string {
+  const parts: string[] = []
+  const slashed = p.replace(/\\/g, "/")
+  const drive = /^[A-Za-z]:/.exec(slashed)?.[0] ?? ""
+  for (const part of slashed.slice(drive.length).split("/")) {
+    if (!part || part === ".") continue
+    if (part === "..") parts.pop()
+    else parts.push(part)
+  }
+  return `${drive}/${parts.join("/")}`.replace(/\/+$/, "") || "/"
+}

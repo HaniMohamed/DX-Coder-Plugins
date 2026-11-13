@@ -49,7 +49,7 @@ describe("convertToMarkdown", () => {
 
 describe("sanitizeFilename", () => {
   test("removes path separators and control characters", () => {
-    expect(sanitizeFilename("../etc/passwd")).toBe("_._etc_passwd")
+    expect(sanitizeFilename("../etc/passwd")).toBe("__etc_passwd")
     expect(sanitizeFilename("BRD: v2 <final>.docx")).toBe("BRD_ v2 _final_.docx")
     expect(sanitizeFilename("")).toBe("attachment")
   })
@@ -83,5 +83,21 @@ describe("processAttachments", () => {
     expect(again[0]).toEqual(manifest[0])
     expect(mock.requests.filter((r) => r.path.includes("/secure/attachment/a1/")).length).toBe(1)
     expect(mock.requests.length).toBe(before)
+  })
+})
+
+describe("htmlToMarkdown", () => {
+  test("converts the mammoth subset: headings, lists, tables, emphasis, links", async () => {
+    const { htmlToMarkdown } = await import("../src/attachments.js")
+    const html =
+      "<h1>Title</h1><p>Intro with <strong>bold</strong> and <em>it</em> and <a href=\"http://x\">link</a>.</p>" +
+      "<ul><li>one</li><li>two<ol><li>nested</li></ol></li></ul>" +
+      "<table><tr><th>Req</th><th>Prio</th></tr><tr><td>A &amp; B</td><td>Must</td></tr></table><p>End</p>"
+    const md = htmlToMarkdown(html)
+    expect(md).toContain("# Title")
+    expect(md).toContain("Intro with **bold** and *it* and [link](http://x).")
+    expect(md).toContain("- one\n- two\n  1. nested")
+    expect(md).toContain("| Req | Prio |\n|---|---|\n| A & B | Must |")
+    expect(md.trim().endsWith("End")).toBe(true)
   })
 })

@@ -20,7 +20,7 @@ import {
   type Credentials,
   type JiraIssue,
 } from "./jira.js"
-import { detectJira, INSTALL_INSTRUCTIONS, notConnectedInstructions, type Detection } from "./mcp.js"
+import { detectJira, INSTALL_INSTRUCTIONS, notConnectedInstructions, workerPermissions, type Detection } from "./mcp.js"
 import {
   renderParentComment,
   renderPushPreview,
@@ -102,6 +102,13 @@ const keys = {
   run: (issue: string) => `jira-planner/run/${issue}`,
   push: (issue: string) => `jira-planner/push/${issue}`,
   meta: (baseUrl: string) => `jira-planner/meta/${encodeURIComponent(baseUrl)}`,
+  worker: (sessionID: string) => `jira-planner/worker/${sessionID}`,
+}
+
+/** Folder a worker session is confined to, or undefined for any other session. */
+export async function workerFolder(ctx: Plugin.Context, sessionID: string): Promise<string | undefined> {
+  const v = await getJson<{ folder?: string }>(ctx, keys.worker(sessionID))
+  return v?.folder
 }
 
 type StorageValue = Parameters<Plugin.Context["storage"]["set"]>[1]
@@ -354,27 +361,7 @@ export async function runPlan(ctx: Plugin.Context, input: PlanInput) {
   // Worker session: the model does the analysis. Jira write tools, web access and writes outside
   // the issue folder are hidden by permission rules (last matching rule wins).
   const ns = jira?.namespace ?? "jira"
-  const permissions = [
-    { action: `${ns}_*`, resource: "*", effect: "deny" as const },
-    { action: `${ns}_*get*`, resource: "*", effect: "allow" as const },
-    { action: `${ns}_*search*`, resource: "*", effect: "allow" as const },
-    { action: "*_jira_create*", resource: "*", effect: "deny" as const },
-    { action: "*_jira_update*", resource: "*", effect: "deny" as const },
-    { action: "*_jira_delete*", resource: "*", effect: "deny" as const },
-    { action: "*_jira_add*", resource: "*", effect: "deny" as const },
-    { action: "*_jira_transition*", resource: "*", effect: "deny" as const },
-    { action: "*_confluence_create*", resource: "*", effect: "deny" as const },
-    { action: "*_confluence_update*", resource: "*", effect: "deny" as const },
-    { action: "*_confluence_delete*", resource: "*", effect: "deny" as const },
-    { action: "webfetch", resource: "*", effect: "deny" as const },
-    { action: "websearch", resource: "*", effect: "deny" as const },
-    { action: "shell", resource: "*", effect: opts.workerShell },
-    { action: "write", resource: "*", effect: "deny" as const },
-    { action: "edit", resource: "*", effect: "deny" as const },
-    { action: "patch", resource: "*", effect: "deny" as const },
-    { action: "write", resource: `${folder}/*`, effect: "allow" as const },
-    { action: "edit", resource: `${folder}/*`, effect: "allow" as const },
-  ]
+  const permissions = workerPermissions({ namespace: ns, shell: opts.workerShell })
 
   const taskText = [
     `Plan Jira story ${issue} for the tech lead.`,
@@ -391,6 +378,7 @@ export async function runPlan(ctx: Plugin.Context, input: PlanInput) {
   const attachments = [{ uri: pathToFileURL(join(folder, "story.md")).href, name: "story.md", description: "Jira story (untrusted data)" }]
   const skills = [{ id: Skill.ID.make(SKILL_ID) }]
   if (workerID) {
+    await setJson(ctx, keys.worker(workerID), { issue, folder })
     try {
       await ctx.session.prompt({ sessionID: workerID, text: `Continue the interrupted planning run.\n\n${taskText}`, files: attachments, skills })
     } catch {
@@ -401,6 +389,7 @@ export async function runPlan(ctx: Plugin.Context, input: PlanInput) {
     const worker = await ctx.session.create({ parentID: sessionID, title: `jira-planner: ${issue}`, agent: opts.workerAgent, permissions })
     workerID = worker.id
     await step("worker", { workerID })
+    await setJson(ctx, keys.worker(workerID), { issue, folder })
     await notify(ctx, sessionID, `jira-planner: analysing ${issue} in worker session ${workerID}`)
     await ctx.session.prompt({ sessionID: workerID, text: taskText, files: attachments, skills })
   }

@@ -2,3 +2,7 @@ node_modules
 *.tsbuildinfo
 .env
 .DS_Store
+plugins/*/dist
+plugins/*/.pack
+*.tgz
+*.tgz.sha256

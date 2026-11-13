@@ -144,8 +144,8 @@ export async function convertToMarkdown(
       return { markdown: Buffer.from(bytes).toString("utf8"), converter: "utf-8 passthrough" }
     case "docx": {
       const mammoth = await import("mammoth")
-      const result = await mammoth.convertToMarkdown({ buffer: Buffer.from(bytes) })
-      return { markdown: result.value, converter: "mammoth" }
+      const result = await mammoth.convertToHtml({ buffer: Buffer.from(bytes) })
+      return { markdown: htmlToMarkdown(result.value), converter: "mammoth" }
     }
     case "xlsx":
     case "xlsm": {
@@ -199,4 +199,98 @@ function cellText(v: unknown): string {
     if (v instanceof Date) return v.toISOString().slice(0, 10)
   }
   return String(v).replace(/\|/g, "\\|").replace(/\r?\n/g, " ")
+}
+
+/**
+ * Converts the small HTML subset mammoth emits (headings, paragraphs, lists, tables, emphasis,
+ * links, line breaks) to markdown. Unknown block tags are flattened to text.
+ */
+export function htmlToMarkdown(html: string): string {
+  const BLOCK = new Set(["h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "li", "table", "thead", "tbody", "tr", "td", "th", "div", "blockquote"])
+  type Node = { tag: string; children: Array<Node | string> }
+  const root: Node = { tag: "root", children: [] }
+  const stack: Node[] = [root]
+  const tagRe = /<\/?([a-zA-Z][a-zA-Z0-9]*)[^>]*>|[^<]+/g
+  for (const m of html.matchAll(tagRe)) {
+    const token = m[0]
+    const tag = m[1]?.toLowerCase()
+    const current = stack[stack.length - 1]!
+    if (!tag || !BLOCK.has(tag)) {
+      current.children.push(token) // text and inline tags stay verbatim for the inline pass
+      continue
+    }
+    if (token.startsWith("</")) {
+      const at = stack.map((n) => n.tag).lastIndexOf(tag)
+      if (at > 0) stack.length = at
+      continue
+    }
+    const node: Node = { tag, children: [] }
+    current.children.push(node)
+    stack.push(node)
+  }
+
+  const decode = (t: string) => t.replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&")
+  const inline = (t: string) =>
+    decode(
+      t
+        .replace(/<br\s*\/?>/gi, "  \n")
+        .replace(/<(strong|b)>([\s\S]*?)<\/\1>/gi, "**$2**")
+        .replace(/<(em|i)>([\s\S]*?)<\/\1>/gi, "*$2*")
+        .replace(/<a\s+[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)")
+        .replace(/<[^>]+>/g, ""),
+    ).trim()
+  const textOf = (nodes: Array<Node | string>): string => nodes.map((n) => (typeof n === "string" ? n : textOf(n.children))).join("")
+  const cell = (t: string) => inline(t).replace(/\|/g, "\\|").replace(/\n/g, " ")
+
+  const out: string[] = []
+  const renderTable = (table: Node) => {
+    const rows: string[][] = []
+    const visit = (n: Node) => {
+      for (const c of n.children) {
+        if (typeof c === "string") continue
+        if (c.tag === "tr") rows.push(c.children.filter((x): x is Node => typeof x !== "string" && (x.tag === "td" || x.tag === "th")).map((x) => cell(textOf(x.children))))
+        else visit(c)
+      }
+    }
+    visit(table)
+    if (rows.length === 0) return
+    const width = Math.max(...rows.map((r) => r.length))
+    const pad = (r: string[]) => [...r, ...Array(width - r.length).fill("")]
+    out.push(`| ${pad(rows[0]!).join(" | ")} |`, `|${Array(width).fill("---").join("|")}|`, ...rows.slice(1).map((r) => `| ${pad(r).join(" | ")} |`), "")
+  }
+  const renderList = (list: Node, depth: number) => {
+    let index = 0
+    for (const li of list.children) {
+      if (typeof li === "string" || li.tag !== "li") continue
+      const own = inline(textOf(li.children.filter((c) => typeof c === "string" || (c.tag !== "ul" && c.tag !== "ol"))))
+      out.push(`${"  ".repeat(depth)}${list.tag === "ol" ? `${++index}.` : "-"} ${own}`)
+      for (const c of li.children) if (typeof c !== "string" && (c.tag === "ul" || c.tag === "ol")) renderList(c, depth + 1)
+    }
+    if (depth === 0) out.push("")
+  }
+  const render = (nodes: Array<Node | string>) => {
+    let text = ""
+    const flush = () => {
+      const t = inline(text)
+      if (t) out.push(t, "")
+      text = ""
+    }
+    for (const n of nodes) {
+      if (typeof n === "string") {
+        text += n
+        continue
+      }
+      flush()
+      if (n.tag === "ul" || n.tag === "ol") renderList(n, 0)
+      else if (n.tag === "table") renderTable(n)
+      else if (/^h[1-6]$/.test(n.tag)) out.push(`${"#".repeat(Number(n.tag[1]))} ${inline(textOf(n.children))}`, "")
+      else if (n.tag === "p" || n.tag === "li" || n.tag === "blockquote") {
+        const t = inline(textOf(n.children))
+        if (t) out.push(n.tag === "blockquote" ? `> ${t}` : t, "")
+      } else render(n.children)
+    }
+    flush()
+  }
+  render(root.children)
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim()
 }

@@ -25,8 +25,9 @@ ones after approval.
    attachments (pdf, docx, xlsx, text) are written to `.dxcoder/jira-planner/<KEY>/` as `story.md`,
    `existing-subtasks.json` and `attachments/*.md`. Jira content is wrapped in "untrusted" banners.
 3. **Plan.** A child worker session runs the bundled `jira-planner` skill and writes `requirements.md`,
-   `repo-audit.md`, `plan.md` and `subtasks.json`. The worker cannot call Jira write tools, fetch the web,
-   or write outside the issue folder; shell is denied unless `workerShell` says otherwise.
+   `repo-audit.md`, `plan.md` and `subtasks.json`. The worker cannot call Jira write tools or fetch the web
+   (session permission rules), and a tool hook in the plugin rejects any write, edit or patch outside the
+   issue folder; shell is denied unless `workerShell` says otherwise.
 4. **Gap report.** `gap-report.md` lists planned subtasks missing in Jira, existing subtasks not covered by
    the plan, matched pairs, and estimate drift (more than 30% or at least 2 points apart).
 5. **Edit, then push.** Edit `subtasks.json` or `plan.md` freely. `push` shows a preview, asks for approval
@@ -81,6 +82,39 @@ Install the plugin:
 ```sh
 dxcoder plugin add 'git+https://<your-git-host>/<org>/dxcoder-plugins.git#path:plugins/jira-planner'
 ```
+
+## Offline / restricted machines: single-folder bundle
+
+`bun run build` bundles `index.ts` and all npm dependencies (gray-matter, mammoth, exceljs, unpdf)
+into `dist/`, keeping only `@opencode/plugin` and `effect` external because the host provides them.
+The folder is self-contained: `index.js`, `package.json`, `skills/`, `README.md`. No `node_modules`
+and no install step are needed where it runs.
+
+On a machine with network access:
+
+```sh
+cd dxcoder-plugins && bun install
+cd plugins/jira-planner && bun run pack       # writes dist/ and jira-planner-<version>-dist.tgz (+ .sha256)
+```
+
+`bun run build` alone writes only `dist/`. The tarball extracts to a `jira-planner/` folder that
+contains `INSTALL.md` with the steps below.
+
+On the restricted machine, extract the folder anywhere and reference it by absolute path in
+`opencode.jsonc` (the `dxcoder plugin add` CLI accepts only npm or git specifiers, so local folders go
+through the config file):
+
+```jsonc
+{
+  "plugins": [{ "package": "/opt/dxcoder/jira-planner", "options": {} }]
+}
+```
+
+Then restart DXcoder and run `/jira-planner status`. The Jira MCP server still has to be installed
+separately (`pip download mcp-atlassian -d wheels` on the connected machine, then
+`pip install --no-index --find-links wheels mcp-atlassian` on the target).
+
+`dist/` is gitignored; commit it on a release branch if you want the bundle distributed via `git clone`.
 
 ## Development
 

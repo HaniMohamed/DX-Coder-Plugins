@@ -2,7 +2,8 @@ import { Plugin, Skill } from "@opencode/plugin"
 import matter from "gray-matter"
 import { readFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
-import { COMMAND, notify, PlannerStop, runAudit, runPlan, runPush, runStatus, SKILL_ID } from "./src/flows.js"
+import { COMMAND, notify, PlannerStop, runAudit, runPlan, runPush, runStatus, SKILL_ID, workerFolder } from "./src/flows.js"
+import { guardWorkerWrite, WRITE_TOOLS } from "./src/mcp.js"
 import { ISSUE_KEY_PATTERN } from "./src/schema.js"
 
 const USAGE = [
@@ -53,6 +54,21 @@ export default Plugin.define({
     })
     await ctx.skill.transform((editor) => {
       if (!editor.get(skill.id)) editor.add(skill)
+    })
+
+    // Confine planning workers to their issue folder. This runs before every write/edit/patch call
+    // and does not depend on how the host formats permission resources.
+    const folders = new Map<string, string | null>()
+    await ctx.tool.hook("execute.before", async (event) => {
+      if (!WRITE_TOOLS.has(event.tool)) return
+      let folder = folders.get(event.sessionID)
+      if (folder === undefined) {
+        folder = (await workerFolder(ctx, event.sessionID)) ?? null
+        folders.set(event.sessionID, folder)
+      }
+      if (!folder) return
+      const problem = guardWorkerWrite({ tool: event.tool, input: event.input, folder, directory: ctx.location.directory })
+      if (problem) throw new Error(problem)
     })
 
     await ctx.command.transform((editor) => {
