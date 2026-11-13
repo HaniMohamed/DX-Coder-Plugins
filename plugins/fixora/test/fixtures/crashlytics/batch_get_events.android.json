@@ -1,0 +1,24 @@
+{
+  "events": [
+    {
+      "name": "projects/123/apps/1:123:android:abc/events/ev1",
+      "displayVersion": "3.2.0",
+      "buildVersion": "320",
+      "device": { "model": "Pixel 7", "manufacturer": "Google" },
+      "operatingSystem": { "displayName": "Android 14", "displayVersion": "14" },
+      "exceptions": [
+        {
+          "type": "java.lang.NullPointerException",
+          "exceptionMessage": "Attempt to invoke virtual method 'int com.example.app.Cart.size()' on a null object reference",
+          "frames": [
+            { "symbol": "com.example.app.cart.CartRepository.load", "file": "CartRepository.kt", "line": 88, "library": "com.example.app.cart.CartRepository" },
+            { "symbol": "com.example.app.cart.CartRepository$load$1.invokeSuspend", "file": "CartRepository.kt", "line": 120, "library": "com.example.app.cart.CartRepository$load$1" },
+            { "symbol": "kotlinx.coroutines.DispatchedTask.run", "file": "DispatchedTask.kt", "line": 106, "library": "kotlinx.coroutines.DispatchedTask" },
+            { "symbol": "android.os.Handler.handleCallback", "file": "Handler.java", "line": 938, "library": "android.os.Handler" }
+          ]
+        }
+      ],
+      "customKeys": { "cart_size": "0" }
+    }
+  ]
+}

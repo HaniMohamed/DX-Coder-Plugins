@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "dxcoder-plugin-fixora",
+  "version": "0.1.0",
+  "description": "Turn production crashes (Sentry, Firebase Crashlytics, pasted stack traces) into reviewed, tested draft merge requests using the DXcoder coding agent",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./index.ts",
+    "./server": "./index.ts",
+    "./rpc": "./src/rpc.ts"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "skills",
+    "script"
+  ],
+  "scripts": {
+    "typecheck": "tsgo --noEmit",
+    "test": "bun test",
+    "build": "bun run script/build.ts",
+    "pack": "bun run script/build.ts --pack"
+  },
+  "dependencies": {
+    "gray-matter": "4.0.3"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.29",
+    "effect": "^4.0.0"
+  }
+}

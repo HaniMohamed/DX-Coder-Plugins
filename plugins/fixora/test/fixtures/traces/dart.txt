@@ -1,0 +1,5 @@
+Null check operator used on a null value
+#0      CartService.applyCoupon (package:my_app/cart/service.dart:88:12)
+#1      _CheckoutState.build (package:my_app/ui/checkout.dart:301:5)
+#2      StatefulElement.build (package:flutter/src/widgets/framework.dart:5080:27)
+#3      _runGuarded (dart:async/zone.dart:1399:47)

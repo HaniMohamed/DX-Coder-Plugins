@@ -7,6 +7,7 @@ installable plugin; none of them are bundled with DXcoder itself.
 | ---------------------------------------- | ----------------------- |
 | [release-flow](plugins/release-flow/README.md) | `plugins/release-flow`  |
 | [jira-planner](plugins/jira-planner/README.md) | `plugins/jira-planner`  |
+| [fixora](plugins/fixora/README.md)             | `plugins/fixora`        |
 
 ## Install on a machine
 

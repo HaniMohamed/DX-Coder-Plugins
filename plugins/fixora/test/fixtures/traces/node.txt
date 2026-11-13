@@ -1,0 +1,5 @@
+TypeError: Cannot read properties of undefined (reading 'id')
+    at applyCoupon (src/cart/service.ts:88:21)
+    at async Checkout.pay (/app/src/checkout.ts:40:5)
+    at Layer.handle [as handle_request] (/app/node_modules/express/lib/router/layer.js:95:5)
+    at new Promise (<anonymous>)

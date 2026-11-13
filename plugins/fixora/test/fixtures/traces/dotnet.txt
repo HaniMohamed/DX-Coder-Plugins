@@ -1,0 +1,4 @@
+System.NullReferenceException: Object reference not set to an instance of an object.
+   at Shop.Cart.CartService.ApplyCoupon(String code) in C:\src\shop\Cart\CartService.cs:line 88
+   at Shop.Api.CheckoutController.Pay() in /src/shop/Api/CheckoutController.cs:line 40
+   at System.Runtime.CompilerServices.TaskAwaiter.ThrowForNonSuccess(Task task)

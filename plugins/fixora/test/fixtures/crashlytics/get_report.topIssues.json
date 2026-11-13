@@ -1,0 +1,8 @@
+{
+  "report": {
+    "issues": [
+      { "issue": { "id": "deadbeef", "title": "NullPointerException in CartRepository.load", "lastSeenVersion": "3.2.0" }, "issueStats": { "userCount": 612, "eventCount": 1402 } },
+      { "issue": { "id": "cafebabe", "title": "IllegalStateException in LoginViewModel", "lastSeenVersion": "3.1.9" }, "issueStats": { "userCount": 97, "eventCount": 200 } }
+    ]
+  }
+}

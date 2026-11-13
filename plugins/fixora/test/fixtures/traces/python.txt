@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/app/shop/api.py", line 40, in pay
+    cart.apply_coupon(code)
+  File "/usr/lib/python3.11/site-packages/django/x.py", line 1, in y
+    z
+  File "/app/shop/cart.py", line 88, in apply_coupon
+    return coupon.id
+AttributeError: 'NoneType' object has no attribute 'id'

@@ -1,0 +1,19 @@
+{
+  "events": [
+    {
+      "displayVersion": "3.2.1",
+      "exceptions": [
+        {
+          "type": "EXC_BAD_ACCESS",
+          "exceptionMessage": "KERN_INVALID_ADDRESS at 0x0",
+          "frames": [
+            { "library": "MyApp", "offset": 111300 },
+            { "library": "MyApp", "offset": 111301 },
+            { "library": "MyApp", "offset": 111302 },
+            { "symbol": "-[UIApplication sendAction:to:from:forEvent:]", "library": "UIKitCore" }
+          ]
+        }
+      ]
+    }
+  ]
+}

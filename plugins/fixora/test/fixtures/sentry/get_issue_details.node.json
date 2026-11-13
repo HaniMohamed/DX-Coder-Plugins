@@ -1,0 +1,35 @@
+{
+  "id": "4523123",
+  "shortId": "SHOP-42",
+  "title": "TypeError: Cannot read properties of undefined (reading 'id')",
+  "culprit": "applyCoupon(src/cart/service.ts)",
+  "permalink": "https://acme.sentry.io/issues/4523123/",
+  "platform": "node",
+  "count": "1830",
+  "userCount": 540,
+  "firstSeen": "2026-11-10T08:00:00Z",
+  "lastSeen": "2026-11-13T21:14:00Z",
+  "level": "error",
+  "metadata": { "type": "TypeError", "value": "Cannot read properties of undefined (reading 'id')" },
+  "latestEvent": {
+    "release": "2024.11.2",
+    "environment": "production",
+    "tags": [{ "key": "browser", "value": "Chrome" }, { "key": "os", "value": "macOS" }],
+    "request": { "headers": { "Cookie": "secret-cookie" } },
+    "exception": {
+      "values": [
+        {
+          "type": "TypeError",
+          "value": "Cannot read properties of undefined (reading 'id')",
+          "stacktrace": {
+            "frames": [
+              { "filename": "node_modules/express/lib/router/layer.js", "lineNo": 95, "colNo": 5, "function": "Layer.handle", "inApp": false },
+              { "filename": "src/checkout.ts", "lineNo": 40, "colNo": 5, "function": "Checkout.pay", "inApp": true },
+              { "filename": "src/cart/service.ts", "lineNo": 88, "colNo": 21, "function": "applyCoupon", "inApp": true }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

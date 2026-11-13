@@ -1,0 +1,9 @@
+FATAL EXCEPTION: main
+java.lang.RuntimeException: Unable to start activity
+	at android.app.ActivityThread.performLaunchActivity(ActivityThread.java:3449)
+Caused by: java.lang.IllegalStateException: coupon not loaded
+	at com.example.app.cart.CartRepository.load(CartRepository.kt:88)
+	at com.example.app.cart.CartRepository$load$1.invokeSuspend(CartRepository.kt:120)
+	at kotlinx.coroutines.DispatchedTask.run(DispatchedTask.kt:106)
+	at android.os.Handler.handleCallback(Handler.java:938)
+	... 12 more

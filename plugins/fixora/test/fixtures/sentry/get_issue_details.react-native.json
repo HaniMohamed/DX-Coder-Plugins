@@ -1,0 +1,12 @@
+{
+  "id": "1",
+  "title": "TypeError: undefined is not an object",
+  "platform": "javascript",
+  "latestEvent": {
+    "exception": { "values": [ { "type": "TypeError", "value": "undefined is not an object", "stacktrace": { "frames": [
+      { "filename": "index.android.bundle", "lineNo": 1, "colNo": 456789, "function": "t", "inApp": true },
+      { "filename": "index.android.bundle", "lineNo": 1, "colNo": 123456, "function": "a", "inApp": true },
+      { "filename": "index.android.bundle", "lineNo": 1, "colNo": 234567, "function": "s", "inApp": true }
+    ] } } ] }
+  }
+}

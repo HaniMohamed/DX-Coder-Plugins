@@ -1,0 +1,6 @@
+Fatal Exception: EXC_BAD_ACCESS
+KERN_INVALID_ADDRESS at 0x0
+0  MyApp                          0x0000000104a00000 0x104a00000 + 111300
+1  MyApp                          0x0000000104a00001 0x104a00000 + 111301
+2  MyApp                          0x0000000104a00002 0x104a00000 + 111302
+3  UIKitCore                      0x00000001a3b1c000 -[UIApplication sendAction:to:from:forEvent:] + 100

@@ -1,0 +1,1 @@
+{ "issues": [ { "key": "APP-1831", "fields": { "summary": "[Crash] TypeError in applyCoupon", "status": { "name": "In Review" } } } ] }

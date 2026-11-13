@@ -1,0 +1,18 @@
+{
+  "events": [
+    {
+      "displayVersion": "3.1.9",
+      "exceptions": [
+        {
+          "type": "_TypeError",
+          "exceptionMessage": "Null check operator used on a null value",
+          "frames": [
+            { "symbol": "_CheckoutPageState.build", "file": "package:my_app/ui/checkout_page.dart", "line": 301 },
+            { "symbol": "StatefulElement.build", "file": "package:flutter/src/widgets/framework.dart", "line": 5080 },
+            { "symbol": "_runGuarded", "file": "dart:async/zone.dart", "line": 1399 }
+          ]
+        }
+      ]
+    }
+  ]
+}

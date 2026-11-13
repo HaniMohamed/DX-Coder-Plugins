@@ -1,0 +1,5 @@
+java.lang.NullPointerException
+	at a.b.c.d(SourceFile:12)
+	at a.b.e.f(SourceFile:34)
+	at a.g.h.i(SourceFile:56)
+	at android.os.Handler.handleCallback(Handler.java:938)

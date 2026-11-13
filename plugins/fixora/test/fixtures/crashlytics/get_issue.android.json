@@ -1,0 +1,14 @@
+{
+  "name": "projects/123/apps/1:123:android:abc/issues/deadbeef",
+  "id": "deadbeef",
+  "title": "NullPointerException in CartRepository.load",
+  "subtitle": "CartRepository.kt line 88",
+  "exceptionType": "java.lang.NullPointerException",
+  "state": "OPEN",
+  "errorType": "FATAL",
+  "displayVersion": "3.2.0",
+  "firstSeenTime": "2026-11-09T10:00:00Z",
+  "lastSeenTime": "2026-11-13T22:00:00Z",
+  "issueStats": { "eventCount": 1402, "userCount": 612 },
+  "sampleEvent": "projects/123/apps/1:123:android:abc/events/ev1"
+}
