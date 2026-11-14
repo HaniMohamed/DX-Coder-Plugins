@@ -36,7 +36,7 @@ export const RunSummarySchema = obj(
   ["runId", "source", "crashId", "title", "step", "status", "createdAt", "updatedAt"],
 )
 
-export const CrashSummarySchema = obj({ source: S, id: S, title: S, userCount: N, eventCount: N, lastSeen: S, appVersion: S, url: S, fingerprint: S, state: S, runId: S }, ["source", "id", "title"])
+export const CrashSummarySchema = obj({ source: S, id: S, title: S, userCount: N, eventCount: N, lastSeen: S, appVersion: S, url: S, fingerprint: S, state: S, runId: S, ref: S, platform: S, appId: S }, ["source", "id", "title"])
 
 /** What the TUI needs to render an approval dialog without reading the run folder. */
 export const GatePreviewSchema = obj({

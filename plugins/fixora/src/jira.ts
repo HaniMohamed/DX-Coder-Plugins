@@ -17,7 +17,7 @@ export interface JiraPort {
   kind: "mcp" | "rest"
   baseUrl?: string
   search(jql: string, max?: number): Promise<JiraIssueRef[]>
-  create(fields: { project: string; issueType: string; summary: string; description: string; labels: string[] }): Promise<JiraIssueRef>
+  create(fields: { project: string; issueType: string; summary: string; description: string; labels: string[]; parent?: string }): Promise<JiraIssueRef>
   comment(key: string, body: string): Promise<void>
   transitions(key: string): Promise<Array<{ id: string; name: string }>>
   transition(key: string, id: string): Promise<void>
@@ -132,7 +132,7 @@ export function restPort(client: JiraClient): JiraPort {
       return (await client.search(jql, max)).map((i) => ({ key: i.key, url: `${base}/browse/${i.key}`, status: i.fields?.status?.name, summary: i.fields?.summary }))
     },
     async create(f) {
-      const res = await client.createIssue({ project: { key: f.project }, issuetype: { name: f.issueType }, summary: f.summary.slice(0, 255), description: f.description, labels: f.labels })
+      const res = await client.createIssue({ project: { key: f.project }, issuetype: { name: f.issueType }, summary: f.summary.slice(0, 255), description: f.description, labels: f.labels, ...(f.parent ? { parent: { key: f.parent } } : {}) })
       return { key: res.key, url: `${base}/browse/${res.key}` }
     },
     async comment(key, body) {
@@ -174,7 +174,8 @@ export function mcpPort(ctx: Plugin.Context, service: DetectedService, o: { sess
       return issuesOf(await call("search", { jql, limit: max, fields: "summary,status" }))
     },
     async create(f) {
-      const raw = await call("createIssue", { project_key: f.project, summary: f.summary.slice(0, 255), issue_type: f.issueType, description: f.description, additional_fields: { labels: f.labels } })
+      // mcp-atlassian takes the parent key in additional_fields (sub-tasks and parent links alike).
+      const raw = await call("createIssue", { project_key: f.project, summary: f.summary.slice(0, 255), issue_type: f.issueType, description: f.description, additional_fields: { labels: f.labels, ...(f.parent ? { parent: f.parent } : {}) } })
       const r = isRecord(raw) && isRecord(raw.issue) ? raw.issue : isRecord(raw) ? raw : {}
       const key = s(r.key) ?? /\b[A-Z][A-Z0-9_]+-\d+\b/.exec(typeof raw === "string" ? raw : JSON.stringify(raw))?.[0]
       if (!key) throw new Error(`jira_create_issue returned no issue key: ${JSON.stringify(raw).slice(0, 300)}`)

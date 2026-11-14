@@ -1,16 +1,16 @@
 /** @jsxImportSource @opentui/solid */
-// Solid components for the Fixora TUI: live pipeline panel, approval dialog, runs and report pages,
-// sidebar badge, footer chip and composer strip. They read the shared store and call RPC actions.
+// Solid components for the Fixora TUI. Everything renders inside DXcoder's session panel (docked
+// next to the conversation, or fullscreen with `f`): the live run view, the runs list and the
+// report are views of that one panel. Dialogs (picker, approval) are the host's modal dialogs.
 
 import type { Plugin } from "@opencode/plugin/tui"
 import type { PanelInput } from "@opencode/plugin/tui/context"
 import type { RGBA } from "@opentui/core"
 import type { JSX } from "@opentui/solid"
-import { createMemo, createSignal, For, Show } from "solid-js"
+import { createMemo, createSignal, For, Show, Switch, Match } from "solid-js"
 import type { Store } from "solid-js/store"
 import { bar, fmtDuration, fmtPct, sparkline } from "../render.js"
-import type { FunnelStats } from "../state.js"
-import { awaitingGates, fmtClock, fmtShort, meter, panelRun, relTime, runsForSession, SPINNER, STAGE_TITLES, STATUS_GLYPH, truncate, type GateView, type RunView, type TuiState } from "./store.js"
+import { awaitingGates, fmtClock, fmtShort, meter, panelRun, relTime, runsForSession, SPINNER, STAGE_TITLES, STATUS_GLYPH, truncate, type GateView, type PanelView, type RunView, type TuiState } from "./store.js"
 
 export interface Fixora {
   context: Plugin.Context
@@ -25,13 +25,13 @@ export interface Fixora {
     cancel(runId: string): Promise<void>
     feedback(runId: string, text?: string): Promise<void>
     focusWorker(run: RunView): void
-    openRuns(): void
-    openReport(): void
+    /** Switches the panel view (and opens the panel when needed). */
+    show(view: PanelView, runId?: string): void
     sync(): Promise<void>
     markFixed(runId: string): Promise<void>
     copy(text: string): Promise<void>
-    back(): void
     hydrate(runId?: string): Promise<void>
+    loadReport(): Promise<void>
   }
 }
 
@@ -60,6 +60,8 @@ export function tone(fx: Fixora, status: string) {
 
 export const confidenceTone = (fx: Fixora, c: number) => (c >= 0.75 ? fx.context.theme.text.feedback.success.base : c >= 0.5 ? fx.context.theme.text.feedback.warning.base : fx.context.theme.text.feedback.error.base)
 
+const glyphOf = (fx: Fixora, status: string) => (status === "running" ? SPINNER[Math.floor(fx.state.now / 250) % SPINNER.length]! : status === "awaiting-approval" ? "⏸" : status === "done" ? "✓" : status === "skipped" || status === "cancelled" ? "–" : "✗")
+
 /** Inline coloured text: OpenTUI spans take their colour through `style`. */
 function S(props: { fg?: RGBA; children?: JSX.Element }) {
   return <span style={{ fg: props.fg }}>{props.children}</span>
@@ -87,27 +89,64 @@ function Rule(props: { fx: Fixora; width: number }) {
   return <text fg={props.fx.context.theme.border.base}>{"─".repeat(Math.max(1, props.width))}</text>
 }
 
-// ---------- live pipeline panel ----------
+function Tabs(props: { fx: Fixora }) {
+  const t = props.fx.context.theme
+  const tab = (view: PanelView, label: string) => (
+    <S fg={props.fx.state.view === view ? t.text.base : t.text.muted}>{props.fx.state.view === view ? <b>{label}</b> : label}</S>
+  )
+  return (
+    <text>
+      {tab("run", "run")}
+      <S fg={t.text.muted}> · </S>
+      {tab("runs", "runs")}
+      <S fg={t.text.muted}> · </S>
+      {tab("report", "report")}
+    </text>
+  )
+}
 
-export function RunPanel(props: { fx: Fixora; panel: PanelInput }) {
+// ---------- the panel: one host panel, three views ----------
+
+export function FixoraPanel(props: { fx: Fixora; panel: PanelInput }) {
+  const fx = props.fx
+  const t = fx.context.theme
+  return (
+    <box flexDirection="column" flexGrow={1} paddingLeft={1} paddingRight={1} backgroundColor={props.panel.presentation === "panel" ? t.background.raised.base : t.background.base}>
+      <Switch>
+        <Match when={fx.state.view === "runs"}>
+          <RunsView fx={fx} panel={props.panel} />
+        </Match>
+        <Match when={fx.state.view === "report"}>
+          <ReportView fx={fx} panel={props.panel} />
+        </Match>
+        <Match when={true}>
+          <RunDetail fx={fx} panel={props.panel} />
+        </Match>
+      </Switch>
+    </box>
+  )
+}
+
+function RunDetail(props: { fx: Fixora; panel: PanelInput }) {
   const fx = props.fx
   const t = fx.context.theme
   const run = createMemo(() => panelRun(fx.state, props.panel.sessionID))
+  const r = () => run()!
   const width = () => Math.max(40, props.panel.width - 2)
-  const frame = () => SPINNER[Math.floor(fx.state.now / 250) % SPINNER.length]!
   const elapsed = createMemo(() => {
-    const r = run()
-    if (!r) return ""
-    if (r.totalMs !== undefined && r.status === "done") return fmtDuration(r.totalMs)
-    return fmtClock(fx.state.now - r.startedAt)
+    const x = run()
+    if (!x) return ""
+    if (x.totalMs !== undefined && x.status === "done") return fmtDuration(x.totalMs)
+    if (x.status !== "running" && x.status !== "awaiting-approval") return relTime(x.updatedAt)
+    return fmtClock(fx.state.now - x.startedAt)
   })
   const gate = createMemo(() => {
-    const r = run()
-    return r?.gateId ? fx.state.gates[r.gateId] : undefined
+    const x = run()
+    return x?.gateId ? fx.state.gates[x.gateId] : undefined
   })
 
   fx.context.keymap.layer(() => ({
-    enabled: () => props.panel.focused && !!run(),
+    enabled: () => props.panel.focused,
     commands: [
       {
         bind: "a",
@@ -119,41 +158,50 @@ export function RunPanel(props: { fx: Fixora; panel: PanelInput }) {
         },
       },
       { bind: "r", title: "Retry", enabled: () => !!run() && run()!.status !== "running", run: () => void fx.actions.retry(run()!.runId) },
-      { bind: "shift+r", title: "Restart", run: () => void fx.actions.restart(run()!.runId) },
+      { bind: "shift+r", title: "Restart", enabled: () => !!run(), run: () => void fx.actions.restart(run()!.runId) },
       { bind: "c", title: "Cancel", enabled: () => run()?.status === "running", run: () => void fx.actions.cancel(run()!.runId) },
       { bind: "w", title: "Worker session", enabled: () => !!run()?.fixerSessionID, run: () => fx.actions.focusWorker(run()!) },
-      { bind: "d", title: "Feedback", enabled: () => run()?.status === "done", run: () => void fx.actions.feedback(run()!.runId) },
+      { bind: "d", title: "Feedback", enabled: () => !!run() && run()!.status !== "running", run: () => void fx.actions.feedback(run()!.runId) },
       { bind: "y", title: "Copy MR URL", enabled: () => !!run()?.mrUrl, run: () => void fx.actions.copy(run()!.mrUrl!) },
-      { bind: "l", title: "All runs", run: () => fx.actions.openRuns() },
+      { bind: "l", title: "All runs", run: () => fx.actions.show("runs") },
+      { bind: "g", title: "Report", run: () => fx.actions.show("report") },
       { bind: "f", title: "Fullscreen", run: () => props.panel.toggleFullscreen() },
       { bind: "escape", title: "Close", run: () => props.panel.close() },
     ],
   }))
 
-  const r = () => run()!
   return (
-    <box flexDirection="column" flexGrow={1} paddingLeft={1} paddingRight={1} backgroundColor={props.panel.presentation === "panel" ? t.background.raised.base : t.background.base}>
-      <Show when={run()} fallback={<text fg={t.text.muted}>No Fixora run in this session. Type /fixora to pick a crash.</text>}>
+    <>
+      <box flexDirection="row" justifyContent="space-between">
+        <text>
+          <S fg={t.text.base}>
+            <b>Fixora</b>
+          </S>
+          <S fg={t.text.muted}> · </S>
+          <Tabs fx={fx} />
+        </text>
+        <Show when={run()}>
+          <text fg={t.text.muted}>
+            {STATUS_LABEL[r().status] ?? r().status} {elapsed()}
+          </text>
+        </Show>
+      </box>
+      <Rule fx={fx} width={width()} />
+      <Show when={run()} fallback={<text fg={t.text.muted}>No Fixora run yet. Type /fixora to pick a crash, or /fixora paste {"<file>"} for a stack trace. l lists all runs.</text>}>
         {
           <>
-            <box flexDirection="row" justifyContent="space-between">
-              <text>
-                <S fg={tone(fx, r().status)}>{r().status === "running" ? frame() : r().status === "awaiting-approval" ? "⏸" : r().status === "done" ? "✓" : "✗"} </S>
-                <S fg={t.text.base}>
-                  <b>Fixora · {r().runId}</b>
-                </S>
-                <S fg={t.text.muted}> · {truncate(r().title, Math.max(10, width() - 48))}</S>
-              </text>
-              <text fg={t.text.muted}>
-                {STATUS_LABEL[r().status] ?? r().status} {elapsed()}
-              </text>
-            </box>
-            <Rule fx={fx} width={width()} />
+            <text>
+              <S fg={tone(fx, r().status)}>{glyphOf(fx, r().status)} </S>
+              <S fg={t.text.base}>
+                <b>{r().runId}</b>
+              </S>
+              <S fg={t.text.muted}> · {truncate(r().title, Math.max(10, width() - r().runId.length - 6))}</S>
+            </text>
             <scrollbox flexGrow={1} scrollY>
               <box flexDirection="column">
                 <For each={r().stages}>
                   {(stage) => {
-                    const glyph = () => (stage.status === "running" ? frame() : STATUS_GLYPH[stage.status])
+                    const glyph = () => (stage.status === "running" ? SPINNER[Math.floor(fx.state.now / 250) % SPINNER.length]! : STATUS_GLYPH[stage.status])
                     const right = () => (stage.status === "running" && stage.startedAt ? fmtClock(fx.state.now - stage.startedAt) : fmtShort(stage.durationMs))
                     const detail = () => (stage.status === "running" ? (r().progress ?? stage.detail ?? "") : (stage.detail ?? ""))
                     return (
@@ -266,12 +314,205 @@ export function RunPanel(props: { fx: Fixora; panel: PanelInput }) {
                 </Show>
               </box>
             </scrollbox>
-            <Rule fx={fx} width={width()} />
-            <Keys fx={fx} items={[...(gate() ? [["a", "answer"] as [string, string]] : []), ["r", "retry"], ["R", "restart"], ["c", "cancel"], ["w", "worker"], ["d", "feedback"], ["y", "copy MR"], ["l", "runs"], ["f", "full"], ["esc", "close"]]} />
           </>
         }
       </Show>
-    </box>
+      <Rule fx={fx} width={width()} />
+      <Keys fx={fx} items={[...(gate() ? [["a", "answer"] as [string, string]] : []), ["r", "retry"], ["R", "restart"], ["c", "cancel"], ["w", "worker"], ["d", "feedback"], ["y", "copy MR"], ["l", "runs"], ["g", "report"], ["f", "full"], ["esc", "close"]]} />
+    </>
+  )
+}
+
+// ---------- runs view ----------
+
+function RunsView(props: { fx: Fixora; panel: PanelInput }) {
+  const fx = props.fx
+  const t = fx.context.theme
+  const width = () => Math.max(40, props.panel.width - 2)
+  const runs = createMemo(() => fx.state.order.map((id) => fx.state.runs[id]!))
+  const cursor = () => Math.min(fx.state.cursor, Math.max(0, runs().length - 1))
+  const move = (delta: number) => fx.mutate((d) => void (d.cursor = Math.max(0, Math.min(runs().length - 1, cursor() + delta))))
+  const selected = () => runs()[cursor()]
+  const counts = createMemo(() => ({ running: runs().filter((r) => r.status === "running").length, awaiting: runs().filter((r) => r.status === "awaiting-approval").length, done: runs().filter((r) => r.status === "done").length }))
+
+  fx.context.keymap.layer(() => ({
+    enabled: () => props.panel.focused,
+    commands: [
+      { bind: "escape", title: "Back", run: () => fx.actions.show("run") },
+      { bind: "down,j", run: () => move(1) },
+      { bind: "up,k", run: () => move(-1) },
+      { bind: "return", title: "Show run", enabled: () => !!selected(), run: () => fx.actions.show("run", selected()!.runId) },
+      {
+        bind: "a",
+        title: "Answer approval",
+        enabled: () => !!selected()?.gateId,
+        run: () => {
+          const g = selected()?.gateId ? fx.state.gates[selected()!.gateId!] : undefined
+          if (g) void fx.actions.openGate(g)
+        },
+      },
+      { bind: "r", title: "Retry", enabled: () => !!selected() && selected()!.status !== "running", run: () => void fx.actions.retry(selected()!.runId) },
+      { bind: "shift+r", title: "Restart", enabled: () => !!selected(), run: () => void fx.actions.restart(selected()!.runId) },
+      { bind: "x", title: "Cancel", enabled: () => selected()?.status === "running", run: () => void fx.actions.cancel(selected()!.runId) },
+      { bind: "m", title: "Mark fixed", enabled: () => !!selected(), run: () => void fx.actions.markFixed(selected()!.runId) },
+      { bind: "s", title: "Sync MRs", run: () => void fx.actions.sync() },
+      { bind: "g", title: "Report", run: () => fx.actions.show("report") },
+      { bind: "f", title: "Fullscreen", run: () => props.panel.toggleFullscreen() },
+    ],
+  }))
+
+  return (
+    <>
+      <box flexDirection="row" justifyContent="space-between">
+        <text>
+          <S fg={t.text.base}>
+            <b>Fixora</b>
+          </S>
+          <S fg={t.text.muted}> · </S>
+          <Tabs fx={fx} />
+        </text>
+        <text fg={t.text.muted}>
+          {counts().running} running · {counts().awaiting} awaiting you · {counts().done} done
+        </text>
+      </box>
+      <Rule fx={fx} width={width()} />
+      <scrollbox flexGrow={1} scrollY>
+        <box flexDirection="column">
+          <Show when={runs().length === 0}>
+            <text fg={t.text.muted}>No runs yet. /fixora picks a crash, /fixora paste {"<file>"} fixes a pasted trace.</text>
+          </Show>
+          <For each={runs()}>
+            {(r, i) => (
+              <box flexDirection="row" justifyContent="space-between" backgroundColor={i() === cursor() ? t.background.raised.high : undefined}>
+                <text>
+                  <S fg={t.text.muted}>{i() === cursor() ? "▸ " : "  "}</S>
+                  <S fg={tone(fx, r.status)}>{glyphOf(fx, r.status)} </S>
+                  <S fg={t.text.base}>{truncate(r.runId, 24).padEnd(25)}</S>
+                  <S fg={tone(fx, r.status)}>{(STATUS_LABEL[r.status] ?? r.status).padEnd(16)}</S>
+                  <S fg={t.text.muted}>{(STAGE_TITLES[r.step] ?? r.step).padEnd(16)}</S>
+                  <S fg={t.text.base}>{truncate(r.title, Math.max(10, width() - 90))}</S>
+                </text>
+                <text fg={t.text.muted}>
+                  {r.mrUrl ? `MR ${r.mrStatus ?? "open"}  ` : ""}
+                  {r.jiraKey ? `${r.jiraKey}  ` : ""}
+                  {relTime(r.updatedAt)}
+                </text>
+              </box>
+            )}
+          </For>
+        </box>
+      </scrollbox>
+      <Rule fx={fx} width={width()} />
+      <Keys fx={fx} items={[["↑↓", "select"], ["enter", "show"], ["a", "answer"], ["r", "retry"], ["R", "restart"], ["x", "cancel"], ["m", "mark fixed"], ["s", "sync MRs"], ["g", "report"], ["esc", "back"]]} />
+    </>
+  )
+}
+
+// ---------- report view ----------
+
+function ReportView(props: { fx: Fixora; panel: PanelInput }) {
+  const fx = props.fx
+  const t = fx.context.theme
+  const width = () => Math.max(40, props.panel.width - 2)
+  const s = () => fx.state.report!
+  fx.context.keymap.layer(() => ({
+    enabled: () => props.panel.focused,
+    commands: [
+      { bind: "escape", title: "Back", run: () => fx.actions.show("run") },
+      { bind: "s", title: "Sync MRs", run: () => void fx.actions.sync().then(() => fx.actions.loadReport()) },
+      { bind: "l", title: "Runs", run: () => fx.actions.show("runs") },
+      { bind: "f", title: "Fullscreen", run: () => props.panel.toggleFullscreen() },
+    ],
+  }))
+  const max = () => Math.max(1, ...(fx.state.report?.funnel.map((f) => f.count) ?? [1]))
+  const barWidth = () => Math.max(8, Math.min(24, width() - 36))
+  return (
+    <>
+      <box flexDirection="row" justifyContent="space-between">
+        <text>
+          <S fg={t.text.base}>
+            <b>Fixora</b>
+          </S>
+          <S fg={t.text.muted}> · </S>
+          <Tabs fx={fx} />
+        </text>
+        <text fg={t.text.muted}>
+          last {fx.state.report?.days ?? 30} days · {fx.state.report?.total ?? 0} run(s)
+        </text>
+      </box>
+      <Rule fx={fx} width={width()} />
+      <Show when={fx.state.report} fallback={<text fg={t.text.muted}>Loading…</text>}>
+        {
+          <scrollbox flexGrow={1} scrollY>
+            <box flexDirection="column" gap={1}>
+              <box flexDirection="column">
+                <For each={s().funnel}>
+                  {(f) => (
+                    <text>
+                      <S fg={t.text.base}>{f.stage.padEnd(16)}</S>
+                      <S fg={t.hue.accent[200]}>{bar(f.count, max(), barWidth())}</S>
+                      <S fg={t.text.base}>{String(f.count).padStart(4)}</S>
+                      <S fg={t.text.muted}> {fmtPct(f.rate).padStart(4)}</S>
+                    </text>
+                  )}
+                </For>
+              </box>
+              <box flexDirection="column">
+                <text>
+                  <S fg={t.text.muted}>Trend  created </S>
+                  <S fg={t.categorical[0]![200]}>{sparkline(s().daily.map((d) => d.created))}</S>
+                  <S fg={t.text.base}> {s().daily.reduce((a, d) => a + d.created, 0)}</S>
+                </text>
+                <text>
+                  <S fg={t.text.muted}>       done    </S>
+                  <S fg={t.text.feedback.success.base}>{sparkline(s().daily.map((d) => d.completed))}</S>
+                  <S fg={t.text.base}> {s().daily.reduce((a, d) => a + d.completed, 0)}</S>
+                </text>
+                <text>
+                  <S fg={t.text.muted}>       failed  </S>
+                  <S fg={t.text.feedback.error.base}>{sparkline(s().daily.map((d) => d.failed))}</S>
+                  <S fg={t.text.base}> {s().daily.reduce((a, d) => a + d.failed, 0)}</S>
+                </text>
+              </box>
+              <box flexDirection="column">
+                <text fg={t.text.base}>
+                  <S fg={t.text.muted}>Timing   </S>avg {fmtDuration(s().timing.avgMs)} · p90 {fmtDuration(s().timing.p90Ms)} · fastest {fmtDuration(s().timing.minMs)}
+                </text>
+                <text fg={t.text.base}>
+                  <S fg={t.text.muted}>MRs      </S>
+                  {s().mrs.opened} opened · {s().mrs.merged} merged · {s().mrs.closed} closed · {s().mrs.pending} pending
+                </text>
+                <text fg={t.text.base}>
+                  <S fg={t.text.muted}>Releases </S>
+                  {s().releases.fixed} fixed · {s().releases.reopened} reopened ({fmtPct(s().releases.reopenRate)})
+                </text>
+                <Show when={s().top.platforms.length}>
+                  <text fg={t.text.base}>
+                    <S fg={t.text.muted}>Top      </S>
+                    {truncate([...s().top.platforms, ...s().top.versions].map(([k, v]) => `${k} ${v}`).join(" · "), width() - 10)}
+                  </text>
+                </Show>
+              </box>
+              <box flexDirection="column">
+                <text fg={t.text.muted}>Recent</text>
+                <For each={s().recent}>
+                  {(r) => (
+                    <text>
+                      <S fg={tone(fx, r.status)}>{glyphOf(fx, r.status)} </S>
+                      <S fg={t.text.base}>{truncate(r.runId, 24).padEnd(25)}</S>
+                      <S fg={t.text.muted}>{truncate(r.title, Math.max(10, width() - 36))}</S>
+                      <S fg={t.text.muted}>{r.mrUrl ? "  MR" : ""}</S>
+                    </text>
+                  )}
+                </For>
+              </box>
+            </box>
+          </scrollbox>
+        }
+      </Show>
+      <Rule fx={fx} width={width()} />
+      <Keys fx={fx} items={[["s", "sync MRs"], ["l", "runs"], ["f", "full"], ["esc", "back"]]} />
+    </>
   )
 }
 
@@ -396,191 +637,12 @@ export function GateDialog(props: { fx: Fixora; gate: GateView }) {
   )
 }
 
-// ---------- runs page ----------
-
-export function RunsPage(props: { fx: Fixora }) {
-  const fx = props.fx
-  const t = fx.context.theme
-  const runs = createMemo(() => fx.state.order.map((id) => fx.state.runs[id]!))
-  const [cursor, setCursor] = createSignal(0)
-  const selected = () => runs()[cursor()]
-  const counts = createMemo(() => ({ running: runs().filter((r) => r.status === "running").length, awaiting: runs().filter((r) => r.status === "awaiting-approval").length, done: runs().filter((r) => r.status === "done").length }))
-
-  fx.context.keymap.layer(() => ({
-    mode: "global",
-    commands: [
-      { bind: "escape", title: "Back", run: () => fx.actions.back() },
-      { bind: "down", run: () => void setCursor((c) => Math.min(runs().length - 1, c + 1)) },
-      { bind: "j", run: () => void setCursor((c) => Math.min(runs().length - 1, c + 1)) },
-      { bind: "up", run: () => void setCursor((c) => Math.max(0, c - 1)) },
-      { bind: "k", run: () => void setCursor((c) => Math.max(0, c - 1)) },
-      { bind: "return", title: "Open session", enabled: () => !!selected(), run: () => void openRun(fx, selected()!) },
-      { bind: "a", title: "Answer approval", enabled: () => !!selected()?.gateId, run: () => void fx.actions.openGate(fx.state.gates[selected()!.gateId!]!) },
-      { bind: "r", title: "Retry", enabled: () => !!selected() && selected()!.status !== "running", run: () => void fx.actions.retry(selected()!.runId) },
-      { bind: "shift+r", title: "Restart", enabled: () => !!selected(), run: () => void fx.actions.restart(selected()!.runId) },
-      { bind: "x", title: "Cancel", enabled: () => selected()?.status === "running", run: () => void fx.actions.cancel(selected()!.runId) },
-      { bind: "m", title: "Mark fixed", enabled: () => !!selected(), run: () => void fx.actions.markFixed(selected()!.runId) },
-      { bind: "s", title: "Sync MRs", run: () => void fx.actions.sync() },
-      { bind: "g", title: "Report", run: () => fx.actions.openReport() },
-    ],
-  }))
-
-  return (
-    <box flexDirection="column" flexGrow={1} paddingLeft={2} paddingRight={2} paddingTop={1}>
-      <box flexDirection="row" justifyContent="space-between">
-        <text fg={t.text.base}>
-          <b>Fixora · runs</b>
-        </text>
-        <text fg={t.text.muted}>
-          {counts().running} running · {counts().awaiting} awaiting you · {counts().done} done
-        </text>
-      </box>
-      <Rule fx={fx} width={100} />
-      <scrollbox flexGrow={1} scrollY>
-        <box flexDirection="column">
-          <Show when={runs().length === 0}>
-            <text fg={t.text.muted}>No runs yet. /fixora picks a crash, /fixora paste {"<file>"} fixes a pasted trace.</text>
-          </Show>
-          <For each={runs()}>
-            {(r, i) => (
-              <box flexDirection="row" justifyContent="space-between" backgroundColor={i() === cursor() ? t.background.raised.high : undefined}>
-                <text>
-                  <S fg={t.text.muted}>{i() === cursor() ? "▸ " : "  "}</S>
-                  <S fg={tone(fx, r.status)}>{r.status === "running" ? "◐" : r.status === "awaiting-approval" ? "⏸" : r.status === "done" ? "✓" : "✗"} </S>
-                  <S fg={t.text.base}>{r.runId.padEnd(26)}</S>
-                  <S fg={tone(fx, r.status)}>{(STATUS_LABEL[r.status] ?? r.status).padEnd(16)}</S>
-                  <S fg={t.text.muted}>{STAGE_TITLES[r.step]?.padEnd(18) ?? r.step.padEnd(18)}</S>
-                  <S fg={t.text.base}>{truncate(r.title, 40)}</S>
-                </text>
-                <text fg={t.text.muted}>
-                  {r.mrUrl ? `MR ${r.mrStatus ?? "open"}  ` : ""}
-                  {r.jiraKey ? `${r.jiraKey}  ` : ""}
-                  {relTime(r.updatedAt)}
-                </text>
-              </box>
-            )}
-          </For>
-        </box>
-      </scrollbox>
-      <Rule fx={fx} width={100} />
-      <Keys fx={fx} items={[["enter", "open"], ["a", "answer"], ["r", "retry"], ["R", "restart"], ["x", "cancel"], ["m", "mark fixed"], ["s", "sync MRs"], ["g", "report"], ["esc", "back"]]} />
-    </box>
-  )
-}
-
-export async function openRun(fx: Fixora, run: RunView) {
-  if (!run.sessionID) return
-  if (!(fx.context.ui.tabs.enabled() && fx.context.ui.tabs.focus(run.sessionID))) fx.context.ui.router.navigate({ type: "session", sessionID: run.sessionID })
-  await fx.actions.hydrate(run.runId)
-  setTimeout(() => fx.context.ui.panel.open("fixora"), 50)
-}
-
-// ---------- report page ----------
-
-export function ReportPage(props: { fx: Fixora; stats: () => FunnelStats | undefined; reload: () => void }) {
-  const fx = props.fx
-  const t = fx.context.theme
-  fx.context.keymap.layer(() => ({
-    mode: "global",
-    commands: [
-      { bind: "escape", title: "Back", run: () => fx.actions.back() },
-      { bind: "s", title: "Sync MRs", run: () => void fx.actions.sync().then(props.reload) },
-      { bind: "l", title: "Runs", run: () => fx.actions.openRuns() },
-    ],
-  }))
-  const max = () => Math.max(1, ...(props.stats()?.funnel.map((f) => f.count) ?? [1]))
-  const s = () => props.stats()!
-  return (
-    <box flexDirection="column" flexGrow={1} paddingLeft={2} paddingRight={2} paddingTop={1}>
-      <text fg={t.text.base}>
-        <b>Fixora · report</b>
-        <S fg={t.text.muted}> · last {props.stats()?.days ?? 30} days · {props.stats()?.total ?? 0} run(s)</S>
-      </text>
-      <Rule fx={fx} width={100} />
-      <Show when={props.stats()} fallback={<text fg={t.text.muted}>Loading…</text>}>
-        {
-          <scrollbox flexGrow={1} scrollY>
-            <box flexDirection="column" gap={1}>
-              <box flexDirection="column">
-                <text fg={t.text.muted}>{"Funnel".padEnd(18)}{" ".repeat(26)}n    rate</text>
-                <For each={s().funnel}>
-                  {(f) => (
-                    <text>
-                      <S fg={t.text.base}>{f.stage.padEnd(18)}</S>
-                      <S fg={t.hue.accent[200]}>{bar(f.count, max(), 24)}</S>
-                      <S fg={t.text.base}>{String(f.count).padStart(4)}</S>
-                      <S fg={t.text.muted}>  {fmtPct(f.rate).padStart(4)}</S>
-                    </text>
-                  )}
-                </For>
-              </box>
-              <box flexDirection="column">
-                <text>
-                  <S fg={t.text.muted}>Trend/day  created </S>
-                  <S fg={t.categorical[0]![200]}>{sparkline(s().daily.map((d) => d.created))}</S>
-                  <S fg={t.text.base}> {s().daily.reduce((a, d) => a + d.created, 0)}</S>
-                </text>
-                <text>
-                  <S fg={t.text.muted}>           done    </S>
-                  <S fg={t.text.feedback.success.base}>{sparkline(s().daily.map((d) => d.completed))}</S>
-                  <S fg={t.text.base}> {s().daily.reduce((a, d) => a + d.completed, 0)}</S>
-                </text>
-                <text>
-                  <S fg={t.text.muted}>           failed  </S>
-                  <S fg={t.text.feedback.error.base}>{sparkline(s().daily.map((d) => d.failed))}</S>
-                  <S fg={t.text.base}> {s().daily.reduce((a, d) => a + d.failed, 0)}</S>
-                </text>
-              </box>
-              <box flexDirection="column">
-                <text fg={t.text.base}>
-                  <S fg={t.text.muted}>Timing    </S>intake → done avg {fmtDuration(s().timing.avgMs)} · p90 {fmtDuration(s().timing.p90Ms)} · fastest {fmtDuration(s().timing.minMs)}
-                </text>
-                <text fg={t.text.base}>
-                  <S fg={t.text.muted}>MRs       </S>
-                  {s().mrs.opened} opened · {s().mrs.merged} merged · {s().mrs.closed} closed · {s().mrs.pending} pending
-                </text>
-                <text fg={t.text.base}>
-                  <S fg={t.text.muted}>Releases  </S>
-                  {s().releases.fixed} marked fixed · {s().releases.reopened} reopened ({fmtPct(s().releases.reopenRate)})
-                </text>
-                <Show when={s().top.platforms.length}>
-                  <text fg={t.text.base}>
-                    <S fg={t.text.muted}>Top       </S>
-                    {s().top.platforms.map(([k, v]) => `${k} ${v}`).join(" · ")}
-                    {s().top.versions.length ? ` · ${s().top.versions.map(([k, v]) => `${k} ${v}`).join(" · ")}` : ""}
-                  </text>
-                </Show>
-              </box>
-              <box flexDirection="column">
-                <text fg={t.text.muted}>Recent</text>
-                <For each={s().recent}>
-                  {(r) => (
-                    <text>
-                      <S fg={t.text.base}>{r.runId.padEnd(26)}</S>
-                      <S fg={tone(fx, r.status)}>{r.status.padEnd(14)}</S>
-                      <S fg={t.text.muted}>{truncate(r.title, 40)}</S>
-                      <S fg={t.text.muted}>{r.mrUrl ? "  MR" : ""}</S>
-                    </text>
-                  )}
-                </For>
-              </box>
-            </box>
-          </scrollbox>
-        }
-      </Show>
-      <Rule fx={fx} width={100} />
-      <Keys fx={fx} items={[["s", "sync MRs"], ["l", "runs"], ["esc", "back"]]} />
-    </box>
-  )
-}
-
 // ---------- small surfaces ----------
 
 export function SidebarBadge(props: { fx: Fixora; sessionID: string }) {
   const fx = props.fx
   const t = fx.context.theme
   const runs = createMemo(() => runsForSession(fx.state, props.sessionID))
-  const frame = () => SPINNER[Math.floor(fx.state.now / 250) % SPINNER.length]!
   return (
     <Show when={runs().length > 0}>
       <box flexDirection="column">
@@ -590,7 +652,7 @@ export function SidebarBadge(props: { fx: Fixora; sessionID: string }) {
         <For each={runs().slice(0, 3)}>
           {(r) => (
             <text>
-              <S fg={tone(fx, r.status)}>{r.status === "running" ? frame() : r.status === "awaiting-approval" ? "⏸" : r.status === "done" ? "✓" : "✗"} </S>
+              <S fg={tone(fx, r.status)}>{glyphOf(fx, r.status)} </S>
               <S fg={t.text.muted}>
                 {STAGE_TITLES[r.step] ?? r.step}
                 {r.status === "running" ? ` ${fmtClock(fx.state.now - r.startedAt)}` : r.status === "awaiting-approval" ? " · needs you" : ""}
@@ -636,7 +698,7 @@ export function ComposerStrip(props: { fx: Fixora; sessionID: string }) {
           <S fg={t.text.feedback.warning.base}>
             ⏸ Fixora needs a decision on {gate()?.runId}: {gate()?.summary}
           </S>
-          <S fg={t.text.muted}> — open the panel (/fixora status) and press a, or use the command palette "Fixora: answer pending approval"</S>
+          <S fg={t.text.muted}> — /fixora panel then a, or the palette command "Fixora: answer pending approval"</S>
         </text>
       </box>
     </Show>

@@ -24,7 +24,7 @@ export interface CrashSource {
   list?(sc: SourceContext, q: ListQuery): Promise<CrashSummary[]>
   get(sc: SourceContext, id: string, extra?: Record<string, string>): Promise<Crash>
   /** Posts a note / link back to the source (optional). */
-  annotate?(sc: SourceContext, id: string, note: { text: string; mrUrl?: string; jiraKey?: string }): Promise<void>
+  annotate?(sc: SourceContext, id: string, note: { text: string; mrUrl?: string; jiraKey?: string }, extra?: Record<string, string>): Promise<void>
 }
 
 export class SourceError extends Error {

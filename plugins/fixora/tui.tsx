@@ -1,21 +1,19 @@
 /** @jsxImportSource @opentui/solid */
-// Fixora TUI entry: a thin, reactive view over the server plugin's state. The server is the source
-// of truth; this entry subscribes to its RPC events, renders the live pipeline panel, the crash
-// picker, the approval dialog, the runs/report pages and small status surfaces.
+// Fixora TUI entry: a thin, reactive view over the server plugin's state that lives entirely inside
+// DXcoder's session view. The server is the source of truth; this entry subscribes to its RPC
+// events, renders the docked panel (run / runs / report views), the crash picker, the approval
+// dialog and small status surfaces. No full-screen pages.
 
 import { Plugin } from "@opencode/plugin/tui"
-import type { Route } from "@opencode/plugin/tui/context"
-import { createSignal, Show } from "solid-js"
-import { ComposerStrip, FooterChip, GateDialog, ReportPage, RunPanel, RunsPage, SidebarBadge, type Fixora } from "./src/tui/components.js"
-import { currentSession, parseSlash, pickCrash, startRuns } from "./src/tui/commands.js"
+import { Show } from "solid-js"
+import { ComposerStrip, FixoraPanel, FooterChip, GateDialog, SidebarBadge, type Fixora } from "./src/tui/components.js"
+import { currentSession, ensureSession, parseSlash, pickCrash, startRuns } from "./src/tui/commands.js"
 import { FixoraRpc, type RunSummary } from "./src/rpc.js"
 import type { FunnelStats } from "./src/state.js"
-import { applyEvent, applyRecord, applySummary, awaitingGates, initialState, type GateView, type RunView, type TuiState } from "./src/tui/store.js"
+import { applyEvent, applyRecord, applySummary, awaitingGates, initialState, type GateView, type PanelView, type TuiState } from "./src/tui/store.js"
 import type { RunRecord } from "./src/types.js"
 
 const PANEL = "fixora"
-const RUNS_ROUTE = "fixora.runs"
-const REPORT_ROUTE = "fixora.report"
 
 export default Plugin.define({
   id: "gosi.fixora",
@@ -24,13 +22,13 @@ export default Plugin.define({
     const [prefs] = context.storage.store<{ panelAutoOpen: boolean }>("prefs", { initial: { panelAutoOpen: true } })
     const rpc = context.client.rpc(FixoraRpc) as unknown as Record<string, (input: unknown) => Promise<unknown>> & { events: { on: (name: string, handler: (e: { data: Record<string, unknown> }) => void) => () => void } }
     const toast = context.ui.toast
-    let previous: Route = { type: "home" }
-    const [stats, setStats] = createSignal<FunnelStats | undefined>(undefined)
 
-    const navigateTo = (name: string) => {
-      const current = context.ui.router.current()
-      if (!(current.type === "plugin" && (current.name === RUNS_ROUTE || current.name === REPORT_ROUTE))) previous = current
-      context.ui.router.navigate({ type: "plugin", name })
+    /** Opens the docked panel in the current session, creating a session first when none is open. */
+    const openPanel = async () => {
+      if (context.ui.panel.current()?.name === PANEL) return true
+      if (context.ui.panel.open(PANEL)) return true
+      if (!(await ensureSession(fx))) return false
+      return context.ui.panel.open(PANEL)
     }
 
     const fx: Fixora = {
@@ -52,6 +50,25 @@ export default Plugin.define({
           } catch {
             // server entry not loaded yet; the panel shows an empty state
           }
+        },
+        async loadReport() {
+          try {
+            const report = (await rpc["report.get"]({ days: 30 })) as FunnelStats
+            mutate((d) => void (d.report = report))
+          } catch {
+            mutate((d) => void (d.report = undefined))
+          }
+        },
+        show(view, runId) {
+          mutate((d) => {
+            d.view = view
+            if (view === "run") d.pinned = runId
+            if (view === "runs") d.cursor = 0
+          })
+          if (view === "runs") void fx.actions.hydrate()
+          if (view === "report") void fx.actions.loadReport()
+          if (view === "run" && runId) void fx.actions.hydrate(runId)
+          void openPanel()
         },
         async openGate(gate) {
           try {
@@ -113,14 +130,6 @@ export default Plugin.define({
           if (!run.fixerSessionID) return
           if (!(context.ui.tabs.enabled() && context.ui.tabs.focus(run.fixerSessionID))) context.ui.router.navigate({ type: "session", sessionID: run.fixerSessionID })
         },
-        openRuns() {
-          void fx.actions.hydrate()
-          navigateTo(RUNS_ROUTE)
-        },
-        openReport() {
-          void loadReport()
-          navigateTo(REPORT_ROUTE)
-        },
         async sync() {
           const res = (await rpc["mr.sync"]({ sessionID: currentSession(fx) }).catch(() => ({ updated: 0 }))) as { updated: number }
           toast.show({ message: `Fixora: ${res.updated} MR status change(s)`, variant: "info" })
@@ -142,18 +151,7 @@ export default Plugin.define({
             toast.show({ message: text, variant: "info", duration: 6000 })
           }
         },
-        back() {
-          context.ui.router.navigate(previous)
-        },
       },
-    }
-
-    const loadReport = async () => {
-      try {
-        setStats((await rpc["report.get"]({ days: 30 })) as FunnelStats)
-      } catch {
-        setStats(undefined)
-      }
     }
 
     // ---------- events → store, toasts, attention ----------
@@ -168,6 +166,10 @@ export default Plugin.define({
     on("run.started", (data) => {
       const sessionID = String(data.sessionID ?? "")
       const route = context.ui.router.current()
+      mutate((d) => {
+        d.view = "run"
+        d.pinned = undefined
+      })
       if (prefs.panelAutoOpen && route.type === "session" && route.sessionID === sessionID && !context.ui.panel.current()) context.ui.panel.open(PANEL)
       else toast.show({ message: `Fixora started ${data.runId}`, variant: "info", sessionID })
     })
@@ -202,12 +204,12 @@ export default Plugin.define({
     const ticker = setInterval(() => mutate((d) => void (d.now = Date.now())), 1000)
     void fx.actions.hydrate()
 
-    // ---------- surfaces ----------
+    // ---------- surfaces (all inside the session view) ----------
     context.ui.slot({
       append: "session.panel",
       render: (panel) => (
         <Show when={panel.name === PANEL}>
-          <RunPanel fx={fx} panel={panel} />
+          <FixoraPanel fx={fx} panel={panel} />
         </Show>
       ),
     })
@@ -215,10 +217,9 @@ export default Plugin.define({
     context.ui.slot({ append: "prompt.footer.status", render: () => <FooterChip fx={fx} /> })
     context.ui.slot({ append: "home.footer.status", render: () => <FooterChip fx={fx} /> })
     context.ui.slot({ append: "session.composer.top", render: (p) => <ComposerStrip fx={fx} sessionID={p.sessionID} /> })
-    context.ui.router.register({ name: RUNS_ROUTE, render: () => <RunsPage fx={fx} /> })
-    context.ui.router.register({ name: REPORT_ROUTE, render: () => <ReportPage fx={fx} stats={stats} reload={() => void loadReport()} /> })
 
     // ---------- commands ----------
+    const showView = (view: PanelView, runId?: string) => fx.actions.show(view, runId)
     context.keymap.layer(() => ({
       mode: "global",
       commands: [
@@ -231,33 +232,26 @@ export default Plugin.define({
           slash: { name: "fixora", aliases: ["fx"], arguments: true },
           async run(input) {
             const { verb, rest } = parseSlash(input)
-            const sessionID = currentSession(fx)
             switch (verb) {
               case "":
               case "list":
                 return pickCrash(fx, rpc as never)
               case "top": {
-                if (!sessionID) return toast.show({ message: "Open a session first", variant: "warning" })
+                const sessionID = await ensureSession(fx)
+                if (!sessionID) return
                 const n = Math.max(1, Math.min(20, Number(rest) || 1))
-                const list = (await rpc["crashes.list"]({ sessionID, top: n * 3 })) as { crashes: Array<{ source: string; id: string; state?: string }> }
-                const refs = list.crashes.filter((c) => !c.state || c.state === "new" || c.state === "failed" || c.state === "reopened").slice(0, n).map((c) => `${c.source}:${c.id}`)
+                const list = (await rpc["crashes.list"]({ sessionID, top: n * 3 })) as { crashes: Array<{ source: string; id: string; state?: string; ref?: string }> }
+                const refs = list.crashes.filter((c) => !c.state || c.state === "new" || c.state === "failed" || c.state === "reopened").slice(0, n).map((c) => c.ref ?? `${c.source}:${c.id}`)
                 if (refs.length === 0) return toast.show({ message: "No new crashes to fix", variant: "info" })
                 return startRuns(fx, rpc, sessionID, refs)
               }
               case "status":
               case "runs":
-                if (rest && sessionID) {
-                  await fx.actions.hydrate(rest)
-                  context.ui.panel.open(PANEL)
-                  return
-                }
-                if (sessionID && state.order.some((id) => state.runs[id]!.sessionID === sessionID) && !rest) {
-                  context.ui.panel.open(PANEL)
-                  return
-                }
-                return fx.actions.openRuns()
+                return rest ? showView("run", rest.split(/\s+/)[0]) : showView("runs")
+              case "panel":
+                return context.ui.panel.current()?.name === PANEL ? context.ui.panel.close() : showView(state.view)
               case "report":
-                return fx.actions.openReport()
+                return showView("report")
               case "feedback": {
                 const [runId, ...words] = rest.split(/\s+/)
                 if (!runId) return toast.show({ message: "Usage: /fixora feedback <runId> <message>", variant: "warning" })
@@ -277,20 +271,20 @@ export default Plugin.define({
                 return fx.actions.cancel(rest.split(/\s+/)[0]!)
               case "sync":
                 return fx.actions.sync()
-              case "panel":
-                return void (context.ui.panel.current()?.name === PANEL ? context.ui.panel.close() : context.ui.panel.open(PANEL))
-              default:
+              default: {
                 // fix / paste / fixed / clean / batch / help and raw refs: the server command handles them.
-                if (!sessionID) return toast.show({ message: "Open a session first", variant: "warning" })
+                const sessionID = await ensureSession(fx)
+                if (!sessionID) return
                 await context.client.session.command({ sessionID, name: "fixora", text: input ?? "" } as never)
                 setTimeout(() => void fx.actions.hydrate(), 1500)
+              }
             }
           },
         },
         { id: "fixora.top", title: "Fixora: fix the top crash now", group: "Fixora", palette: true, run: () => context.keymap.dispatch("fixora.open", "top 1") },
-        { id: "fixora.panel", title: "Fixora: toggle run panel", group: "Fixora", palette: true, enabled: () => !!currentSession(fx), run: () => context.keymap.dispatch("fixora.open", "panel") },
-        { id: "fixora.runs", title: "Fixora: all runs", group: "Fixora", palette: true, run: () => fx.actions.openRuns() },
-        { id: "fixora.report", title: "Fixora: report", group: "Fixora", palette: true, run: () => fx.actions.openReport() },
+        { id: "fixora.panel", title: "Fixora: toggle panel", group: "Fixora", palette: true, run: () => context.keymap.dispatch("fixora.open", "panel") },
+        { id: "fixora.runs", title: "Fixora: all runs", group: "Fixora", palette: true, run: () => showView("runs") },
+        { id: "fixora.report", title: "Fixora: report", group: "Fixora", palette: true, run: () => showView("report") },
         {
           id: "fixora.approve",
           title: "Fixora: answer pending approval",
@@ -312,5 +306,3 @@ export default Plugin.define({
     }
   },
 })
-
-export type { RunView }

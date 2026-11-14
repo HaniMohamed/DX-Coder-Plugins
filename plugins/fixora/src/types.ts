@@ -39,6 +39,8 @@ export interface Crash {
   symbolication: Symbolication
   fetchedAt: string
   extra?: Record<string, unknown>
+  /** Firebase app id the crash was fetched from (Crashlytics only). */
+  appId?: string
 }
 
 export type CrashState = "new" | "in_progress" | "awaiting" | "mr_open" | "merged" | "fixed" | "reopened" | "failed" | "skipped"
@@ -55,6 +57,10 @@ export interface CrashSummary {
   fingerprint?: string
   state?: CrashState
   runId?: string
+  /** Full reference to start a run with (`source:id`, plus the app for multi-app Crashlytics). */
+  ref?: string
+  platform?: string
+  appId?: string
 }
 
 export type Classification = "fixable" | "needs_symbolication" | "third_party_only" | "not_in_repo" | "env_or_data" | "needs_human" | "duplicate_of"

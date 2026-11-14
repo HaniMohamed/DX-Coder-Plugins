@@ -14,7 +14,7 @@ Kotlin/Java, Swift, JavaScript/TypeScript, Python, Go, .NET, Rust.
 | Command | What it does |
 |---|---|
 | `/fixora` | List the top crashes from every connected source. The agent then asks which to fix and starts the runs. |
-| `/fixora fix <source>:<id> \| <crash url>` | Fix one crash, e.g. `sentry:4523123`, `crashlytics:deadbeef`, a Sentry issue URL or a Firebase console issue URL. `/fixora sentry:123` is a shortcut. |
+| `/fixora fix <source>:<id> \| <crash url>` | Fix one crash, e.g. `sentry:4523123`, `crashlytics:deadbeef`, a Sentry issue URL or a Firebase console issue URL. With several Firebase apps, `crashlytics:deadbeef@1:123:ios:abc` names the app (the picker and `/fixora` list print this form). `/fixora sentry:123` is a shortcut. |
 | `/fixora paste <file> [--title ".."] [--platform ..] [--language ..]` | Fix a stack trace saved in a file. No MCP server needed. |
 | `/fixora top [N]` | Fix the top N new crashes (default 1). |
 | `/fixora batch [--top N] [--min-users N] [--source s] [--minutes M]` | Batch mode with a time budget. |
@@ -25,6 +25,7 @@ Kotlin/Java, Swift, JavaScript/TypeScript, Python, Go, .NET, Rust.
 | `/fixora fixed <runId> --release <X> [--platform android\|ios\|web]` | Release tracking: if the same crash fingerprint shows up later, it is flagged as reopened with a likely reason. |
 | `/fixora report [--days 30]` | Funnel (detected → analysed → fixed → validated → reviewed → pushed → MR → merged), timings, MR status, reopen rate, top platforms/versions. |
 | `/fixora sync` | Refresh MR statuses (merged / closed). |
+| `/fixora doctor` | Show the MCP servers and tools Fixora detects, which services it recognised, and the likely fix when a crash source is missing. |
 | `/fixora clean <runId> [--remote]` | Remove the worktree (and, after approval, the remote branch). |
 
 Flags: `--dry-run` (stop before commit; writes the MR body and commit message to the run folder),
@@ -78,9 +79,11 @@ entry). With it:
   decides later (the composer strip, the sidebar badge, the footer chip and the palette command
   "Fixora: answer pending approval" bring it back). Without a TUI, or when nobody answers within
   the acknowledgement window, the host's permission prompt is used instead.
-- **Pages:** `/fixora status` (or `/fixora runs`) lists every run with status, step, Jira and MR
-  (`enter` opens its session and panel, `a`/`r`/`R`/`x`/`m` act on it, `s` syncs MR statuses);
-  `/fixora report` shows the funnel, the 30-day trend, timings, MR and reopen statistics.
+- **Views of the same panel** (nothing leaves the session): `/fixora status` (or `l` in the panel)
+  lists every run with status, step, Jira and MR (`↑↓` select, `enter` shows it, `a`/`r`/`R`/`x`/`m`
+  act on it, `s` syncs MR statuses); `/fixora status <runId>` pins one run; `/fixora report` (or `g`)
+  shows the funnel, the 30-day trend, timings, MR and reopen statistics. `esc` goes back to the run
+  view, then closes the panel; `/fixora panel` toggles it.
 - Toasts and OS notifications (with sounds) on start, decision needed, done, failed and reopened crashes.
 
 Everything else (`fix`, `paste`, `top`, `batch`, `fixed`, `clean`, flags) is forwarded to the server
@@ -97,7 +100,8 @@ servers, and the plugin:
   "mcp": {
     "servers": {
       "sentry": { "type": "remote", "url": "https://mcp.sentry.dev/mcp" },
-      "firebase": { "type": "local", "command": ["npx", "-y", "firebase-tools@latest", "mcp"] },
+      // --only crashlytics: without it firebase-tools hides the crashlytics_* tools unless it finds a Crashlytics app in its working directory
+      "firebase": { "type": "local", "command": ["npx", "-y", "firebase-tools@latest", "mcp", "--only", "crashlytics"] },
       "jira": { "type": "local", "command": ["mcp-atlassian"], "environment": { "JIRA_URL": "https://jira.example.com", "JIRA_PERSONAL_TOKEN": "<pat>" } },
       "gitlab": { "type": "local", "command": ["npx", "-y", "@zereight/mcp-gitlab"], "environment": { "GITLAB_API_URL": "https://gitlab.example.com/api/v4", "GITLAB_PERSONAL_ACCESS_TOKEN": "<token>" } }
     }
@@ -117,10 +121,10 @@ servers, and the plugin:
         "confidence": { "minToFix": 0.4, "minToPublish": 0.6, "autoApprove": 0.85 },
         "approvals": "publish",
         "mode": "fix",
-        "jira": { "project": "APP", "issueType": "Bug", "labels": ["fixora"], "transitionOnMr": "In Review", "ticketOnSkip": false },
+        "jira": { "project": "APP", "issueType": "Bug", "parent": null, "labels": ["fixora"], "transitionOnMr": "In Review", "ticketOnSkip": false },
         "mr": { "draft": true, "labels": ["fixora"], "reviewers": [], "target": null, "forge": null },
         "sourceWriteBack": false,
-        "crashlytics": { "appId": "1:1234567890:android:abcdef" },
+        "crashlytics": { "appIds": ["1:1234567890:android:abcdef", "1:1234567890:ios:012345"] },
         "sentry": { "organization": "acme", "project": "shop" },
         "inAppPackages": ["com.example.app"], "appPackage": "my_app",
         "worktree": { "root": null, "keep": "until-merged" },
@@ -154,10 +158,10 @@ dxcoder plugin add 'git+https://<your-git-host>/<org>/dxcoder-plugins.git#path:p
 | `confidence.*` | 0.4 / 0.6 / 0.85 | Minimum confidence to attempt a fix, to publish, and to auto-approve. |
 | `approvals` | `publish` | `publish` = one dialog for push + MR; `each` = separate dialogs; `auto` = no dialog when confidence, checks, review and risk allow. |
 | `mode` | `fix` | `test-first` makes the worker write a failing reproduction test before the fix. |
-| `jira.*` | — | Project key enables tickets; issue type, labels, transition after the MR, REST credentials as a fallback to the MCP server. |
+| `jira.*` | — | Project key enables tickets; issue type, labels, transition after the MR, REST credentials as a fallback to the MCP server. `parent` links every ticket to an issue (set it together with `"issueType": "Sub-task"` to create sub-tasks under a story). |
 | `mr.*` | draft | Draft MRs, labels, reviewers, target branch, forge override (`gitlab` / `github`). |
 | `sourceWriteBack` | false | Post a note with the MR link on the Sentry / Crashlytics issue. |
-| `crashlytics.appId`, `sentry.organization` / `project` | — | Needed by the respective MCP tools when not derivable from a URL. |
+| `crashlytics.appId` / `appIds`, `sentry.organization` / `project` | — | Needed by the respective MCP tools when not derivable from a URL. `appIds` (or an array in `appId`) lists several Firebase apps: `/fixora` queries all of them, refs carry the app (`crashlytics:<id>@<appId>`) and a bare `crashlytics:<id>` is looked up in each app in order. |
 | `inAppPackages`, `appPackage` | — | Package / module prefixes that count as application code. |
 | `worktree.root`, `worktree.keep` | host default, `until-merged` | Where worktrees go and when they are removed. |
 

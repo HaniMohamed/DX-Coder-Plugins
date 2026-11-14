@@ -3,7 +3,7 @@ import matter from "gray-matter"
 import { readFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import { COMMAND, parseCommand, USAGE, type Flags } from "./src/command.js"
-import { prepareRun, presentList, refreshServices, runClean, runFeedback, runFix, runFixed, runList, runPaste, runReport, runRestart, runRetry, runStatus, runSync, runTop, startPipeline } from "./src/flows.js"
+import { prepareRun, presentList, refreshServices, runClean, runFeedback, runFix, runFixed, runList, runPaste, runReport, runRestart, runRetry, runStatus, runSync, runTop, startPipeline, runDoctor } from "./src/flows.js"
 import { ackGate, decideGate } from "./src/gate.js"
 import { decideAutoAllow, pendingCalls } from "./src/mcp.js"
 import { DEFAULTS, readOptions, type FixoraOptions } from "./src/options.js"
@@ -312,6 +312,9 @@ export default Plugin.define({
                 break
               case "sync":
                 await runSync(rt, { sessionID })
+                break
+              case "doctor":
+                await runDoctor(rt, { sessionID })
                 break
             }
           } catch (error) {

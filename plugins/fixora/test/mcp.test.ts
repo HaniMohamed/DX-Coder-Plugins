@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { decideAutoAllow, matchServices, mcpNamespace, normalizeToolOutput, pendingKey } from "../src/mcp.js"
+import { decideAutoAllow, matchServices, mcpNamespace, normalizeToolOutput, pendingKey, renderDoctor } from "../src/mcp.js"
 
 describe("matchServices", () => {
   test("detects each service from tool ids, including odd server names", () => {
@@ -61,5 +61,27 @@ describe("normalizeToolOutput", () => {
     expect(normalizeToolOutput({ content: [{ type: "text", text: "## Issue" }, { type: "text", text: "body" }] })).toBe("## Issue\nbody")
     expect(normalizeToolOutput({ content: '[{"id":1}]' })).toEqual([{ id: 1 }])
     expect(normalizeToolOutput("plain")).toBe("plain")
+  })
+})
+
+describe("renderDoctor", () => {
+  test("explains a connected Firebase server without crashlytics tools", () => {
+    const servers = [{ name: "firebase", status: { status: "connected" } }, { name: "jira", status: "connected" }]
+    const toolIds = ["firebase_firebase_get_project", "firebase_firebase_list_apps", "jira_jira_get_issue", "jira_jira_search", "jira_jira_create_issue"]
+    const services = matchServices(toolIds, servers)
+    const out = renderDoctor({ servers, toolIds, services, options: { sources: ["crashlytics"], crashlytics: { appIds: ["1:1:android:a"] }, jira: { project: "DE", issueType: "Sub-task", parent: "DE-62556" } } })
+    expect(out).toContain("**firebase** (connected) — 2 tool(s)")
+    expect(out).toContain("crashlytics: not found")
+    expect(out).toContain('jira: server "jira" (connected)')
+    expect(out).toContain("DE / Sub-task under DE-62556")
+    expect(out).toContain("### Likely fix")
+    expect(out).toContain('"--only", "crashlytics"')
+  })
+  test("no fix section when crashlytics is detected", () => {
+    const servers = [{ name: "firebase", status: { status: "connected" } }]
+    const toolIds = ["firebase_crashlytics_get_issue", "firebase_crashlytics_get_report"]
+    const out = renderDoctor({ servers, toolIds, services: matchServices(toolIds, servers), options: { sources: ["crashlytics"], crashlytics: { appIds: [] }, jira: { issueType: "Bug" } } })
+    expect(out).toContain('crashlytics: server "firebase" (connected)')
+    expect(out).not.toContain("Likely fix")
   })
 })

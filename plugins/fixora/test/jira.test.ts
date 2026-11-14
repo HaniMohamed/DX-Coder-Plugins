@@ -52,6 +52,11 @@ describe("REST port against a mock Jira", () => {
     const created = await port.create({ project: "APP", issueType: "Bug", summary: "x".repeat(300), description: "d", labels: ["fixora"] })
     expect(created.key).toBe("APP-2")
     expect((requests.find((r) => r.method === "POST" && r.path === "/rest/api/2/issue")!.body as { fields: { summary: string; labels: string[] } }).fields.summary).toHaveLength(255)
+    const sub = await port.create({ project: "DE", issueType: "Sub-task", summary: "s", description: "d", labels: ["fixora"], parent: "DE-62556" })
+    expect(sub.key).toBe("APP-2")
+    const subBody = requests.filter((r) => r.method === "POST" && r.path === "/rest/api/2/issue").at(-1)!.body as { fields: Record<string, unknown> }
+    expect(subBody.fields.parent).toEqual({ key: "DE-62556" })
+    expect(subBody.fields.issuetype).toEqual({ name: "Sub-task" })
     await port.comment("APP-2", "hello")
     expect(await port.transitions("APP-2")).toEqual([{ id: "21", name: "In Review" }])
     await port.transition("APP-2", "21")

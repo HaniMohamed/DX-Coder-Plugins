@@ -104,7 +104,11 @@ This folder is a self-contained DXcoder plugin: no npm install, no network neede
 2. Add it to opencode.jsonc (global: ~/.config/opencode/opencode.jsonc, or a project's):
 
    {
-     "plugins": [{ "package": "/opt/dxcoder/fixora", "options": { "baseBranch": "main", "jira": { "project": "APP" } } }]
+     "plugins": [{ "package": "/opt/dxcoder/fixora", "options": {
+       "baseBranch": "main",
+       "crashlytics": { "appIds": ["1:<project number>:android:<hash>", "1:<project number>:ios:<hash>"] },
+       "jira": { "project": "APP", "issueType": "Sub-task", "parent": "APP-123" }
+     } }]
    }
 
    The \`dxcoder plugin add\` CLI accepts only npm/git specifiers; local folders go through the config file.
@@ -113,12 +117,15 @@ This folder is a self-contained DXcoder plugin: no npm install, no network neede
 
    { "mcp": { "servers": {
        "sentry":   { "type": "remote", "url": "https://mcp.sentry.dev/mcp" },
-       "firebase": { "type": "local", "command": ["npx", "-y", "firebase-tools@latest", "mcp"] }
+       "firebase": { "type": "local", "command": ["npx", "-y", "firebase-tools@latest", "mcp", "--only", "crashlytics"] }
    } } }
+
+   "--only crashlytics" matters: without it firebase-tools hides its crashlytics_* tools unless it finds a
+   Crashlytics app in its own working directory.
 
    Optional: a Jira server (mcp-atlassian) for tickets, a GitLab/GitHub MCP server (or the glab / gh CLI) for merge requests.
 
-4. Restart DXcoder and run:  /fixora status
+4. Restart DXcoder and run:  /fixora doctor   (shows the servers / tools Fixora detected and the likely fix if a source is missing)
    Then list crashes:         /fixora
    Or fix one directly:       /fixora fix sentry:<issue id>
 

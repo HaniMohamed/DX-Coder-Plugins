@@ -299,12 +299,12 @@ export function renderValidationCard(run: RunRecord): string {
   return L.join("\n")
 }
 
-export function renderApprovalPreview(run: RunRecord, o: { kind: "ticket" | "publish" | "push" | "mr"; branch?: string; remote?: string; target?: string; mr?: { title: string; body: string; provider: string }; jira?: { project?: string; issueType: string; summary?: string }; crashUrl?: string }): string {
+export function renderApprovalPreview(run: RunRecord, o: { kind: "ticket" | "publish" | "push" | "mr"; branch?: string; remote?: string; target?: string; mr?: { title: string; body: string; provider: string }; jira?: { project?: string; issueType: string; summary?: string; parent?: string }; crashUrl?: string }): string {
   const L: string[] = []
   L.push(`# Fixora · ${run.runId} · approval: ${o.kind}`, "")
   L.push(`Crash: ${run.title}${o.crashUrl ? ` — ${o.crashUrl}` : ""}`, "")
   if (run.triage) L.push(`Root cause (${fmtPct(run.triage.confidence)} confidence): ${run.triage.rootCause}`, "")
-  if (o.kind === "ticket" && o.jira) L.push(`Will create a Jira **${o.jira.issueType}** in project **${o.jira.project ?? "?"}**: "${o.jira.summary ?? ""}"`, "")
+  if (o.kind === "ticket" && o.jira) L.push(`Will create a Jira **${o.jira.issueType}** in project **${o.jira.project ?? "?"}**${o.jira.parent ? ` under **${o.jira.parent}**` : ""}: "${o.jira.summary ?? ""}"`, "")
   if (o.kind !== "ticket") {
     L.push(`Branch: \`${o.branch}\` → ${o.remote}${o.target ? ` (target ${o.target})` : ""}`)
     if (run.fix) L.push(`Files: ${run.fix.filesChanged.map((f) => `\`${f}\``).join(", ")}`)
@@ -323,7 +323,7 @@ export function renderCrashTable(list: CrashSummary[], o: { states: Map<string, 
   list.forEach((c, i) => {
     const s = c.fingerprint ? o.states.get(c.fingerprint) : undefined
     const state = s ? `${s.state}${s.runId ? ` (${s.runId})` : ""}` : "new"
-    L.push(`| ${i + 1} | \`${c.source}:${c.id}\` | ${cell(c.title).slice(0, 70)} | ${c.userCount ?? "—"} | ${c.eventCount ?? "—"} | ${cell(c.appVersion) || "—"} | ${relTime(c.lastSeen)} | ${state} |`)
+    L.push(`| ${i + 1} | \`${c.ref ?? `${c.source}:${c.id}`}\` | ${cell(c.title).slice(0, 70)}${c.platform ? ` (${c.platform})` : ""} | ${c.userCount ?? "—"} | ${c.eventCount ?? "—"} | ${cell(c.appVersion) || "—"} | ${relTime(c.lastSeen)} | ${state} |`)
   })
   return L.join("\n")
 }

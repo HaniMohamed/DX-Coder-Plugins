@@ -43,6 +43,8 @@ export interface FixoraOptions {
     labels: string[]
     transitionOnMr?: string
     ticketOnSkip: boolean
+    /** Parent issue key (e.g. "DE-62556"); required when issueType is a sub-task. */
+    parent?: string
     url?: string
     token?: string
     username?: string
@@ -51,7 +53,8 @@ export interface FixoraOptions {
   }
   mr: { draft: boolean; labels: string[]; reviewers: string[]; target?: string; forge?: "gitlab" | "github" }
   sourceWriteBack: boolean
-  crashlytics: { appId?: string }
+  /** Firebase app ids ("1:<project>:<platform>:<hash>"); several when one codebase ships to more than one platform. */
+  crashlytics: { appIds: string[] }
   sentry: { organization?: string; project?: string }
   inAppPackages: string[]
   appPackage?: string
@@ -79,7 +82,7 @@ export const DEFAULTS: FixoraOptions = {
   jira: { issueType: "Bug", labels: ["fixora"], transitionOnMr: "In Review", ticketOnSkip: false },
   mr: { draft: true, labels: ["fixora"], reviewers: [] },
   sourceWriteBack: false,
-  crashlytics: {},
+  crashlytics: { appIds: [] },
   sentry: {},
   inAppPackages: [],
   worktree: { keep: "until-merged" },
@@ -97,6 +100,9 @@ class Reader {
 
   private get(path: string): unknown {
     return path.split(".").reduce<unknown>((acc, key) => (isRecord(acc) ? acc[key] : undefined), this.raw)
+  }
+  getRaw(path: string): unknown {
+    return this.get(path)
   }
   present(path: string) {
     const v = this.get(path)
@@ -237,6 +243,7 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
         return v === null ? undefined : (v ?? d.jira.transitionOnMr)
       })(),
       ticketOnSkip: r.bool("jira.ticketOnSkip", d.jira.ticketOnSkip),
+      parent: r.str("jira.parent"),
       url: r.str("jira.url"),
       token: r.str("jira.token"),
       username: r.str("jira.username"),
@@ -251,7 +258,7 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
       forge: r.present("mr.forge") ? r.oneOf("mr.forge", ["gitlab", "github"] as const, "gitlab") : undefined,
     },
     sourceWriteBack: r.bool("sourceWriteBack", d.sourceWriteBack),
-    crashlytics: { appId: r.str("crashlytics.appId") },
+    crashlytics: { appIds: readAppIds(r) },
     sentry: { organization: r.str("sentry.organization"), project: r.str("sentry.project") },
     inAppPackages: r.strs("inAppPackages", d.inAppPackages),
     appPackage: r.str("appPackage"),
@@ -273,7 +280,33 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
     }
   }
   if (/^(main|master|develop|release|hotfix)\/$/.test(value.branchPrefix)) r.errors.push(`branchPrefix must not be a protected branch name (${value.branchPrefix})`)
+  if (value.jira.parent && !JIRA_KEY.test(value.jira.parent)) r.errors.push(`jira.parent must be an issue key like "DE-62556" (got ${JSON.stringify(value.jira.parent)})`)
+  if (/sub-?task/i.test(value.jira.issueType) && !value.jira.parent) r.errors.push(`jira.issueType ${JSON.stringify(value.jira.issueType)} needs "jira": { "parent": "<story key>" }`)
   return r.errors.length > 0 ? { ok: false, errors: r.errors } : { ok: true, value }
+}
+
+export const JIRA_KEY = /^[A-Z][A-Z0-9_]*-\d+$/
+export const FIREBASE_APP_ID = /^\d+:\d+:(android|ios|web|macos|windows|linux):[a-f0-9]+$/i
+
+/** `crashlytics.appId` (string or array) and `crashlytics.appIds` (array), merged, deduplicated, order kept. */
+function readAppIds(r: Reader): string[] {
+  const out: string[] = []
+  for (const path of ["crashlytics.appId", "crashlytics.appIds"] as const) {
+    const v = r.getRaw(path)
+    if (v === undefined || v === null) continue
+    const list = Array.isArray(v) ? v : [v]
+    if (!list.every((x) => typeof x === "string")) {
+      r.errors.push(`${path} must be a string or an array of strings`)
+      continue
+    }
+    for (const id of list as string[]) {
+      const t = id.trim()
+      if (!t) continue
+      if (!FIREBASE_APP_ID.test(t)) r.errors.push(`${path} contains an invalid Firebase app id ${JSON.stringify(t)} (expected "1:<project number>:<platform>:<hash>")`)
+      else if (!out.includes(t)) out.push(t)
+    }
+  }
+  return out
 }
 
 function normalizePrefix(p: string) {

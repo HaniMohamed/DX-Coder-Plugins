@@ -33,6 +33,7 @@ export type Parsed =
   | { verb: "report"; days: number }
   | { verb: "clean"; runId: string; remote: boolean }
   | { verb: "sync" }
+  | { verb: "doctor" }
   | { verb: "help" }
 
 export type ParseResult = Parsed | { error: string }
@@ -54,6 +55,7 @@ export const USAGE = [
   `  /${COMMAND} report [--days 30]                funnel, timings, MR status, reopen rate`,
   `  /${COMMAND} clean <runId> [--remote]          remove the worktree (and the remote branch)`,
   `  /${COMMAND} sync                              refresh MR statuses`,
+  `  /${COMMAND} doctor                            show the MCP servers / tools Fixora detects and why a source is missing`,
   "Flags: --dry-run --no-ticket --no-mr --no-push --auto --force --force-triage --test-first --base <branch>",
   "       --model <providerID/modelID> --review quick|session --tests full|mapped|skip",
 ].join("\n")
@@ -246,6 +248,8 @@ export function parseCommand(text: string): ParseResult {
     }
     case "sync":
       return { verb: "sync" }
+    case "doctor":
+      return { verb: "doctor" }
     default:
       // `/fixora sentry:123` and `/fixora https://...` are shortcuts for `fix`.
       if (/^[a-z]+:\S+$/i.test(t.positional[0]!) || /^https?:\/\//i.test(t.positional[0]!)) return { verb: "fix", ref: t.positional[0]!, flags }

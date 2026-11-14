@@ -11,7 +11,7 @@ describe("readOptions", () => {
     expect(r.value.approvals).toBe("publish")
     expect(r.value.mr.draft).toBe(true)
     expect(r.value.branchPrefix).toBe("fixora/")
-    expect(r.value).toEqual({ ...DEFAULTS, worker: { ...DEFAULTS.worker, model: undefined }, review: { mode: "session", model: undefined }, testCommands: { ...DEFAULTS.testCommands, unit: undefined, integration: undefined, lint: undefined, typecheck: undefined }, jira: { ...DEFAULTS.jira, project: undefined, url: undefined, token: undefined, username: undefined, password: undefined, sslVerify: undefined }, mr: { ...DEFAULTS.mr, target: undefined, forge: undefined }, crashlytics: { appId: undefined }, sentry: { organization: undefined, project: undefined }, appPackage: undefined, worktree: { root: undefined, keep: "until-merged" } })
+    expect(r.value).toEqual({ ...DEFAULTS, worker: { ...DEFAULTS.worker, model: undefined }, review: { mode: "session", model: undefined }, testCommands: { ...DEFAULTS.testCommands, unit: undefined, integration: undefined, lint: undefined, typecheck: undefined }, jira: { ...DEFAULTS.jira, project: undefined, parent: undefined, url: undefined, token: undefined, username: undefined, password: undefined, sslVerify: undefined }, mr: { ...DEFAULTS.mr, target: undefined, forge: undefined }, crashlytics: { appIds: [] }, sentry: { organization: undefined, project: undefined }, appPackage: undefined, worktree: { root: undefined, keep: "until-merged" } })
   })
 
   test("accepts overrides and normalises the prefix", () => {
@@ -41,6 +41,27 @@ describe("readOptions", () => {
     expect(r.errors.join("\n")).toContain("invalid regex")
     expect(r.errors.join("\n")).toContain("unknown source")
     expect(r.errors.join("\n")).toContain("protected branch")
+  })
+
+  test("crashlytics app ids: string, array, both keys, validation", () => {
+    const one = readOptions({ crashlytics: { appId: "1:123:android:abc" } })
+    expect(one.ok && one.value.crashlytics.appIds).toEqual(["1:123:android:abc"])
+    const many = readOptions({ crashlytics: { appId: ["1:123:android:abc", "1:123:ios:def"], appIds: ["1:123:ios:def", " 1:123:web:0a1 "] } })
+    expect(many.ok && many.value.crashlytics.appIds).toEqual(["1:123:android:abc", "1:123:ios:def", "1:123:web:0a1"])
+    const bad = readOptions({ crashlytics: { appIds: ["com.example.app"], appId: 5 } })
+    expect(bad.ok).toBe(false)
+    if (bad.ok) return
+    expect(bad.errors.join("\n")).toContain("crashlytics.appIds contains an invalid Firebase app id")
+    expect(bad.errors.join("\n")).toContain("crashlytics.appId must be a string or an array of strings")
+  })
+
+  test("jira.parent enables sub-tasks and is validated", () => {
+    const sub = readOptions({ jira: { project: "DE", issueType: "Sub-task", parent: "DE-62556" } })
+    expect(sub.ok && sub.value.jira).toMatchObject({ project: "DE", issueType: "Sub-task", parent: "DE-62556" })
+    const noParent = readOptions({ jira: { project: "DE", issueType: "Subtask" } })
+    expect(!noParent.ok && noParent.errors.join("\n")).toContain('needs "jira": { "parent"')
+    const badKey = readOptions({ jira: { project: "DE", parent: "story 62556" } })
+    expect(!badKey.ok && badKey.errors.join("\n")).toContain("jira.parent must be an issue key")
   })
 
   test("parseModelRef", () => {

@@ -221,6 +221,8 @@ export class Pipeline {
       const extra = (run.meta?.refExtra ? JSON.parse(String(run.meta.refExtra)) : undefined) as Record<string, string> | undefined
       this.crash = await source.get(this.sourceContext(), run.crashId, extra)
       await writeFile(file, `${JSON.stringify(this.crash, null, 2)}\n`)
+      // Remember which app the crash came from so retries and the close-loop note go to the same one.
+      if (this.crash.appId && extra?.appId !== this.crash.appId) run.meta = { ...run.meta, refExtra: JSON.stringify({ ...extra, appId: this.crash.appId }) }
     }
     const crash = this.crash
     run.title = crash.title
@@ -467,15 +469,17 @@ export class Pipeline {
     }
     const issue = renderJiraIssue(run, this.crash)
     if (decision.decision === "ask") {
-      await writeFile(join(run.folder, "ticket-preview.md"), `${renderApprovalPreview(run, { kind: "ticket", jira: { project, issueType: this.opts.jira.issueType, summary: issue.summary }, crashUrl: this.crashUrl() })}\n\n${issue.description}\n`)
+      const parent = this.opts.jira.parent
+      const jiraPreview = { project, issueType: this.opts.jira.issueType, summary: issue.summary, parent }
+      await writeFile(join(run.folder, "ticket-preview.md"), `${renderApprovalPreview(run, { kind: "ticket", jira: jiraPreview, crashUrl: this.crashUrl() })}\n\n${issue.description}\n`)
       await approve(this.rt, run, "ticket", {
-        resources: [`create Jira ${this.opts.jira.issueType} in ${project}: ${issue.summary}`, `labels: ${[...this.opts.jira.labels, "fixora"].join(", ")}`],
-        summary: `create a Jira ${this.opts.jira.issueType} in ${project}`,
+        resources: [`create Jira ${this.opts.jira.issueType} in ${project}${parent ? ` under ${parent}` : ""}: ${issue.summary}`, `labels: ${[...this.opts.jira.labels, "fixora"].join(", ")}`],
+        summary: `create a Jira ${this.opts.jira.issueType} in ${project}${parent ? ` under ${parent}` : ""}`,
         previewPath: join(run.folder, "ticket-preview.md"),
-        preview: { jira: { project, issueType: this.opts.jira.issueType, summary: issue.summary }, rootCause: run.triage?.rootCause, confidence: run.triage?.confidence, risk: run.triage?.risk.level, crashUrl: this.crashUrl(), previewPath: join(run.folder, "ticket-preview.md") },
+        preview: { jira: jiraPreview, rootCause: run.triage?.rootCause, confidence: run.triage?.confidence, risk: run.triage?.risk.level, crashUrl: this.crashUrl(), previewPath: join(run.folder, "ticket-preview.md") },
       })
     } else run.approvals.ticket = "auto"
-    const created = await port.create({ project: project!, issueType: this.opts.jira.issueType, summary: issue.summary, description: issue.description, labels: [...new Set([...this.opts.jira.labels, "fixora"])] })
+    const created = await port.create({ project: project!, issueType: this.opts.jira.issueType, summary: issue.summary, description: issue.description, labels: [...new Set([...this.opts.jira.labels, "fixora"])], parent: this.opts.jira.parent })
     run.jiraKey = created.key
     run.jiraUrl = created.url
     run.pipeline.ticketed = true
@@ -783,7 +787,8 @@ export class Pipeline {
     }
     if (this.opts.sourceWriteBack && run.source !== "manual") {
       const source = sourceById(run.source)
-      await source.annotate?.(this.sourceContext(), run.crashId, { text: `Fixora opened ${run.mrUrl ?? `branch ${run.branch}`}${run.jiraKey ? ` (Jira ${run.jiraKey})` : ""}. Root cause: ${run.triage?.rootCause.slice(0, 300) ?? ""}`, mrUrl: run.mrUrl, jiraKey: run.jiraKey }).catch((e) => notes.push(`${run.source} note failed: ${(e as Error).message}`))
+      const extra = (run.meta?.refExtra ? JSON.parse(String(run.meta.refExtra)) : undefined) as Record<string, string> | undefined
+      await source.annotate?.(this.sourceContext(), run.crashId, { text: `Fixora opened ${run.mrUrl ?? `branch ${run.branch}`}${run.jiraKey ? ` (Jira ${run.jiraKey})` : ""}. Root cause: ${run.triage?.rootCause.slice(0, 300) ?? ""}`, mrUrl: run.mrUrl, jiraKey: run.jiraKey }, extra).catch((e) => notes.push(`${run.source} note failed: ${(e as Error).message}`))
     }
     run.pipeline.loopClosed = true
     await stageEnd(this.rt, run, "close-loop", "ok", notes.join("; ") || (run.jiraKey ? `Jira ${run.jiraKey} updated` : "nothing to link"))

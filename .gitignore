@@ -6,3 +6,5 @@ plugins/*/dist
 plugins/*/.pack
 *.tgz
 *.tgz.sha256
+*.zip
+*.zip.sha256

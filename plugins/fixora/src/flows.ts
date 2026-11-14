@@ -8,9 +8,9 @@ import { join } from "node:path"
 import type { Flags } from "./command.js"
 import { git } from "./git.js"
 import { connectJira } from "./jira.js"
-import { connected, detectServices, INSTALL_SOURCES } from "./mcp.js"
+import { connected, detectServices, INSTALL_SOURCES, listServers, renderDoctor } from "./mcp.js"
 import { Pipeline } from "./pipeline.js"
-import { FixoraStop, notify, present, type Runtime } from "./progress.js"
+import { FixoraStop, notify, present, tell, type Runtime } from "./progress.js"
 import { renderCrashTable, renderFunnelReport, renderJiraComment, renderRunsTable, renderRunStatus } from "./render.js"
 import { availableSources, listTopCrashes, resolveRef, runIdFor } from "./sources/index.js"
 import { acquireLock, funnel, keys, listCrashIndex, listRuns, loadCrashIndex, loadRun, now, releaseLock, resumePoint, saveCrashIndex, saveRun, TERMINAL } from "./state.js"
@@ -223,6 +223,14 @@ export async function runReport(rt: Runtime, input: { sessionID: string; days: n
   const [runs, crashes] = await Promise.all([listRuns(rt.ctx), listCrashIndex(rt.ctx)])
   const stats = funnel(runs, crashes, { days: input.days })
   await present(rt.ctx, input.sessionID, `fixora report: ${stats.total} run(s) in ${input.days} days`, renderFunnelReport(stats))
+}
+
+export async function runDoctor(rt: Runtime, input: { sessionID: string }) {
+  await refreshServices(rt)
+  const [servers, tools] = await Promise.all([listServers(rt.ctx), rt.ctx.tool.list()])
+  const markdown = renderDoctor({ servers, toolIds: tools.map((t) => t.id), services: rt.services, options: rt.opts })
+  await tell(rt.ctx, input.sessionID, "fixora doctor", markdown)
+  return markdown
 }
 
 export async function runSync(rt: Runtime, input: { sessionID: string }) {

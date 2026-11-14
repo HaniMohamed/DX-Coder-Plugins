@@ -232,8 +232,10 @@ export const INSTALL_SOURCES = `Fixora needs at least one crash source. None is 
    then connect it from /mcps.
 
 2. Firebase Crashlytics (local MCP, needs firebase login):
-   { "mcp": { "servers": { "firebase": { "type": "local", "command": ["npx", "-y", "firebase-tools@latest", "mcp"] } } } }
-   and set "crashlytics": { "appId": "1:1234567890:android:abcdef" } in the plugin options (or pass a Firebase console URL).
+   { "mcp": { "servers": { "firebase": { "type": "local", "command": ["npx", "-y", "firebase-tools@latest", "mcp", "--only", "crashlytics"] } } } }
+   (--only crashlytics matters: firebase-tools hides its crashlytics_* tools unless it finds a Crashlytics app in its working directory)
+   and set "crashlytics": { "appId": "1:1234567890:android:abcdef" } in the plugin options ("appIds": [..] when the
+   same codebase ships to Android and iOS), or pass a Firebase console URL.
 
 3. No MCP at all: save the stack trace to a file and run  /fixora paste <file>
 
@@ -242,3 +244,37 @@ falls back to the glab / gh CLI or a compare URL for the merge request.`
 
 export const notConnectedInstructions = (s: DetectedService) =>
   `The ${s.id} MCP server "${s.serverName}" is configured but its status is "${s.status}". Connect it from /mcps (check its command/URL and credentials), then re-run /fixora.`
+
+/**
+ * `/fixora doctor`: what Fixora sees of the host's MCP servers and tools, so a missing crash source
+ * can be traced to "server not connected", "server connected but the expected tools are not
+ * exposed" (e.g. the Firebase MCP server hides its crashlytics_* tools unless started with
+ * `--only crashlytics` or inside a folder with a Crashlytics app), or a naming mismatch.
+ */
+export function renderDoctor(o: { servers: ServerInfo[]; toolIds: string[]; services: Services; options: { sources: string[]; crashlytics: { appIds: string[] }; jira: { project?: string; parent?: string; issueType: string } } }): string {
+  const L: string[] = ["## Fixora doctor", ""]
+  L.push("### MCP servers", "")
+  if (o.servers.length === 0) L.push("- none configured (`opencode.jsonc` → `mcp.servers`)")
+  for (const s of o.servers) {
+    const ns = mcpNamespace(s.name)
+    const tools = o.toolIds.filter((t) => t.startsWith(`${ns}_`))
+    const interesting = tools.filter((t) => /crashlytics|issue|merge_request|pull_request|jira/i.test(t))
+    L.push(`- **${s.name}** (${statusOf(s)}) — ${tools.length} tool(s)${interesting.length ? `: ${interesting.slice(0, 12).map((t) => `\`${t}\``).join(", ")}${interesting.length > 12 ? ", …" : ""}` : tools.length ? " (none look like crash / ticket / MR tools)" : ""}`)
+  }
+  L.push("", "### Services Fixora recognised", "")
+  const ids = ["sentry", "crashlytics", "jira", "gitlab", "github"] as const
+  for (const id of ids) {
+    const s = o.services[id]
+    if (!s) {
+      L.push(`- ${id}: not found${id === "crashlytics" ? " — expected tools ending in `crashlytics_get_issue` / `crashlytics_batch_get_events` / `crashlytics_get_report`" : id === "sentry" ? " — expected `get_issue_details` / `search_issues`" : id === "jira" ? " — expected `jira_get_issue` / `jira_search` / `jira_create_issue`" : id === "gitlab" ? " — expected `create_merge_request`" : " — expected `create_pull_request`"}`)
+      continue
+    }
+    L.push(`- ${id}: server "${s.serverName}" (${s.status}) — ${Object.entries(s.capabilities).map(([k, v]) => `${k}→\`${v}\``).join(", ")}`)
+  }
+  L.push("", "### Options", "", `- sources: ${o.options.sources.join(", ") || "none"}`, `- crashlytics.appIds: ${o.options.crashlytics.appIds.join(", ") || "none"}`, `- jira: ${o.options.jira.project ? `${o.options.jira.project} / ${o.options.jira.issueType}${o.options.jira.parent ? ` under ${o.options.jira.parent}` : ""}` : "no project (tickets off)"}`)
+  const fb = o.servers.find((s) => /firebase/i.test(s.name))
+  if (fb && statusOf(fb) === "connected" && !o.services.crashlytics) {
+    L.push("", "### Likely fix", "", `The Firebase MCP server "${fb.name}" is connected but exposes no \`crashlytics_*\` tools. firebase-tools only enables the Crashlytics feature group when it finds a Flutter / Android / iOS app with the Crashlytics SDK in its working directory, or when started with \`--only crashlytics\`. Change its command to:`, "", "```jsonc", `"${fb.name}": { "type": "local", "command": ["npx", "-y", "firebase-tools@latest", "mcp", "--only", "crashlytics"] }`, "```", "", "then reconnect it from /mcps and run `/fixora doctor` again. Make sure `firebase login` was done for the account that can see the project.")
+  }
+  return L.join("\n")
+}

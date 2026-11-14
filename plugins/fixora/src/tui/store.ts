@@ -2,6 +2,7 @@
 
 import { STEPS, type RunRecord, type Step } from "../types.js"
 import type { GatePreview, RunSummary } from "../rpc.js"
+import type { FunnelStats } from "../state.js"
 
 export type StageStatus = "pending" | "running" | "ok" | "failed" | "skipped"
 
@@ -71,7 +72,12 @@ export interface CrashRow {
   fingerprint?: string
   state?: string
   runId?: string
+  ref?: string
+  platform?: string
+  appId?: string
 }
+
+export type PanelView = "run" | "runs" | "report"
 
 export interface TuiState {
   runs: Record<string, RunView>
@@ -81,6 +87,13 @@ export interface TuiState {
   crashesAt?: number
   sources: Array<{ id: string; status: string; serverName?: string }>
   now: number
+  /** Which view the docked panel shows; everything stays inside the session, no full-screen pages. */
+  view: PanelView
+  /** Selected row in the runs view. */
+  cursor: number
+  /** Run pinned to the panel by `/fixora status <runId>`; otherwise the session's latest run. */
+  pinned?: string
+  report?: FunnelStats
 }
 
 export const STAGE_TITLES: Record<Step, string> = {
@@ -100,7 +113,7 @@ export const STAGE_TITLES: Record<Step, string> = {
   done: "Done",
 }
 
-export const initialState = (): TuiState => ({ runs: {}, order: [], gates: {}, crashes: [], sources: [], now: Date.now() })
+export const initialState = (): TuiState => ({ runs: {}, order: [], gates: {}, crashes: [], sources: [], now: Date.now(), view: "run", cursor: 0 })
 
 export const emptyStages = (): StageView[] => STEPS.filter((s) => s !== "done").map((step) => ({ step, status: "pending" }))
 
@@ -317,8 +330,9 @@ export const activeRuns = (state: TuiState) => state.order.map((id) => state.run
 export const awaitingGates = (state: TuiState) => Object.values(state.gates).sort((a, b) => a.createdAt - b.createdAt)
 export const runsForSession = (state: TuiState, sessionID: string) => state.order.map((id) => state.runs[id]!).filter((r) => r.sessionID === sessionID)
 export const panelRun = (state: TuiState, sessionID: string): RunView | undefined => {
+  if (state.pinned && state.runs[state.pinned]) return state.runs[state.pinned]
   const mine = runsForSession(state, sessionID)
-  return mine.find((r) => r.status === "awaiting-approval") ?? mine.find((r) => r.status === "running") ?? mine[0]
+  return mine.find((r) => r.status === "awaiting-approval") ?? mine.find((r) => r.status === "running") ?? mine[0] ?? state.order.map((id) => state.runs[id]!)[0]
 }
 
 export const STATUS_GLYPH: Record<StageStatus, string> = { pending: "○", running: "◐", ok: "✓", failed: "✗", skipped: "–" }

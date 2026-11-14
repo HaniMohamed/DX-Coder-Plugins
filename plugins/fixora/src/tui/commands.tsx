@@ -12,6 +12,31 @@ export function currentSession(fx: Fixora): string | undefined {
   return route.type === "session" ? route.sessionID : undefined
 }
 
+/**
+ * The session Fixora works in. On the Home / new-session screen no session exists yet (the host
+ * creates one on the first prompt), so Fixora creates one itself, named after the plugin, and
+ * navigates to it. Returns undefined only when creation fails.
+ */
+export async function ensureSession(fx: Fixora): Promise<string | undefined> {
+  const current = currentSession(fx)
+  if (current) return current
+  try {
+    const model = fx.context.ui.model.current()
+    const created = (await fx.context.client.session.create({
+      title: "Fixora",
+      location: fx.context.data.location.default(),
+      ...(model ? { model: { providerID: model.providerID, id: model.modelID, variant: model.variant } } : {}),
+    } as never)) as { id: string }
+    fx.context.ui.router.navigate({ type: "session", sessionID: created.id })
+    // Give the session view a tick to mount before anything targets its panel.
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    return created.id
+  } catch (error) {
+    fx.context.ui.toast.show({ title: "Fixora", message: `Could not create a session: ${error instanceof Error ? error.message : String(error)}`, variant: "error" })
+    return undefined
+  }
+}
+
 export const sourceLabel: Record<string, string> = { sentry: "Sentry", crashlytics: "Crashlytics", manual: "Pasted" }
 
 export function crashOption(c: CrashRow) {
@@ -19,8 +44,8 @@ export function crashOption(c: CrashRow) {
   const state = c.state && c.state !== "new" ? c.state.replace("_", " ").toUpperCase() : "NEW"
   return {
     title: `${truncate(c.title, 70)}${users ? `   ${users}` : ""}`,
-    value: { kind: "crash" as const, ref: `${c.source}:${c.id}`, title: c.title },
-    description: [c.appVersion ? `v${c.appVersion}` : undefined, c.lastSeen ? relTime(Date.parse(c.lastSeen)) : undefined, c.runId].filter(Boolean).join(" · ") || undefined,
+    value: { kind: "crash" as const, ref: c.ref ?? `${c.source}:${c.id}`, title: c.title },
+    description: [c.platform, c.appVersion ? `v${c.appVersion}` : undefined, c.lastSeen ? relTime(Date.parse(c.lastSeen)) : undefined, c.runId].filter(Boolean).join(" · ") || undefined,
     footer: state,
     category: sourceLabel[c.source] ?? c.source,
     disabled: c.state === "in_progress" || c.state === "awaiting",
@@ -29,11 +54,8 @@ export function crashOption(c: CrashRow) {
 
 /** The /fixora picker: lists crashes from every connected source and starts runs. */
 export async function pickCrash(fx: Fixora, rpc: ReturnType<Fixora["context"]["client"]["rpc"]> & Record<string, (input: unknown) => Promise<unknown>>): Promise<void> {
-  const sessionID = currentSession(fx)
-  if (!sessionID) {
-    fx.context.ui.toast.show({ message: "Open a session first, then /fixora", variant: "warning" })
-    return
-  }
+  const sessionID = await ensureSession(fx)
+  if (!sessionID) return
   const toast = fx.context.ui.toast
   const loading = setTimeout(() => toast.show({ message: "Fixora: loading crashes…", variant: "info", duration: 1500 }), 400)
   let sources: Array<{ id: string; status: string; serverName?: string }> = []
@@ -77,7 +99,7 @@ export async function pickCrash(fx: Fixora, rpc: ReturnType<Fixora["context"]["c
         selection: "none",
         onTrigger: () => {
           fx.context.ui.dialog.clear()
-          void startRuns(fx, rpc, sessionID, newOnes.slice(0, 3).map((c) => `${c.source}:${c.id}`))
+          void startRuns(fx, rpc, sessionID, newOnes.slice(0, 3).map((c) => c.ref ?? `${c.source}:${c.id}`))
         },
       },
       {

@@ -128,7 +128,8 @@ export function mapCrashlyticsIssue(issue: unknown, events: unknown, o: { id: st
     lastSeen: str(iss?.lastSeenTime) ?? str(iss?.lastSeen),
     eventCount: num(stats?.eventCount) ?? num(stats?.crashCount) ?? num(iss?.eventCount),
     userCount: num(stats?.userCount) ?? num(stats?.impactedUsers) ?? num(iss?.userCount),
-    url: str(iss?.consoleUrl) ?? str(iss?.url) ?? (o.appId ? `https://console.firebase.google.com/project/_/crashlytics/app/${o.appId}/issues/${o.id}` : undefined),
+    url: str(iss?.consoleUrl) ?? str(iss?.url) ?? (o.appId ? consoleUrl(o.appId, o.id) : undefined),
+    appId: o.appId,
     rawStackTrace: sanitizeText(rawTrace, 64 * 1024),
     fingerprint: fp.hash,
     symbolication: symbolicationCheck(language, frames),
@@ -153,37 +154,78 @@ export function mapCrashlyticsList(raw: unknown): CrashSummary[] {
 
 const hintsOf = (sc: SourceContext): Hints => ({ appPackage: sc.options.appPackage, inAppPrefixes: sc.options.inAppPackages })
 
-function appIdOf(sc: SourceContext, extra?: Record<string, string>): string {
-  const appId = extra?.appId ?? sc.options.crashlytics.appId
-  if (!appId) throw new SourceError("crashlytics", 'Crashlytics needs the Firebase app id. Set "crashlytics": { "appId": "1:1234567890:android:abcdef" } in the plugin options, or pass the Firebase console URL of the issue.')
-  return appId
+export const NO_APP_ID = 'Crashlytics needs the Firebase app id. Set "crashlytics": { "appId": "1:1234567890:android:abcdef" } (or "appIds": [..] for several platforms) in the plugin options, or pass the Firebase console URL of the issue.'
+
+/** App ids to query: the one carried by the reference (console URL or `crashlytics:<id>@<appId>`), else every configured one. */
+function appIdsOf(sc: SourceContext, extra?: Record<string, string>): string[] {
+  const ids = extra?.appId ? [extra.appId] : sc.options.crashlytics.appIds
+  if (ids.length === 0) throw new SourceError("crashlytics", NO_APP_ID)
+  return ids
 }
+
+/** `crashlytics:<id>` or `crashlytics:<id>@<appId>` for multi-app setups. */
+export const crashlyticsRef = (id: string, appId?: string) => (appId ? `crashlytics:${id}@${appId}` : `crashlytics:${id}`)
+
+const REF = /^crashlytics:([A-Za-z0-9_-]+)(?:@(\d+:\d+:[a-z]+:[a-f0-9]+))?$/i
 
 export const crashlytics: CrashSource = {
   id: "crashlytics",
   available: (services, options) => options.sources.includes("crashlytics") && !!services.crashlytics && services.crashlytics.status === "connected" && !!(services.crashlytics.capabilities.getIssue || services.crashlytics.capabilities.batchGetEvents),
-  parseRef: (input) => {
-    const m = /^crashlytics:([A-Za-z0-9_-]+)$/i.exec(input)
-    if (m) return { id: m[1]! }
+  parseRef: (input): { id: string; extra?: Record<string, string> } | undefined => {
+    const m = REF.exec(input)
+    if (m) return { id: m[1]!, extra: m[2] ? { appId: m[2] } : undefined }
     const url = /console\.firebase\.google\.com\/(?:u\/\d+\/)?project\/([^/]+)\/crashlytics\/app\/([^/]+)\/issues\/([A-Za-z0-9_-]+)/i.exec(input)
     if (url) return { id: url[3]!, extra: { appId: url[2]!, project: url[1]! } }
     return undefined
   },
   async list(sc, q) {
     const s = sc.services.crashlytics!
-    const appId = appIdOf(sc)
-    let raw: unknown
-    if (s.capabilities.getReport) raw = await callTool(sc.ctx, s.capabilities.getReport, { app_id: appId, report: "topIssues", page_size: q.top, issue_error_types: ["FATAL"], interval: { start_time: new Date(Date.now() - 14 * 86_400_000).toISOString() } }, { sessionID: sc.sessionID, signal: sc.signal })
-    else if (s.capabilities.listTopIssues) raw = await callTool(sc.ctx, s.capabilities.listTopIssues, { app_id: appId, issue_count: q.top, issue_type: "FATAL" }, { sessionID: sc.sessionID, signal: sc.signal })
-    else return []
-    return mapCrashlyticsList(raw)
+    const appIds = appIdsOf(sc)
+    const multi = appIds.length > 1
+    const out: CrashSummary[] = []
+    const errors: string[] = []
+    for (const appId of appIds) {
+      let raw: unknown
+      try {
+        if (s.capabilities.getReport) raw = await callTool(sc.ctx, s.capabilities.getReport, { app_id: appId, report: "topIssues", page_size: q.top, issue_error_types: ["FATAL"], interval: { start_time: new Date(Date.now() - 14 * 86_400_000).toISOString() } }, { sessionID: sc.sessionID, signal: sc.signal })
+        else if (s.capabilities.listTopIssues) raw = await callTool(sc.ctx, s.capabilities.listTopIssues, { app_id: appId, issue_count: q.top, issue_type: "FATAL" }, { sessionID: sc.sessionID, signal: sc.signal })
+        else return []
+      } catch (error) {
+        errors.push(`${platformOfAppId(appId) ?? appId}: ${error instanceof Error ? error.message : String(error)}`)
+        continue
+      }
+      const platform = platformOfAppId(appId)
+      for (const c of mapCrashlyticsList(raw)) out.push({ ...c, platform, appId, ref: crashlyticsRef(c.id, multi ? appId : undefined), url: c.url ?? consoleUrl(appId, c.id) })
+    }
+    if (out.length === 0 && errors.length > 0) throw new SourceError("crashlytics", errors.join("; "))
+    return out
       .filter((c) => (q.minUsers ?? 0) === 0 || (c.userCount ?? 0) >= (q.minUsers ?? 0))
+      .sort((a, b) => (b.userCount ?? 0) - (a.userCount ?? 0) || (b.eventCount ?? 0) - (a.eventCount ?? 0))
       .slice(0, q.top)
   },
   async get(sc, id, extra) {
     const s = sc.services.crashlytics!
-    const appId = appIdOf(sc, extra)
-    const issue = s.capabilities.getIssue ? await callTool(sc.ctx, s.capabilities.getIssue, { app_id: appId, issue_id: id }, { sessionID: sc.sessionID, signal: sc.signal }) : undefined
+    const candidates = appIdsOf(sc, extra)
+    // Without an app in the reference, probe the configured apps in order and keep the first that knows the issue.
+    let appId = candidates[0]!
+    let issue: unknown
+    const failures: string[] = []
+    for (const candidate of candidates) {
+      if (!s.capabilities.getIssue) break
+      try {
+        issue = await callTool(sc.ctx, s.capabilities.getIssue, { app_id: candidate, issue_id: id }, { sessionID: sc.sessionID, signal: sc.signal })
+        if (candidates.length === 1 || hasIssue(issue)) {
+          appId = candidate
+          break
+        }
+        failures.push(`${platformOfAppId(candidate) ?? candidate}: not found`)
+        issue = undefined
+      } catch (error) {
+        if (candidates.length === 1) throw error
+        failures.push(`${platformOfAppId(candidate) ?? candidate}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    if (candidates.length > 1 && issue === undefined && s.capabilities.getIssue) throw new SourceError("crashlytics", `issue ${id} was not found in any configured app (${failures.join("; ")})`)
     let events: unknown
     if (s.capabilities.batchGetEvents) {
       const sampleName = isRecord(issue) && typeof issue.sampleEvent === "string" ? issue.sampleEvent : undefined
@@ -192,9 +234,20 @@ export const crashlytics: CrashSource = {
     } else if (s.capabilities.getSampleCrash) events = await callTool(sc.ctx, s.capabilities.getSampleCrash, { app_id: appId, issue_id: id, variant_count: 1 }, { sessionID: sc.sessionID, signal: sc.signal }).catch(() => undefined)
     return mapCrashlyticsIssue(issue, events, { id, appId, hints: hintsOf(sc) })
   },
-  async annotate(sc, id, note) {
+  async annotate(sc, id, note, extra) {
     const s = sc.services.crashlytics!
     if (!s.capabilities.createNote) return
-    await callTool(sc.ctx, s.capabilities.createNote, { app_id: appIdOf(sc), issue_id: id, note: note.text }, { sessionID: sc.sessionID, signal: sc.signal })
+    await callTool(sc.ctx, s.capabilities.createNote, { app_id: appIdsOf(sc, extra)[0], issue_id: id, note: note.text }, { sessionID: sc.sessionID, signal: sc.signal })
   },
+}
+
+const consoleUrl = (appId: string, id: string) => `https://console.firebase.google.com/project/_/crashlytics/app/${appId}/issues/${id}`
+
+/** A `crashlytics_get_issue` result that actually describes an issue (not an empty / error payload). */
+export function hasIssue(raw: unknown): boolean {
+  if (typeof raw === "string") return raw.trim().length > 0 && !/not found|does not exist|NOT_FOUND|permission denied|error/i.test(raw)
+  const iss = isRecord(raw) && isRecord(raw.issue) ? raw.issue : raw
+  if (!isRecord(iss)) return false
+  if (typeof iss.error === "string" || isRecord(iss.error)) return false
+  return ["id", "issueId", "name", "title", "displayName"].some((k) => typeof iss[k] === "string" && (iss[k] as string).length > 0)
 }
