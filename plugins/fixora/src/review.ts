@@ -17,7 +17,7 @@ export async function runReview(rt: Runtime, run: RunRecord, o: { signal?: Abort
     minutes: rt.opts.worker.maxPhaseMinutes.review,
     signal: o.signal,
     pick: (fresh) => fresh.reviews[attempt - 1],
-    nudge: nudgePrompt("fixora_submit_review", run.runId, SKILLS.review, `runId "${run.runId}", attempt ${attempt}`),
+    nudge: nudgePrompt("fixora_submit_review", run.runId, [SKILLS.review], `runId "${run.runId}", attempt ${attempt}`),
   })
   if (r.value) {
     run.reviews = r.fresh.reviews

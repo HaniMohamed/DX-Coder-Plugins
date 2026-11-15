@@ -170,7 +170,7 @@ export async function runList(rt: Runtime, input: ListInput): Promise<{ crashes:
     let outcome = await promptSession(rt, sessionID, prompt, { minutes: rt.opts.worker.maxPhaseMinutes.list })
     record = (await getJson<CrashListRecord>(rt.ctx, keys.crashes(requestId))) ?? record
     if (!record.result && outcome === "done") {
-      outcome = await promptSession(rt, sessionID, nudgePrompt("fixora_submit_crashes", undefined, SKILLS.crashes, `requestId "${requestId}" and every reply or error you got`), { minutes: 3 })
+      outcome = await promptSession(rt, sessionID, nudgePrompt("fixora_submit_crashes", undefined, [SKILLS.crashes], `requestId "${requestId}" and every reply or error you got`), { minutes: 3 })
       record = (await getJson<CrashListRecord>(rt.ctx, keys.crashes(requestId))) ?? record
     }
     if (!record.result) throw new FixoraStop(outcome === "timeout" ? `Listing crashes exceeded ${rt.opts.worker.maxPhaseMinutes.list} minutes. See the lister session ${sessionID} and try again.` : `The lister session ${sessionID} did not report the crash list. See that session, then run /fixora again.`)
@@ -338,7 +338,7 @@ export async function runDoctor(rt: Runtime, input: { sessionID: string; all?: b
     await tell(rt.ctx, input.sessionID, `fixora doctor --tool ${input.tool}`, markdown)
     return markdown
   }
-  let markdown = renderDoctor({ servers, toolIds: tools.map((t) => t.id), services: rt.services, options: rt.opts, all: input.all, warnings: legacyOptionWarnings(rt.ctx.options) })
+  let markdown = renderDoctor({ servers, toolIds: tools.map((t) => t.id), services: rt.services, options: rt.opts, all: input.all, warnings: legacyOptionWarnings(rt.ctx.options), version: rt.version })
   if (input.probe) markdown += `\n\n${await probeSources(rt, input.sessionID)}`
   await tell(rt.ctx, input.sessionID, "fixora doctor", markdown)
   return markdown
@@ -379,7 +379,7 @@ export async function opsRound(rt: Runtime, run: RunRecord, o: { phase: WorkerPh
     minutes: o.minutes ?? rt.opts.worker.maxPhaseMinutes.restore,
     label: o.title,
     pick: (fresh) => (fresh.meta?.received === token ? fresh : undefined),
-    nudge: nudgePrompt("fixora_submit_ops", run.runId, SKILLS.ops, `op "${o.op}", ok true/false, results, errors`),
+    nudge: nudgePrompt("fixora_submit_ops", run.runId, [SKILLS.ops], `op "${o.op}", ok true/false, results, errors`),
   })
   if (!r.value) return undefined
   const { timings, step, ...rest } = r.value

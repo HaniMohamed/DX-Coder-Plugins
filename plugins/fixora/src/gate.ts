@@ -30,11 +30,6 @@ export function decideApproval(kind: ApprovalKind, run: RunRecord, opts: FixoraO
   return { decision: "ask", reason: `approvals=${opts.approvals}` }
 }
 
-/** Which gates exist for this run: one "publish" gate by default, or push + mr separately. */
-export function gateKinds(opts: FixoraOptions): { push: ApprovalKind; mr: ApprovalKind | undefined } {
-  return opts.approvals === "each" ? { push: "push", mr: "mr" } : { push: "publish", mr: undefined }
-}
-
 export class ApprovalRejected extends Error {
   constructor(
     readonly kind: ApprovalKind,

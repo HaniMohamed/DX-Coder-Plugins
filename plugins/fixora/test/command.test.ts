@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { parseCommand, tokenize } from "../src/command.js"
+import { parseCommand, SUBCOMMANDS, tokenize, USAGE } from "../src/command.js"
 
 const ok = (text: string) => {
   const r = parseCommand(text)
@@ -19,6 +19,25 @@ describe("tokenize", () => {
     expect(t.flags.get("from")).toBe("fix")
     expect(t.flags.get("tests")).toBe("full")
     expect(t.flags.get("dry-run")).toBe(true)
+  })
+})
+
+describe("subcommands", () => {
+  test("every verb has a /fixora:<verb> command and the usage lists it", () => {
+    const names = SUBCOMMANDS.map((c) => c.name)
+    expect(names).toContain("fixora:status")
+    expect(names).toContain("fixora:fix")
+    expect(new Set(names).size).toBe(names.length)
+    for (const c of SUBCOMMANDS) {
+      expect(c.name).toBe(`fixora:${c.verb}`)
+      if (c.verb !== "list") expect(USAGE).toContain(`/${c.name}`)
+    }
+    expect(USAGE).toContain("/fixora:retry <runId> [--from <step>] [--fresh]")
+    expect(USAGE).toContain("the long form `/fixora <verb> …` works too")
+    // The subcommand prefixes its verb to the user's text; the parser sees the long form.
+    expect(parseCommand("status manual-7fcb3db2d5")).toEqual({ verb: "status", runId: "manual-7fcb3db2d5" })
+    expect(parseCommand("list ")).toMatchObject({ verb: "list" })
+    expect(parseCommand("help ")).toEqual({ verb: "help" })
   })
 })
 

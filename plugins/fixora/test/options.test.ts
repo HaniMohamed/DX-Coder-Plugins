@@ -11,6 +11,7 @@ describe("readOptions", () => {
     expect(r.value.approvals).toBe("publish")
     expect(r.value.mr.draft).toBe(true)
     expect(r.value.branchPrefix).toBe("fixora/")
+    expect(r.value.branchNaming).toEqual({ type: "fix", template: undefined, example: undefined })
     expect(r.value).toEqual({ ...DEFAULTS, worker: { ...DEFAULTS.worker, model: undefined }, review: { model: undefined }, testCommands: { ...DEFAULTS.testCommands, unit: undefined, integration: undefined, lint: undefined, typecheck: undefined }, jira: { ...DEFAULTS.jira, project: undefined, parent: undefined }, mr: { ...DEFAULTS.mr, target: undefined, forge: undefined }, crashlytics: { appIds: [] }, sentry: { organization: undefined, project: undefined }, appPackage: undefined, crashes: { cacheMinutes: 5 } })
     expect(r.value.worker.maxPhaseMinutes).toEqual({ crash: 5, prepare: 10, triage: 10, fix: 20, review: 10, publish: 10, restore: 5, list: 5 })
   })
@@ -24,7 +25,7 @@ describe("readOptions", () => {
     expect(r.value.worker.shell).toBe("ask")
     expect(r.value.jira.project).toBe("APP")
     expect(r.value.jira.transitionOnMr).toBeUndefined()
-    expect(r.value.approvals).toBe("each")
+    expect(r.value.approvals).toBe("publish") // "each" is a legacy alias
     expect(r.value.mode).toBe("test-first")
     expect(r.value.testCommands.unit).toBe("bun test")
     expect(r.value.sources).toEqual(["sentry"])
@@ -42,6 +43,18 @@ describe("readOptions", () => {
     expect(r.errors.join("\n")).toContain("invalid regex")
     expect(r.errors.join("\n")).toContain("unknown source")
     expect(r.errors.join("\n")).toContain("protected branch")
+  })
+
+  test("branchNaming: the template is checked for placeholders and git-safe characters", () => {
+    const ok = readOptions({ branchNaming: { template: " {type}/{ticket}-{slug} ", example: "fix/DE-456-fix-crash-on-startup" } })
+    expect(ok.ok && ok.value.branchNaming).toEqual({ template: "{type}/{ticket}-{slug}", type: "fix", example: "fix/DE-456-fix-crash-on-startup" })
+    const bad = readOptions({ branchNaming: { template: "{kind}/{ticket} {slug}", type: "bugfix" } })
+    expect(bad.ok).toBe(false)
+    if (bad.ok) return
+    expect(bad.errors.join("\n")).toContain("unknown placeholder(s) {kind}")
+    expect(bad.errors.join("\n")).toContain("characters git does not allow")
+    const constant = readOptions({ branchNaming: { template: "{type}/crash" } })
+    expect(!constant.ok && constant.errors.join("\n")).toContain("must contain {ticket}")
   })
 
   test("crashlytics app ids: string, array, both keys, validation", () => {

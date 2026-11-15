@@ -66,8 +66,9 @@ Prefer a stated assumption in `rationale` over a question.
 5. Call **`fixora_submit_fix`** once. If it returns validation errors (for example a file you changed
    is missing from `filesChanged`, a forbidden path, a missing check, or no test change), correct the
    problem and call it again.
-6. Stop. Fixora checks the change set, then an independent reviewer reads it. You may be prompted
-   again with findings or failures; address each one and resubmit with the next `attempt` number.
+6. Its reply says STOP: end your turn. Fixora checks the change set, then an independent reviewer
+   reads it. You may be prompted again with findings or failures; address each one and resubmit with
+   the next `attempt` number.
 
 ## Feedback mode (`/fixora feedback`)
 

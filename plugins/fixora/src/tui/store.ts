@@ -107,7 +107,7 @@ export const STAGE_TITLES: Record<Step, string> = {
   fix: "Fix",
   validate: "Checks",
   review: "Review",
-  publish: "Commit · push · MR",
+  publish: "Ticket · commit · push · MR",
   "close-loop": "Link",
   restore: "Restore checkout",
   done: "Done",

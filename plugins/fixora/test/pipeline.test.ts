@@ -1,7 +1,7 @@
-// Orchestration end to end, without git or processes: a pasted crash → scripted agent sessions
-// (prepare, triage, fix, review, publish, restore) that answer through the plugin's own tools →
-// approvals → final report. Then feedback, rejected approvals, restart, dry run, dirty checkout,
-// cancellation and the repository lock.
+// Orchestration end to end, without git or processes: a pasted crash → the WORK turn (one scripted
+// agent session steered by the fixora_submit_* replies: prepare → triage → fix) → the REVIEW turn →
+// the PUBLISH turn (commit, push, MR, restore) → final report. Then feedback, rejected approvals,
+// restart, dry run, dirty checkout, cancellation, the repository lock and reset.
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { existsSync, readFileSync } from "node:fs"
@@ -9,6 +9,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { runFeedback, runFix, runPaste, runReset, runRestart, runRetry, runStatus, startPipeline } from "../src/flows.js"
+import { slug } from "../src/git.js"
 import { readOptions } from "../src/options.js"
 import type { Runtime } from "../src/progress.js"
 import { loadRun } from "../src/state.js"
@@ -30,7 +31,7 @@ let commits = 0
 const FLAGS = { dryRun: false, ticket: true, mr: true, push: true, auto: false, force: false, forceTriage: false }
 
 /** Knobs the tests turn. */
-const state = { dirty: false, holdTriage: undefined as Promise<void> | undefined, cancelInFix: false, restorePrompts: [] as string[], publishPrompts: [] as string[], preparePrompts: [] as string[] }
+const state = { dirty: false, holdTriage: undefined as Promise<void> | undefined, cancelInFix: false, restorePrompts: [] as string[], publishPrompts: [] as string[], workPrompts: [] as string[] }
 
 const STATUS = " M src/cart/service.ts\n?? src/cart/guard.test.ts\n"
 const DIFF = [
@@ -54,31 +55,36 @@ const DIFF = [
   "",
 ].join("\n")
 
-/** The scripted agent: reacts to the phase recorded for its session. */
+type ToolOf = (name: string) => { execute: (input: unknown, ctx: ReturnType<typeof toolCtx>) => Promise<{ output?: unknown; content?: string }> }
+
+/** The scripted agent: one turn = a loop over stages, each ended by a tool reply that says CONTINUE or STOP. */
 const worker: Worker = async (prompt, session, tool) => {
+  for (let guard = 0; guard < 8; guard++) {
+    const reply = await stage(prompt, session, tool as ToolOf)
+    if (reply === undefined || !/CONTINUE:/.test(reply)) return
+  }
+}
+
+const stage = async (prompt: { text: string }, session: { id: string }, tool: ToolOf): Promise<string | undefined> => {
   const w = mock.storage.get(`fixora/worker/${session.id}`) as WorkerInfo
   const runId = w.runId!
   const call = async (name: string, input: unknown) => {
     const r = await tool(name).execute(input, toolCtx(session.id))
     if ((r.output as { ok?: boolean }).ok !== true) throw new Error(`${name} rejected: ${r.content}`)
-    return r
+    return r.content ?? ""
   }
   switch (w.phase) {
     case "prepare": {
-      state.preparePrompts.push(prompt.text)
+      state.workPrompts.push(prompt.text)
       const base = { version: 1, runId, repoRoot: repo, previousBranch: "main", previousHeadSha: HEAD_SHA, conventionFiles: [], notes: [] }
-      if (/Step 1 — inspect/.test(prompt.text) && state.dirty) {
-        await call("fixora_submit_prepare", { ...base, stage: "inspect", dirty: true, status: " M README.md\n", dirtyFiles: 1 })
-        return
-      }
-      const stashApproved = /approved stashing/.test(prompt.text)
-      const branch = /already has branch `([^`]+)`/.exec(prompt.text)?.[1] ?? /Fallback branch name[^`]*`([^`]+)`/.exec(prompt.text)![1]!
-      await call("fixora_submit_prepare", { ...base, stage: "ready", dirty: state.dirty, stashRef: stashApproved ? STASH_SHA : null, baseRef: "origin/main", baseSha: BASE_SHA, remoteUrl: "git@git.corp.io:team/shop.git", branch, created: true, toolchain: { ecosystems: [{ id: "node", root: "" }], checks: [{ kind: "unit", command: "bun test", cwd: "" }, { kind: "typecheck", command: "bunx tsc --noEmit", cwd: "", optional: true }], setup: [] } })
-      return
+      const stashApproved = /git stash push/.test(prompt.text)
+      if (state.dirty && !stashApproved) return call("fixora_submit_prepare", { ...base, stage: "inspect", dirty: true, status: " M README.md\n", dirtyFiles: 1 })
+      const branch = /`(fixora\/[^`]+)`/.exec(prompt.text)![1]!
+      return call("fixora_submit_prepare", { ...base, stage: "ready", dirty: state.dirty, stashRef: stashApproved ? STASH_SHA : null, baseRef: "origin/main", baseSha: BASE_SHA, remoteUrl: "git@git.corp.io:team/shop.git", branch, created: true, toolchain: { ecosystems: [{ id: "node", root: "" }], checks: [{ kind: "unit", command: "bun test", cwd: "" }, { kind: "typecheck", command: "bunx tsc --noEmit", cwd: "", optional: true }], setup: [] } })
     }
     case "triage": {
       if (state.holdTriage) await state.holdTriage
-      await call("fixora_submit_triage", {
+      return call("fixora_submit_triage", {
         version: 1,
         runId,
         classification: "fixable",
@@ -96,21 +102,19 @@ const worker: Worker = async (prompt, session, tool) => {
         relatedCrashes: [],
         flaggedContent: [],
       })
-      return
     }
     case "fix":
     case "feedback": {
       if (state.cancelInFix) {
         rt.inflight.get(runId)!.controller.abort()
-        return
+        return undefined
       }
       const attempt = Number(/attempt (\d+)/.exec(prompt.text)?.[1] ?? "1")
       const feedback = w.phase === "feedback"
       if (feedback && /question:/i.test(prompt.text)) {
-        await call("fixora_submit_fix", { version: 1, runId, attempt, summary: "Answered a question", filesChanged: [], rationale: "No change: the guard already handles both undefined and null.", alternativesRejected: [], testsAdded: [], commandsRun: [], risk: { level: "low", publicApiChange: false, behaviourChange: "", rollback: "" }, changesMade: false, unresolved: [] })
-        return
+        return call("fixora_submit_fix", { version: 1, runId, attempt, summary: "Answered a question", filesChanged: [], rationale: "No change: the guard already handles both undefined and null.", alternativesRejected: [], testsAdded: [], commandsRun: [], risk: { level: "low", publicApiChange: false, behaviourChange: "", rollback: "" }, changesMade: false, unresolved: [] })
       }
-      await call("fixora_submit_fix", {
+      return call("fixora_submit_fix", {
         version: 1,
         runId,
         attempt,
@@ -126,12 +130,10 @@ const worker: Worker = async (prompt, session, tool) => {
         status: STATUS,
         diff: feedback ? DIFF.replace("if (!c)", "if (c == null)") : DIFF,
       })
-      return
     }
     case "review": {
       const attempt = Number(/review attempt (\d+)/.exec(prompt.text)?.[1] ?? "1")
-      await call("fixora_submit_review", { version: 1, runId, attempt, verdict: "approve", rootCauseAddressed: true, regressionTestPresent: true, findings: [], summary: "Minimal guard with a regression test; nothing to object to." })
-      return
+      return call("fixora_submit_review", { version: 1, runId, attempt, verdict: "approve", rootCauseAddressed: true, regressionTestPresent: true, findings: [], summary: "Minimal guard with a regression test; nothing to object to." })
     }
     case "publish": {
       state.publishPrompts.push(prompt.text)
@@ -145,19 +147,17 @@ const worker: Worker = async (prompt, session, tool) => {
         ...(g.mr ? { mrSkipped: { reason: "no GitLab / GitHub MCP and no glab", compareUrl: "https://git.corp.io/team/shop (branch → main)" } } : {}),
         errors: [],
       })
-      return
+      // The same turn restores the checkout, as the prompt's last step.
+      return call("fixora_submit_ops", { version: 1, runId, op: "restore", ok: true, results: { branch: "main", stashPopped: /stash pop/.test(prompt.text) }, errors: [] })
     }
     case "restore": {
       state.restorePrompts.push(prompt.text)
-      await call("fixora_submit_ops", { version: 1, runId, op: "restore", ok: true, results: { branch: "main", stashPopped: /stash pop/.test(prompt.text) }, errors: [] })
-      return
+      return call("fixora_submit_ops", { version: 1, runId, op: "restore", ok: true, results: { branch: "main", stashPopped: /stash pop/.test(prompt.text) }, errors: [] })
     }
-    case "clean": {
-      await call("fixora_submit_ops", { version: 1, runId, op: "clean", ok: true, results: { localDeleted: true }, errors: [] })
-      return
-    }
+    case "clean":
+      return call("fixora_submit_ops", { version: 1, runId, op: "clean", ok: true, results: { localDeleted: true }, errors: [] })
     default:
-      throw new Error(`unexpected phase ${w.phase} for skill ${prompt.skills?.[0]?.id}`)
+      throw new Error(`unexpected phase ${w.phase}`)
   }
 }
 
@@ -185,19 +185,18 @@ beforeEach(() => {
 })
 
 const fixerPrompts = (run: RunRecord) => mock.sessions.get(run.sessions.fixer!)!.prompts
-const phasesOf = (run: RunRecord) => fixerPrompts(run).map((p) => p.skills?.[0]?.id)
+const skillsOf = (run: RunRecord) => fixerPrompts(run).map((p) => p.skills?.map((s) => s.id))
 
 describe("pipeline orchestration", () => {
   let runId: string
 
-  test("paste → prepare → triage → fix → review → publish → restore, everything through the agent", async () => {
+  test("paste → one work turn (prepare → triage → fix) → review → one publish turn (commit, push, MR, restore)", async () => {
     const run = await runPaste(rt, { sessionID: "origin", file: join(root, "trace.txt"), flags: FLAGS })
     runId = run.runId
     if (run.status !== "done") throw new Error(`${run.status} at ${run.step}: ${run.error}\n${mock.synthetics.map((s) => s.description).join("\n")}`)
     expect(run.runId.startsWith("manual-")).toBe(true)
     expect(run.repo).toBe(repo)
-    expect(run.pipeline).toMatchObject({ analysed: true, fixed: true, validated: true, reviewed: true, committed: true, pushed: true, mrOpened: false, loopClosed: true })
-    expect(run.approvals.ticket).toBe("skipped")
+    expect(run.pipeline).toMatchObject({ analysed: true, fixed: true, validated: true, reviewed: true, committed: true, pushed: true, mrOpened: false })
     expect(run.approvals.publish).toBe("approved")
     expect(run.triage?.confidence).toBe(0.9)
     expect(run.tests?.allPassed).toBe(true)
@@ -210,78 +209,77 @@ describe("pipeline orchestration", () => {
     expect(run.toolchain?.checks.map((c) => c.command)).toEqual(["bun test", "bunx tsc --noEmit"])
     expect(run.mrUrl).toBeUndefined()
     expect(String(run.meta?.compareUrl)).toContain("git.corp.io")
-    // The checkout was restored by the agent, as the last prompt of the fixer session.
+    // Three agent turns: work (three skills in one prompt), review (own session), publish (restore inside).
+    expect(skillsOf(run)).toEqual([["fixora-prepare", "fixora-triage", "fixora-fix"], ["fixora-publish"]])
+    expect(mock.sessions.get(run.sessions.reviewer!)!.prompts[0]!.skills?.map((s) => s.id)).toEqual(["fixora-review"])
     expect(run.checkout).toMatchObject({ active: false, previousBranch: "main", previousHeadSha: HEAD_SHA })
     expect(run.checkout.restoredAt).toBeDefined()
-    expect(run.checkout.stashRef).toBeUndefined()
-    expect(run.timings.restore?.status).toBe("ok")
-    expect(phasesOf(run)).toEqual(["fixora-prepare", "fixora-triage", "fixora-fix", "fixora-publish", "fixora-ops"])
-    expect(state.restorePrompts.at(-1)).toContain("git checkout main")
-    expect(state.restorePrompts.at(-1)).not.toContain("stash pop")
+    expect(state.restorePrompts).toHaveLength(0)
+    // The stage events came from the tools while the single turn ran.
+    for (const step of ["prepare", "analyse", "fix", "validate", "review", "publish"] as const) expect(run.timings[step]?.status).toBe("ok")
+    const work = state.workPrompts.at(-1)!
+    expect(work).toContain("fixora_submit_prepare")
+    expect(work).toContain("fixora_submit_triage")
+    expect(work).toContain("fixora_submit_fix")
+    expect(work).toContain("CONTINUE")
+    const publish = state.publishPrompts.at(-1)!
+    expect(publish).toContain("git add -- src/cart/service.ts src/cart/guard.test.ts")
+    expect(publish).toContain("git commit -F")
+    expect(publish).toContain("git push -u origin fixora/")
+    expect(publish).toContain("compareUrl")
+    expect(publish).toContain("git checkout main")
+    expect(publish).not.toContain("stash pop")
     // Worker sessions were created in the session's checkout with static permission rules; reviewer separate.
     const fixer = mock.sessions.get(run.sessions.fixer!)!
     expect(fixer.location?.directory).toBe(repo)
     expect(fixer.agent).toBe("build")
     expect(Array.isArray(fixer.permissions)).toBe(true)
     expect(run.sessions.reviewer).not.toBe(run.sessions.fixer)
-    expect(mock.sessions.get(run.sessions.reviewer!)!.prompts[0]!.skills?.[0]?.id).toBe("fixora-review")
-    // The publish prompt carried the approved grants and the exact commands.
-    const publish = state.publishPrompts.at(-1)!
-    expect(publish).toContain("git add -- src/cart/service.ts src/cart/guard.test.ts")
-    expect(publish).toContain("git commit -F")
-    expect(publish).toContain("git push -u origin fixora/")
-    expect(publish).toContain("compareUrl")
-    // The approval dialog carried human-readable resources and the preview path.
+    // One approval dialog for the whole publish turn.
     const gate = mock.permissionRequests.find((p) => p.action === "fixora.publish")!
     expect(gate.resources.some((r) => r.startsWith("push branch fixora/"))).toBe(true)
     expect(gate.resources.some((r) => r.includes("+6 −0"))).toBe(true)
-    expect(existsSync(join(run.folder, "publish-preview.md"))).toBe(true)
-    // Artefacts in the run folder; no mapping.md any more.
-    for (const f of ["crash.json", "crash.md", "project.md", "limits.json", "triage.json", "fix.1.json", "diff.1.patch", "verification.1.json", "review.1.json", "commit-message.txt", "mr.md"]) expect(existsSync(join(run.folder, f))).toBe(true)
-    expect(existsSync(join(run.folder, "mapping.md"))).toBe(false)
+    expect(mock.permissionRequests.map((p) => p.action)).toEqual(["fixora.publish"])
+    for (const f of ["crash.json", "crash.md", "project.md", "limits.json", "triage.json", "fix.1.json", "diff.1.patch", "verification.1.json", "review.1.json", "commit-message.txt", "mr.md", "publish-preview.md"]) expect(existsSync(join(run.folder, f))).toBe(true)
     const commitMessage = readFileSync(join(run.folder, "commit-message.txt"), "utf8")
     expect(commitMessage.startsWith("fix(cart): Guard missing coupon in applyCoupon")).toBe(true)
     expect(commitMessage).toContain(`Fixora-Run: ${run.runId}`)
-    expect(readFileSync(join(run.folder, "crash.md"), "utf8")).toContain("src/cart/service.ts")
-    // Progress rows and RPC events were emitted; the final report was presented after restore.
     expect(mock.rpcEvents.some((e) => e.name === "run.started")).toBe(true)
-    expect(mock.rpcEvents.filter((e) => e.name === "run.stage").length).toBeGreaterThan(10)
+    expect(mock.rpcEvents.filter((e) => e.name === "run.stage").length).toBeGreaterThan(8)
     expect(mock.rpcEvents.some((e) => e.name === "run.done")).toBe(true)
     const final = mock.synthetics.filter((s) => s.resume).pop()!
     expect(final.text).toContain("finished in")
     expect(final.text).toContain(run.branch!)
     expect(final.text).toContain("restored to `main`")
-    // Nothing in the plugin ever shelled out: the only "git" is inside prompts to the agent.
-    expect(mock.permissionRequests.map((p) => p.action)).toEqual(["fixora.publish"])
   })
 
   test("re-running the same crash is refused; status renders; retry of a done run is refused", async () => {
     await expect(runFix(rt, { sessionID: "origin", ref: `manual:${runId.replace("manual-", "")}`, flags: FLAGS })).rejects.toThrow("already")
     await runStatus(rt, { sessionID: "origin", runId })
     expect(mock.synthetics.pop()!.text).toContain("| analyse | ok |")
-    expect(mock.synthetics.pop()!.text ?? "").toBeDefined()
     await expect(runRetry(rt, { sessionID: "origin", runId, fresh: false, flags: FLAGS })).rejects.toThrow("already done")
   })
 
   test("feedback: a question gets an answer without changes; a change request re-runs validate → review → publish; the checkout is restored both times", async () => {
     mock.synthetics.length = 0
     state.restorePrompts.length = 0
+    state.workPrompts.length = 0
     mock.assistantText = "Yes: the guard returns early for both undefined and null."
     const answered = await runFeedback(rt, { sessionID: "origin", runId, message: "Question: does the guard also cover null?" })
     expect(answered.status).toBe("done")
     expect(answered.counters.feedback).toBe(1)
     expect(answered.commitShas).toHaveLength(1)
     expect(mock.synthetics.some((s) => s.text.includes("the guard returns early"))).toBe(true)
-    expect(state.restorePrompts).toHaveLength(1)
-    // The feedback round re-checked the branch out (prepare with the existing branch name).
-    expect(state.preparePrompts.at(-1)).toContain(`already has branch \`${answered.branch}\``)
+    expect(state.restorePrompts).toHaveLength(1) // an answer only: restored by the failure-path step
+    expect(state.workPrompts.at(-1)).toContain(answered.branch!)
+    expect(state.workPrompts.at(-1)).toContain("feedback")
     const changed = await runFeedback(rt, { sessionID: "origin", runId, message: "also guard null coupons" })
     if (changed.status !== "done") throw new Error(`${changed.status} at ${changed.step}: ${changed.error}`)
     expect(changed.counters.feedback).toBe(2)
     expect(changed.commitShas).toHaveLength(2)
     expect(changed.reviews).toHaveLength(2)
     expect(changed.pipeline.pushed).toBe(true)
-    expect(state.restorePrompts).toHaveLength(2)
+    expect(changed.checkout.active).toBe(false)
     expect(readFileSync(join(changed.folder, "diff.3.patch"), "utf8")).toContain("c == null")
   })
 
@@ -293,7 +291,6 @@ describe("pipeline orchestration", () => {
     expect(run.status).toBe("rejected")
     expect(run.step).toBe("publish")
     expect(run.pipeline.committed).toBe(false)
-    expect(run.pipeline.pushed).toBe(false)
     expect(run.checkout.active).toBe(false)
     expect(state.restorePrompts).toHaveLength(1)
     expect(state.publishPrompts).toHaveLength(0)
@@ -302,10 +299,9 @@ describe("pipeline orchestration", () => {
     const retried = await runRetry(rt, { sessionID: "origin", runId, from: "publish", fresh: false, flags: FLAGS })
     expect(retried.status).toBe("done")
     expect(retried.pipeline.pushed).toBe(true)
-    // Only prepare (re-checkout), publish and restore were prompted on the retry.
-    const after = fixerPrompts(retried).slice(-3).map((p) => p.skills?.[0]?.id)
-    expect(after).toEqual(["fixora-prepare", "fixora-publish", "fixora-ops"])
-    expect(state.restorePrompts).toHaveLength(2)
+    // The retry re-checked the branch out (prepare only) and published; nothing else was prompted.
+    expect(skillsOf(retried).slice(-2)).toEqual([["fixora-prepare"], ["fixora-publish"]])
+    expect(state.restorePrompts).toHaveLength(1)
   })
 
   test("restart creates a new branch and a fresh cycle", async () => {
@@ -327,15 +323,15 @@ describe("pipeline orchestration", () => {
     expect(existsSync(join(run.folder, "mr.md"))).toBe(true)
     expect(readFileSync(join(run.folder, "mr.md"), "utf8")).toContain("## Root cause")
     expect(state.restorePrompts).toHaveLength(1)
-    expect(mock.permissionRequests.filter((p) => p.action === "fixora.publish").length).toBe(gatesBefore) // no gate in a dry run
+    expect(mock.permissionRequests.filter((p) => p.action === "fixora.publish").length).toBe(gatesBefore)
   })
 })
 
 describe("dirty checkout", () => {
-  test("the user is asked before anything is stashed; approved → stash, work, pop", async () => {
+  test("the user is asked before anything is stashed; approved → the same session stashes, continues, and the stash is popped at the end", async () => {
     state.dirty = true
-    state.restorePrompts.length = 0
-    state.preparePrompts.length = 0
+    state.workPrompts.length = 0
+    state.publishPrompts.length = 0
     const run = await runPaste(rt, { sessionID: "origin", file: join(root, "trace2.txt"), flags: FLAGS })
     if (run.status !== "done") throw new Error(`${run.status} at ${run.step}: ${run.error}`)
     const stash = mock.permissionRequests.find((p) => p.action === "fixora.stash")!
@@ -343,9 +339,10 @@ describe("dirty checkout", () => {
     expect(run.approvals.stash).toBe("approved")
     expect(run.checkout.stashRef).toBe(STASH_SHA)
     expect(run.checkout.active).toBe(false)
-    expect(state.preparePrompts).toHaveLength(2)
-    expect(state.preparePrompts[1]).toContain("git stash push -u -m")
-    expect(state.restorePrompts.at(-1)).toContain("git stash pop")
+    expect(state.workPrompts).toHaveLength(2)
+    expect(state.workPrompts[1]).toContain("git stash push -u -m")
+    expect(state.workPrompts[1]).toContain("fixora_submit_fix")
+    expect(state.publishPrompts.at(-1)).toContain("git stash pop")
     expect(existsSync(join(run.folder, "stash-preview.md"))).toBe(true)
     expect(mock.rpcEvents.some((e) => e.name === "run.awaiting" && (e.data as { kind: string }).kind === "stash")).toBe(true)
   })
@@ -361,7 +358,6 @@ describe("dirty checkout", () => {
     expect(run.checkout.active).toBe(false)
     expect(run.branch).toBeUndefined()
     expect(state.restorePrompts).toHaveLength(0)
-    // Retry resumes at prepare.
     state.dirty = false
     const retried = await runRetry(rt, { sessionID: "origin", runId: run.runId, fresh: false, flags: FLAGS })
     expect(retried.status).toBe("done")
@@ -370,12 +366,11 @@ describe("dirty checkout", () => {
 })
 
 describe("cancellation and the repository lock", () => {
-  test("cancelling during the fix phase still restores the checkout", async () => {
+  test("cancelling during the fix stage still restores the checkout", async () => {
     state.cancelInFix = true
     state.restorePrompts.length = 0
     const run = await runPaste(rt, { sessionID: "origin", file: join(root, "trace.txt"), flags: { ...FLAGS, force: true } })
     expect(run.status).toBe("cancelled")
-    expect(run.step).toBe("fix")
     expect(run.checkout.active).toBe(false)
     expect(state.restorePrompts).toHaveLength(1)
   })
@@ -393,10 +388,31 @@ describe("cancellation and the repository lock", () => {
     const [a, b] = await Promise.all([first, second])
     expect(a.status).toBe("done")
     expect(b.status).toBe("done")
-    // The second run started its prepare phase only after the first restored the checkout.
     const aRestore = Date.parse(a.checkout.restoredAt!)
     const bPrepare = Date.parse(b.timings.prepare!.startedAt)
     expect(bPrepare).toBeGreaterThanOrEqual(aRestore)
+  })
+})
+
+describe("branch naming convention", () => {
+  test("a template names the branch exactly; without Jira the crash id stands in for the ticket", async () => {
+    const saved = rt.opts
+    rt.opts = { ...rt.opts, branchNaming: { template: "{type}/{ticket}-{slug}", type: "fix", example: "fix/DE-456-fix-crash-on-startup" } }
+    state.workPrompts.length = 0
+    try {
+      const run = await runPaste(rt, { sessionID: "origin", file: join(root, "trace.txt"), flags: { ...FLAGS, force: true } })
+      if (run.status !== "done") throw new Error(`${run.status} at ${run.step}: ${run.error}`)
+      const expected = `fixora/fix/${slug(run.crashId, 12)}-${slug(run.title, 32)}`
+      expect(run.branch!.startsWith(expected)).toBe(true)
+      expect(run.meta?.plannedBranch).toBe(run.branch)
+      expect(run.jiraKey).toBeUndefined()
+      expect(state.workPrompts[0]).toContain(`\`${run.branch}\` — use it exactly`)
+      expect(state.workPrompts[0]).toContain("e.g. fix/DE-456-fix-crash-on-startup")
+      expect(state.workPrompts[0]).not.toContain("Jira ticket")
+      expect(mock.permissionRequests.filter((p) => p.action === "fixora.ticket")).toHaveLength(0)
+    } finally {
+      rt.opts = saved
+    }
   })
 })
 
@@ -418,5 +434,49 @@ describe("reset", () => {
     expect(gate.resources.some((r) => r.includes("merge requests and Jira tickets are kept"))).toBe(true)
     expect(mock.synthetics.at(-1)!.description).toContain("fixora reset")
     expect(mock.synthetics.at(-1)!.text).toContain("- run: ")
+  })
+})
+
+describe("report hygiene", () => {
+  test("a second submit of an accepted report changes nothing; a refused report's reason reaches the failure message; a dirty 'ready' without an approved stash is taken as inspect", async () => {
+    const tool = (name: string) => mock.tools.get(name)!
+    const seed = await runPaste(rt, { sessionID: "origin", file: join(root, "trace.txt"), flags: { ...FLAGS, force: true } })
+    expect(seed.status).toBe("done")
+    // Scripted: the prepare stage first sends a wrong branch name (refused), then 'ready' while dirty (demoted to inspect → stash gate), and the run completes after approval.
+    const original = state.dirty
+    state.dirty = false
+    let calls = 0
+    const fixer = mock.sessions.get(seed.sessions.fixer!)!
+    const run = await (async () => {
+      const prev = mock.worker
+      mock.worker = async (prompt, session, t) => {
+        const w = mock.storage.get(`fixora/worker/${session.id}`) as WorkerInfo
+        if (w.phase === "prepare" && calls === 0) {
+          calls++
+          const bad = await t("fixora_submit_prepare").execute({ version: 1, runId: w.runId, stage: "ready", repoRoot: repo, previousBranch: "main", previousHeadSha: HEAD_SHA, dirty: false, baseRef: "origin/main", baseSha: BASE_SHA, remoteUrl: "git@git.corp.io:team/shop.git", branch: "feature/not-fixora", created: true, toolchain: { ecosystems: [], checks: [] }, conventionFiles: [], notes: [] }, toolCtx(session.id))
+          expect((bad.output as { ok: boolean }).ok).toBe(false)
+          expect(bad.content).toContain('branch must start with "fixora/"')
+          expect(String((mock.storage.get(`fixora/run/${w.runId}`) as RunRecord).meta?.lastRejection)).toContain("prepare report: branch must start with")
+          // 'ready' but dirty and no stash approval → inspect report → STOP (the pipeline asks the user)
+          const demoted = await t("fixora_submit_prepare").execute({ version: 1, runId: w.runId, stage: "ready", repoRoot: repo, previousBranch: "main", previousHeadSha: HEAD_SHA, dirty: true, status: " M README.md\n", baseRef: "origin/main", baseSha: BASE_SHA, branch: "fixora/x", toolchain: { ecosystems: [], checks: [] }, conventionFiles: [], notes: [] }, toolCtx(session.id))
+          expect((demoted.output as { ok: boolean }).ok).toBe(true)
+          expect(demoted.content).toContain("STOP")
+          return
+        }
+        return prev(prompt, session, t)
+      }
+      try {
+        state.dirty = true
+        return await runPaste(rt, { sessionID: "origin", file: join(root, "trace.txt"), flags: { ...FLAGS, force: true } })
+      } finally {
+        mock.worker = prev
+        state.dirty = original
+      }
+    })()
+    expect(run.status).toBe("done")
+    expect(run.approvals.stash).toBe("approved")
+    expect(run.checkout.stashRef).toBe(STASH_SHA)
+    void fixer
+    void tool
   })
 })

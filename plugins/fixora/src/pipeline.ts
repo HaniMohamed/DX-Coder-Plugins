@@ -1,29 +1,30 @@
-// The per-crash pipeline: detect → fetch → prepare → analyse → ticket → fix → validate → review →
-// publish → close-loop → (restore) → done. The plugin only decides and validates; every git command,
-// check, MCP call and CLI is run by a worker session (the host's coding agent) inside the user's
-// checkout. Each step is idempotent and resumable from storage; restore runs on every exit path.
+// The per-crash pipeline in three agent turns: WORK (fetch → prepare → analyse → fix in one fixer
+// session; the submit tools steer the agent from stage to stage and flip its permission phase),
+// REVIEW (a fresh session) and PUBLISH (ticket → commit → push → MR → links → restore, after one
+// approval). The plugin only decides and validates; every git command, check, MCP call and CLI is
+// run by the agent inside the user's checkout. Steps are idempotent and resumable; the checkout is
+// restored on every exit path.
 
-import { existsSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises"
 import { join } from "node:path"
-import { needsCheckout } from "./checkout.js"
+import { duplicateMessage, indexCrash } from "./crashindex.js"
 import { describeError } from "./errors.js"
-import { detectReopen } from "./fingerprint.js"
-import { ApprovalRejected, approve, decideApproval, gateKinds } from "./gate.js"
-import { branchName, compareUrl, parseRemote, type ParsedRemote } from "./git.js"
+import { ApprovalRejected, approve, decideApproval } from "./gate.js"
+import { branchFromTemplate, branchName, compareUrl, parseRemote, slug, type ParsedRemote } from "./git.js"
 import { dedupeJql, jiraAvailable, jiraBaseUrl, jiraCommentInput, jiraCreateInput, jiraSearchInput, jiraTransitionsInput, schemaParamType } from "./jira.js"
 import { connected } from "./mcp.js"
 import { mrProviderOrder, renderMrAttempts, renderMrOp, type MrProvider } from "./mr.js"
-import { crashFetchPrompt, feedbackPrompt, fixFollowUpPrompt, fixPrompt, nudgePrompt, opsPrompt, preparePrompt, publishPrompt, renderTestFailureText, restoreSteps, SKILLS, ticketPrompt, triagePrompt, type Prompt, type PublishPlan } from "./prompts.js"
-import { appendLog, FixoraStop, notify, present, progress, sourceContext, stageBegin, stageEnd, toolProps, type Runtime } from "./progress.js"
+import { fixFollowUpPrompt, nudgePrompt, opsPrompt, publishPrompt, renderTestFailureText, restorePlan, restoreSteps, SKILLS, workPrompt, type OpStep, type PublishPlan, type TicketPlan, type WorkStage } from "./prompts.js"
+import { appendLog, FixoraStop, notify, present, sourceContext, stageBegin, stageEnd, toolProps, type Runtime } from "./progress.js"
 import { manualRestoreText, renderApprovalPreview, renderCommitMessage, renderCrashMarkdown, renderFinalReport, renderJiraComment, renderJiraIssue, renderMr, renderTriageCard, renderValidationCard } from "./render.js"
 import { ensureRunRepo } from "./repo.js"
 import { latestFixAttempt, runReview } from "./review.js"
 import { scanAddedLines } from "./secrets.js"
 import { sourceById } from "./sources/index.js"
 import { crashFromFile } from "./sources/manual.js"
-import { loadCrashIndex, loadRun, saveCrashIndex, saveRun } from "./state.js"
-import type { Crash, CrashIndexEntry, RunRecord, Step, WorkerGrants } from "./types.js"
+import { saveRun } from "./state.js"
+import type { Crash, RunRecord, Step, WorkerGrants, WorkerPhase } from "./types.js"
 import { checkChangedFiles, failedChecks, summarizeChecks } from "./validate.js"
 import { awaitSubmission, ensureWorker, lastAssistantText, type Outcome } from "./worker.js"
 
@@ -34,8 +35,9 @@ export interface PipelineOptions {
   feedback?: string
 }
 
-const FEEDBACK_ORDER: Step[] = ["fix", "validate", "review", "publish", "close-loop", "done"]
-const FULL_ORDER: Step[] = ["detect", "fetch", "prepare", "analyse", "ticket", "fix", "validate", "review", "publish", "close-loop", "done"]
+type Phase = "detect" | "fetch" | "work" | "validate" | "review" | "publish" | "done"
+const PHASES: Phase[] = ["detect", "fetch", "work", "validate", "review", "publish", "done"]
+const PHASE_OF: Record<Step, Phase> = { detect: "detect", fetch: "fetch", prepare: "work", analyse: "work", ticket: "publish", fix: "work", validate: "validate", review: "review", publish: "publish", "close-loop": "publish", restore: "done", done: "done" }
 
 const rand = () => Math.random().toString(36).slice(2, 10)
 
@@ -59,6 +61,11 @@ export class Pipeline {
   private log(line: string) {
     return appendLog(this.run.folder, line)
   }
+  /** The reason the last report of this run was refused, for failure messages. */
+  private lastRejection(): string {
+    const r = this.run.meta?.lastRejection
+    return typeof r === "string" && r ? ` Last report refused — ${r}.` : ""
+  }
   private crashUrl() {
     return this.crash?.url ?? (typeof this.run.meta?.crashUrl === "string" ? this.run.meta.crashUrl : undefined)
   }
@@ -68,21 +75,22 @@ export class Pipeline {
 
   async execute(): Promise<RunRecord> {
     const run = this.run
-    const order = this.o.feedback ? FEEDBACK_ORDER : FULL_ORDER
-    let i = Math.max(0, order.indexOf(this.o.from))
+    const from: Step = this.o.feedback ? "fix" : this.o.from
+    let i = Math.max(0, PHASES.indexOf(PHASE_OF[from]))
     try {
       await this.reload()
-      while (i < order.length) {
+      while (i < PHASES.length) {
         if (this.o.signal.aborted) throw new FixoraStop(`run ${run.runId} was cancelled`)
-        const step = order[i]!
-        if (step !== "prepare" && needsCheckout(step) && !run.checkout.active) {
-          const r = await this.prepare()
+        const phase = PHASES[i]!
+        // Re-entry after a restore (retry, feedback): the checkout has to be prepared again first.
+        if ((phase === "validate" || phase === "review" || phase === "publish") && !run.checkout.active) {
+          const r = await this.work(["prepare"])
           if (r === "stop") break
         }
-        const next = await this.runStep(step)
+        const next = await this.runPhase(phase, from)
         if (next === "stop") break
         if (next === "loop") {
-          i = order.indexOf("validate")
+          i = PHASES.indexOf("validate")
           continue
         }
         i++
@@ -94,6 +102,31 @@ export class Pipeline {
       await this.finish()
     }
     return run
+  }
+
+  private async runPhase(phase: Phase, from: Step): Promise<"next" | "stop" | "loop"> {
+    switch (phase) {
+      case "detect":
+        return this.detect()
+      case "fetch":
+        return this.fetch()
+      case "work":
+        return this.work(this.stagesFor(from))
+      case "validate":
+        return this.validate()
+      case "review":
+        return this.review()
+      case "publish":
+        return this.publish()
+      case "done":
+        return this.done()
+    }
+  }
+
+  /** Which stages the work turn still has to do when the pipeline enters it at `from`. */
+  private stagesFor(from: Step): WorkStage[] {
+    if (this.o.feedback) return ["fix"]
+    return from === "fix" ? ["fix"] : from === "analyse" ? ["triage", "fix"] : ["prepare", "triage", "fix"]
   }
 
   // ---------- bookkeeping ----------
@@ -109,22 +142,23 @@ export class Pipeline {
   /** Marks the submission the next prompt must produce; the submit tools echo it into `meta.received`. */
   private async expect(kind: string): Promise<string> {
     const token = `${kind}:${rand()}`
-    this.run.meta = { ...this.run.meta, expect: token, received: null }
+    this.run.meta = { ...this.run.meta, expect: token, received: null, lastRejection: null }
     await saveRun(this.ctx, this.run)
     return token
   }
 
-  /** Takes over what the submit tools persisted (everything but the pipeline's own bookkeeping). */
+  /** Takes over what the submit tools persisted (they also record stage events and phases). */
   private adopt(fresh: RunRecord) {
-    const { timings, step, ...rest } = fresh
-    void timings
-    void step
-    Object.assign(this.run, rest)
+    Object.assign(this.run, fresh)
+    const file = join(this.run.folder, "crash.json")
+    if (!this.crash && existsSync(file)) this.crash = JSON.parse(readFileSync(file, "utf8")) as Crash
+    this.remote = this.run.base.remoteUrl ? parseRemote(this.run.base.remoteUrl, this.opts.mr.forge) : undefined
   }
 
   private async fail(error: unknown) {
     const run = this.run
     const step = run.step
+    if (error instanceof Error && !(error instanceof FixoraStop) && !(error instanceof ApprovalRejected) && error.stack) await this.log(`unexpected error at ${step}: ${error.stack}`).catch(() => {})
     if (error instanceof ApprovalRejected) {
       run.status = "rejected"
       await stageEnd(this.rt, run, step, "failed", error.message)
@@ -134,7 +168,7 @@ export class Pipeline {
     if (error instanceof FixoraStop) {
       if (run.status === "running" || run.status === "awaiting-approval") run.status = this.o.signal.aborted ? "cancelled" : "failed"
       run.error = error.message
-      await stageEnd(this.rt, run, step, run.status === "skipped" ? "skipped" : "failed", undefined, error.message)
+      if (run.timings[step]?.status === "running") await stageEnd(this.rt, run, step, run.status === "skipped" ? "skipped" : "failed", undefined, error.message)
       return
     }
     const message = error instanceof Error ? `${error.name}: ${error.message}` : describeError(error)
@@ -157,35 +191,6 @@ export class Pipeline {
     await present(this.ctx, run.originSessionID, `fixora ${run.runId}: ${run.status}${run.mrUrl ? ` — ${run.mrUrl}` : ""}`, report)
   }
 
-  private async runStep(step: Step): Promise<"next" | "stop" | "loop"> {
-    switch (step) {
-      case "detect":
-        return this.detect()
-      case "fetch":
-        return this.fetch()
-      case "prepare":
-        return this.prepare()
-      case "analyse":
-        return this.analyse()
-      case "ticket":
-        return this.ticket()
-      case "fix":
-        return this.fix()
-      case "validate":
-        return this.validate()
-      case "review":
-        return this.review()
-      case "publish":
-        return this.publish()
-      case "close-loop":
-        return this.closeLoop()
-      case "restore":
-        return "next"
-      case "done":
-        return this.done()
-    }
-  }
-
   private stopFor(outcome: Outcome, what: string, budgetMinutes: number, retryFrom: Step): never {
     const run = this.run
     if (outcome === "aborted") throw new FixoraStop(`run ${run.runId} was cancelled during ${what}`)
@@ -196,7 +201,7 @@ export class Pipeline {
     throw new FixoraStop(`The worker did not report back from ${what}. See the worker session (${run.sessions.fixer ?? "?"}), then \`/fixora retry ${run.runId} --from ${retryFrom}\`.`)
   }
 
-  // ---------- steps ----------
+  // ---------- phases ----------
 
   private async detect(): Promise<"next"> {
     const run = this.run
@@ -209,269 +214,183 @@ export class Pipeline {
       if (!existsSync(gi)) await writeFile(gi, "*\n")
     }
     const services = Object.keys(this.rt.services).filter((k) => connected(this.rt.services[k as keyof typeof this.rt.services]))
-    await stageEnd(this.rt, run, "detect", "ok", `${services.join(", ") || "no MCP"} · checkout ${run.repo}`)
+    await stageEnd(this.rt, run, "detect", "ok", `${services.join(", ") || "no MCP"} · checkout ${run.repo} · fixora ${this.rt.version ?? "dev"}`)
     return "next"
   }
 
+  /** Pasted traces are parsed here; crashes from a source are fetched by the agent as the first stage of the work turn. */
   private async fetch(): Promise<"next"> {
     const run = this.run
-    await stageBegin(this.rt, run, "fetch")
     const file = join(run.folder, "crash.json")
     if (existsSync(file) && !run.flags.force) {
       this.crash = JSON.parse(await readFile(file, "utf8")) as Crash
-    } else if (run.source === "manual") {
-      const extra = this.extra
-      this.crash = await crashFromFile({ file: extra?.file ?? run.crashId, title: extra?.title, platform: extra?.platform, language: extra?.language, appPackage: this.opts.appPackage, inAppPrefixes: this.opts.inAppPackages })
-      await writeFile(file, `${JSON.stringify(this.crash, null, 2)}\n`)
-      run.title = this.crash.title
-      run.fingerprint = this.crash.fingerprint
-      run.meta = { ...run.meta, crashUrl: null, platform: this.crash.platform ?? null, appVersion: null, language: this.crash.language, symbolication: this.crash.symbolication, userCount: null, eventCount: null }
-    } else {
-      const source = sourceById(run.source)
-      const plan = source.fetchPlan!(sourceContext(this.rt), run.crashId, this.extra)
-      const sessionID = await ensureWorker(this.rt, run, "fixer", { phase: "crash" })
-      const token = await this.expect("crash")
-      const r = await awaitSubmission(this.rt, run, sessionID, crashFetchPrompt(run, plan), {
-        minutes: this.opts.worker.maxPhaseMinutes.crash,
-        signal: this.o.signal,
-        label: "fetching the crash through the agent",
-        pick: (fresh) => (fresh.meta?.received === token ? fresh : undefined),
-        nudge: nudgePrompt("fixora_submit_crash", run.runId, SKILLS.crashes, "the replies you received"),
-      })
-      if (!r.value) this.stopFor(r.outcome, "the crash fetch", this.opts.worker.maxPhaseMinutes.crash, "fetch")
-      this.adopt(r.value)
-      this.crash = JSON.parse(await readFile(file, "utf8")) as Crash
+      return "next"
     }
-    const crash = this.crash
-    run.title = crash.title
-    run.fingerprint = crash.fingerprint
-    // Crash index: dedupe across sources, reopen detection.
-    const index: CrashIndexEntry = (await loadCrashIndex(this.ctx, crash.fingerprint)) ?? { fingerprint: crash.fingerprint, runIds: [], reopened: { count: 0 } }
-    const others = index.runIds.filter((id) => id !== run.runId)
-    if (others.length > 0 && !run.flags.force) {
-      for (const id of others) {
-        const other = await loadRun(this.ctx, id)
-        if (other && (other.mrUrl || other.status === "running" || other.status === "awaiting-approval")) {
-          run.status = "skipped"
-          run.skipReason = `same crash fingerprint as run ${id} (${other.status}${other.mrUrl ? `, MR ${other.mrUrl}` : ""})`
-          throw new FixoraStop(`This crash has the same fingerprint as run \`${id}\` (${other.status}${other.mrUrl ? `, MR ${other.mrUrl}` : ""}). Use \`/fixora feedback ${id} "…"\` or \`/fixora restart ${id}\`, or re-run with --force to fix it separately.`)
-        }
-      }
+    if (run.source !== "manual") return "next"
+    await stageBegin(this.rt, run, "fetch")
+    const extra = this.extra
+    this.crash = await crashFromFile({ file: extra?.file ?? run.crashId, title: extra?.title, platform: extra?.platform, language: extra?.language, appPackage: this.opts.appPackage, inAppPrefixes: this.opts.inAppPackages })
+    await writeFile(file, `${JSON.stringify(this.crash, null, 2)}\n`)
+    run.title = this.crash.title
+    run.fingerprint = this.crash.fingerprint
+    run.meta = { ...run.meta, crashUrl: null, platform: this.crash.platform ?? null, appVersion: null, language: this.crash.language, symbolication: this.crash.symbolication, userCount: null, eventCount: null }
+    const index = await indexCrash(this.ctx, run, this.crash)
+    if (index.reopened) {
+      await this.rt.emit("crash.reopened", { runId: run.runId, fingerprint: this.crash.fingerprint, reason: index.reopened.reason, previousRunId: index.reopened.previousRunId })
+      await notify(this.ctx, run.originSessionID, `fixora ${run.runId}: ⚠ reopened crash — fixed in ${index.reopened.fixedIn}, seen again (${index.reopened.reason})`)
     }
-    const reopen = detectReopen(index, crash, new Date().toISOString())
-    if (reopen.reopened) {
-      index.reopened = { count: index.reopened.count + 1, lastAt: new Date().toISOString(), reason: reopen.reason }
-      run.reopened = { count: index.reopened.count, previousRunId: index.fixedIn?.runId, fixedIn: index.fixedIn?.release, reason: reopen.reason }
-      await this.rt.emit("crash.reopened", { runId: run.runId, fingerprint: crash.fingerprint, reason: reopen.reason, previousRunId: index.fixedIn?.runId })
-      await notify(this.ctx, run.originSessionID, `fixora ${run.runId}: ⚠ reopened crash — fixed in ${index.fixedIn?.release}, seen again (${reopen.reason})`)
+    await writeFile(join(run.folder, "crash.md"), `${renderCrashMarkdown(this.crash, { reopened: run.reopened ? { ...run.reopened } : undefined })}\n`)
+    if (index.duplicateOf) {
+      run.status = "skipped"
+      run.skipReason = `same crash fingerprint as run ${index.duplicateOf.runId}`
+      throw new FixoraStop(duplicateMessage(index.duplicateOf))
     }
-    if (!index.runIds.includes(run.runId)) index.runIds.push(run.runId)
-    index.title = crash.title
-    index.lastSeen = crash.lastSeen ?? index.lastSeen
-    await saveCrashIndex(this.ctx, index)
-    // No frame mapping or in-app / symbolication judgement here: the agent investigates the frames
-    // itself in the analyse phase and classifies (fixable, third_party_only, needs_symbolication…).
-    await writeFile(join(run.folder, "crash.md"), `${renderCrashMarkdown(crash, { reopened: run.reopened ? { ...run.reopened } : undefined })}\n`)
-    await stageEnd(this.rt, run, "fetch", "ok", `${crash.exceptionType ?? crash.title} · ${crash.frames.length} frames · ${crash.language}${crash.symbolication !== "ok" ? ` · symbolication: ${crash.symbolication}` : ""}`)
+    await stageEnd(this.rt, run, "fetch", "ok", `${this.crash.exceptionType ?? this.crash.title} · ${this.crash.frames.length} frames · ${this.crash.language}${this.crash.symbolication !== "ok" ? ` · symbolication: ${this.crash.symbolication}` : ""}`)
     return "next"
   }
 
-  /** The worker checks out the fix branch in the user's checkout (stashing after approval when dirty). */
-  private async prepare(): Promise<"next" | "stop"> {
+  /**
+   * The WORK turn. One prompt lists the stages still to do; the submit tools move the session from
+   * stage to stage (and record the stage events). The plugin steps in only for the stash approval.
+   */
+  private async work(wanted: WorkStage[]): Promise<"next" | "stop"> {
     const run = this.run
-    if (run.checkout.active) {
-      if (run.step !== "prepare") return "next"
-      await stageBegin(this.rt, run, "prepare")
-      await stageEnd(this.rt, run, "prepare", "ok", `already on ${run.branch}`)
-      return "next"
-    }
-    await stageBegin(this.rt, run, "prepare")
-    const sessionID = await ensureWorker(this.rt, run, "fixer", { phase: "prepare" })
-    const fallbackBranch = run.branch ?? branchName(this.opts.branchPrefix, run.runId, run.title, run.counters.restarts)
-    const budget = this.opts.worker.maxPhaseMinutes.prepare
-    const ask = async (prompt: Prompt, label: string) => {
-      const token = await this.expect("prepare")
+    const stages: WorkStage[] = [...wanted]
+    if (!run.checkout.active && !stages.includes("prepare")) stages.unshift("prepare")
+    const needFetch = run.source !== "manual" && !existsSync(join(run.folder, "crash.json"))
+    if (needFetch && !stages.includes("fetch")) stages.unshift("fetch")
+    const stepOf = (s: WorkStage): Step => (s === "fetch" ? "fetch" : s === "prepare" ? "prepare" : s === "triage" ? "analyse" : "fix")
+    const phaseOf = (s: WorkStage): WorkerPhase => (s === "fetch" ? "crash" : s === "prepare" ? "prepare" : s === "triage" ? "triage" : this.o.feedback ? "feedback" : "fix")
+    let firstStep: Step = stepOf(stages[0]!)
+    await stageBegin(this.rt, run, firstStep)
+    run.meta = { ...run.meta, workStages: stages.join(","), feedback: this.o.feedback ? true : null }
+    const attempt = latestFixAttempt(run)
+    const fetch = needFetch ? sourceById(run.source).fetchPlan!(sourceContext(this.rt), run.crashId, this.extra) : undefined
+    const m = this.opts.worker.maxPhaseMinutes
+    const budgetOf = (list: WorkStage[]) => list.reduce((sum, s) => sum + (s === "fetch" ? m.crash : s === "prepare" ? m.prepare : s === "triage" ? m.triage : m.fix), 0)
+    let budget = budgetOf(stages)
+    const checks = run.toolchain?.checks ?? []
+    let sessionID = await ensureWorker(this.rt, run, "fixer", { phase: phaseOf(stages[0]!) })
+    const turn = async (prompt: ReturnType<typeof workPrompt>, label: string) => {
+      const token = await this.expect("work")
       const r = await awaitSubmission(this.rt, run, sessionID, prompt, {
         minutes: budget,
         signal: this.o.signal,
         label,
         pick: (fresh) => (fresh.meta?.received === token ? fresh : undefined),
-        nudge: nudgePrompt("fixora_submit_prepare", run.runId, SKILLS.prepare, `stage "inspect" with what you found, or stage "ready" if the branch is checked out`),
+        nudge: nudgePrompt("the next fixora_submit_* tool of the stage you are in", run.runId, prompt.skills, "what you have"),
       })
-      if (!r.value) this.stopFor(r.outcome, "the prepare phase", budget, "prepare")
+      if (!r.value) this.stopFor(r.outcome, "the work turn", budget, firstStep)
       this.adopt(r.value)
-      return String(run.meta?.prepareStage ?? "")
+      return r.outcome
     }
-    let stage = await ask(preparePrompt(run, this.opts, { stage: "inspect", fallbackBranch }), "the agent is inspecting the checkout")
-    if (stage === "blocked") throw new FixoraStop(blockedHelp(run))
-    if (stage === "inspect") {
-      const dirty = run.meta?.prepareDirty === true
-      if (dirty) {
-        const files = Number(run.meta?.prepareDirtyFiles ?? 0)
-        const status = String(run.meta?.prepareStatus ?? "")
-        const decision = decideApproval("stash", run, this.opts, { serviceAvailable: true })
-        if (decision.decision === "ask") {
-          await writeFile(join(run.folder, "stash-preview.md"), `${renderApprovalPreview(run, { kind: "stash", branch: fallbackBranch, stash: { files, status }, crashUrl: this.crashUrl() })}\n`)
-          try {
-            await approve(this.rt, run, "stash", {
-              resources: [`stash ${files} uncommitted change(s) in ${run.repo} (git stash push -u)`, `work on branch ${fallbackBranch}, then pop the stash and check out ${run.checkout.previousBranch ?? "your branch"} again`],
-              summary: `stash ${files} local change(s) before fixing`,
-              previewPath: join(run.folder, "stash-preview.md"),
-              preview: { branch: fallbackBranch, stash: { files, status: status.split("\n").slice(0, 20).join("\n") }, rootCause: run.triage?.rootCause, crashUrl: this.crashUrl(), previewPath: join(run.folder, "stash-preview.md") },
-            })
-          } catch (error) {
-            if (error instanceof ApprovalRejected) {
-              run.status = "blocked"
-              run.blockedReason = "dirty-worktree"
-              throw new FixoraStop(`The checkout ${run.repo} has ${files} uncommitted change(s) and stashing was declined. Nothing was touched. Commit or stash them yourself, then \`/fixora retry ${run.runId}\`.`)
-            }
-            throw error
+    const afterFetch = async (outcome: Outcome) => {
+      if (run.status === "skipped") throw new FixoraStop(run.error ?? run.skipReason ?? "skipped")
+      if (run.status === "blocked") throw new FixoraStop(blockedHelp(run))
+      if (run.reopened) await this.rt.emit("crash.reopened", { runId: run.runId, fingerprint: run.fingerprint, reason: run.reopened.reason, previousRunId: run.reopened.previousRunId })
+      if (!this.crash && stages.includes("prepare")) {
+        if (outcome !== "done") this.stopFor(outcome, "the crash fetch", budget, "fetch")
+        throw new FixoraStop(`The agent did not submit the crash. See the worker session, then \`/fixora retry ${run.runId}\`.`)
+      }
+    }
+    let outcome: Outcome = "done"
+    // The branch name needs the Jira key and the ticket needs the crash: fetch first, in its own turn.
+    if (needFetch && stages.includes("prepare") && this.ticketBeforeBranchWanted()) {
+      run.meta = { ...run.meta, workStages: "fetch" }
+      outcome = await turn(workPrompt(run, this.opts, { stages: ["fetch"], fetch, fallbackBranch: "", attempt, checks }), "the agent is fetching the crash")
+      await afterFetch(outcome)
+      stages.splice(stages.indexOf("fetch"), 1)
+      firstStep = "prepare"
+      budget = budgetOf(stages)
+      await stageBegin(this.rt, run, "prepare")
+      run.meta = { ...run.meta, workStages: stages.join(",") }
+    }
+    const naming = await this.planBranch(stages.includes("prepare"))
+    const fallbackBranch = naming.branch
+    sessionID = await ensureWorker(this.rt, run, "fixer", { phase: phaseOf(stages[0]!), grants: naming.ticket ? { jiraWrite: true } : {} })
+    const branchInput = { fallbackBranch, exactBranch: naming.exact, ticket: naming.ticket, ticketFallback: naming.ticketFallback }
+    outcome = await turn(workPrompt(run, this.opts, { stages, fetch: stages.includes("fetch") ? fetch : undefined, ...branchInput, attempt, checks, feedback: this.o.feedback }), `the agent is working (${stages.join(" → ")})`)
+    // Outcomes the tools recorded.
+    if (stages.includes("fetch")) await afterFetch(outcome)
+    else if (run.status === "skipped") throw new FixoraStop(run.error ?? run.skipReason ?? "skipped")
+    else if (run.status === "blocked") throw new FixoraStop(blockedHelp(run))
+    // Dirty checkout: ask, then let the same session continue from the stash onward.
+    if (run.meta?.prepareStage === "inspect" && run.meta?.prepareDirty === true && !run.checkout.active) {
+      const files = Number(run.meta?.prepareDirtyFiles ?? 0)
+      const status = String(run.meta?.prepareStatus ?? "")
+      const decision = decideApproval("stash", run, this.opts, { serviceAvailable: true })
+      if (decision.decision === "ask") {
+        await writeFile(join(run.folder, "stash-preview.md"), `${renderApprovalPreview(run, { kind: "stash", branch: fallbackBranch, stash: { files, status }, crashUrl: this.crashUrl() })}\n`)
+        try {
+          await approve(this.rt, run, "stash", {
+            resources: [`stash ${files} uncommitted change(s) in ${run.repo} (git stash push -u)`, `work on branch ${fallbackBranch}, then pop the stash and check out ${run.checkout.previousBranch ?? "your branch"} again`],
+            summary: `stash ${files} local change(s) before fixing`,
+            previewPath: join(run.folder, "stash-preview.md"),
+            preview: { branch: fallbackBranch, stash: { files, status: status.split("\n").slice(0, 20).join("\n") }, crashUrl: this.crashUrl(), previewPath: join(run.folder, "stash-preview.md") },
+          })
+        } catch (error) {
+          if (error instanceof ApprovalRejected) {
+            run.status = "blocked"
+            run.blockedReason = "dirty-worktree"
+            throw new FixoraStop(`The checkout ${run.repo} has ${files} uncommitted change(s) and stashing was declined. Nothing was touched. Commit or stash them yourself, then \`/fixora retry ${run.runId}\`.`)
           }
-        } else run.approvals.stash = "auto"
-        stage = await ask(preparePrompt(run, this.opts, { stage: "apply", fallbackBranch, stashApproved: true }), "the agent is stashing your changes and creating the branch")
-      } else stage = await ask(preparePrompt(run, this.opts, { stage: "apply", fallbackBranch, stashApproved: false }), "the agent is creating the branch")
+          throw error
+        }
+      } else run.approvals.stash = "auto"
+      const rest = stages.filter((s) => s !== "fetch")
+      run.meta = { ...run.meta, workStages: rest.join(",") }
+      await stageBegin(this.rt, run, "prepare")
+      outcome = await turn(workPrompt(run, this.opts, { stages: rest, ...branchInput, stashApproved: true, attempt, checks, feedback: this.o.feedback }), "the agent is stashing your changes and continuing")
+      if ((run.status as string) === "blocked") throw new FixoraStop(blockedHelp(run))
     }
-    if (stage === "blocked") throw new FixoraStop(blockedHelp(run))
-    if (stage !== "ready" || !run.checkout.active || !run.branch) throw new FixoraStop(`The prepare phase did not end with a checked-out branch (stage ${stage || "none"}). See the worker session, then \`/fixora retry ${run.runId} --from prepare\`.`)
-    this.remote = run.base.remoteUrl ? parseRemote(run.base.remoteUrl, this.opts.mr.forge) : undefined
-    if (!run.base.remoteUrl) await notify(this.ctx, run.originSessionID, `fixora ${run.runId}: no remote "${run.base.remote}" — push and MR will be skipped`)
-    await stageEnd(this.rt, run, "prepare", "ok", `${run.branch} from ${run.base.remote}/${run.base.branch}${run.base.sha ? `@${run.base.sha.slice(0, 8)}` : ""}${run.checkout.stashRef ? " · changes stashed" : ""}`)
-    return "next"
-  }
-
-  private async analyse(): Promise<"next" | "stop"> {
-    const run = this.run
-    await stageBegin(this.rt, run, "analyse")
-    const sessionID = await ensureWorker(this.rt, run, "fixer", { phase: "triage" })
-    const token = await this.expect("triage")
-    const budget = this.opts.worker.maxPhaseMinutes.triage
-    const r = await awaitSubmission(this.rt, run, sessionID, triagePrompt(run), {
-      minutes: budget,
-      signal: this.o.signal,
-      label: "the agent is analysing the crash",
-      pick: (fresh) => (fresh.meta?.received === token && fresh.triage ? fresh : undefined),
-      nudge: nudgePrompt("fixora_submit_triage", run.runId, SKILLS.triage, "the analysis you reached (classification, mappedFrames with existing files, rootCause, confidence, fixStrategy, alternatives)"),
-    })
-    if (!r.value) this.stopFor(r.outcome, "the analysis", budget, "analyse")
-    this.adopt(r.value)
-    const t = run.triage!
-    const sc = t.suspectCommits[0]
-    await this.rt.emit("run.card", { runId: run.runId, sessionID: run.originSessionID, kind: "triage", data: { rootCause: t.rootCause, confidence: t.confidence, category: t.category, risk: t.risk.level, classification: t.classification, introducedBy: sc ? `${sc.sha.slice(0, 10)} ${sc.subject}${t.introducedInRelease ? ` · ${t.introducedInRelease}` : ""}` : undefined, reopened: run.reopened ? (t.reopenReason ?? run.reopened.reason) : undefined } })
-    await present(this.ctx, run.originSessionID, `fixora ${run.runId}: root cause — ${t.classification}, ${Math.round(t.confidence * 100)}%`, renderTriageCard(run, this.crash!))
-    if (t.classification !== "fixable" || t.confidence < this.opts.confidence.minToFix) {
-      const why = t.classification !== "fixable" ? `classified as ${t.classification}` : `confidence ${Math.round(t.confidence * 100)}% is below minToFix ${Math.round(this.opts.confidence.minToFix * 100)}%`
-      run.status = "skipped"
-      run.skipReason = why
-      await stageEnd(this.rt, run, "analyse", "ok", why)
-      if (this.opts.jira.ticketOnSkip && run.flags.ticket) await this.ticket().catch(() => {})
-      throw new FixoraStop(`Fixora stopped after the analysis: ${why}. ${t.classification === "needs_human" ? "A human decision is needed; see analysis.md. " : ""}See analysis.md in ${run.folder}; \`/fixora retry ${run.runId} --from analyse\` runs the analysis again, or lower "confidence.minToFix".`)
-    }
-    await stageEnd(this.rt, run, "analyse", "ok", `${t.category} · confidence ${Math.round(t.confidence * 100)}% · risk ${t.risk.level}`)
-    return "next"
-  }
-
-  private async ticket(): Promise<"next"> {
-    const run = this.run
-    if (run.jiraKey) return "next"
-    await stageBegin(this.rt, run, "ticket")
-    const jira = this.rt.services.jira
-    const available = jiraAvailable(jira, this.opts)
-    const decision = decideApproval("ticket", run, this.opts, { serviceAvailable: available })
-    if (decision.decision === "skip") {
-      run.approvals.ticket = "skipped"
-      const why = !jira || jira.status !== "connected" ? "no connected Jira MCP server" : !this.opts.jira.project ? 'set "jira": { "project": "KEY" } in the plugin options' : decision.reason
-      await stageEnd(this.rt, run, "ticket", "skipped", why)
-      return "next"
-    }
-    const project = this.opts.jira.project!
-    const issue = renderJiraIssue(run, this.crash!)
-    const parent = this.opts.jira.parent
-    const jiraPreview = { project, issueType: this.opts.jira.issueType, summary: issue.summary, parent }
-    await writeFile(join(run.folder, "ticket-preview.md"), `${renderApprovalPreview(run, { kind: "ticket", jira: jiraPreview, crashUrl: this.crashUrl() })}\n\n${issue.description}\n`)
-    if (decision.decision === "ask") {
-      await approve(this.rt, run, "ticket", {
-        resources: [`create Jira ${this.opts.jira.issueType} in ${project}${parent ? ` under ${parent}` : ""}: ${issue.summary}`, `labels: ${[...this.opts.jira.labels, "fixora"].join(", ")}`],
-        summary: `create a Jira ${this.opts.jira.issueType} in ${project}${parent ? ` under ${parent}` : ""}`,
-        previewPath: join(run.folder, "ticket-preview.md"),
-        preview: { jira: jiraPreview, rootCause: run.triage?.rootCause, confidence: run.triage?.confidence, risk: run.triage?.risk.level, crashUrl: this.crashUrl(), previewPath: join(run.folder, "ticket-preview.md") },
-      })
-    } else run.approvals.ticket = "auto"
-    const createTool = jira!.capabilities.createIssue!
-    const prompt = ticketPrompt(run, {
-      namespace: jira!.namespace,
-      searchTool: jira!.capabilities.search!,
-      searchInput: jiraSearchInput(dedupeJql(project, run.fingerprint), 5),
-      createTool,
-      createInput: jiraCreateInput({ project, issueType: this.opts.jira.issueType, summary: issue.summary, description: issue.description, labels: [...new Set([...this.opts.jira.labels, "fixora"])], parent }, { additionalFieldsType: schemaParamType({ properties: toolProps(this.rt, createTool) }, "additional_fields") }),
-      commentTool: jira!.capabilities.addComment,
-      reopenComment: run.reopened && jira!.capabilities.addComment ? jiraCommentInput("<key>", renderJiraComment("reopened", run, { reason: run.reopened.reason })) : undefined,
-      browseBase: jiraBaseUrl(jira),
-    })
-    const sessionID = await ensureWorker(this.rt, run, "fixer", { phase: "ticket", grants: { jiraWrite: true } })
-    const token = await this.expect("ticket")
-    const budget = this.opts.worker.maxPhaseMinutes.crash
-    const r = await awaitSubmission(this.rt, run, sessionID, prompt, {
-      minutes: budget,
-      signal: this.o.signal,
-      label: "the agent is creating the Jira ticket",
-      pick: (fresh) => (fresh.meta?.received === token ? fresh : undefined),
-      nudge: nudgePrompt("fixora_submit_ticket", run.runId, SKILLS.ops, 'action "created" / "reused" with the key, or "failed" with the error'),
-    })
-    if (!r.value) this.stopFor(r.outcome, "the ticket phase", budget, "ticket")
-    this.adopt(r.value)
-    if (!run.jiraKey) throw new FixoraStop(`The Jira ticket could not be created: ${run.meta?.ticketError ?? "no key reported"}. \`/fixora retry ${run.runId} --from ticket\` or \`--no-ticket\`.`)
-    await this.rt.emit("run.card", { runId: run.runId, sessionID: run.originSessionID, kind: "ticket", data: { jiraKey: run.jiraKey, jiraUrl: run.jiraUrl } })
-    await stageEnd(this.rt, run, "ticket", "ok", `${run.meta?.ticketAction === "reused" ? "reused " : ""}${run.jiraKey}${run.jiraUrl ? ` ${run.jiraUrl}` : ""}`)
-    return "next"
-  }
-
-  private async fix(): Promise<"next" | "stop"> {
-    const run = this.run
-    await stageBegin(this.rt, run, "fix")
-    const feedback = this.o.feedback
-    const sessionID = await ensureWorker(this.rt, run, "fixer", { phase: feedback ? "feedback" : "fix" })
-    const attempt = latestFixAttempt(run)
-    const checks = run.toolchain?.checks ?? []
-    const prompt = feedback ? feedbackPrompt(run, { attempt, message: feedback, checks }) : fixPrompt(run, this.opts, { attempt, checks, testsScope: typeof run.meta?.tests === "string" ? run.meta.tests : undefined })
-    const budget = this.opts.worker.maxPhaseMinutes.fix
-    const r = await awaitSubmission(this.rt, run, sessionID, prompt, {
-      minutes: budget,
-      signal: this.o.signal,
-      label: feedback ? `the agent is handling your feedback (attempt ${attempt})` : `the agent is fixing (attempt ${attempt})`,
-      pick: (fresh) => (fresh.fix?.attempt === attempt ? fresh : undefined),
-      nudge: nudgePrompt("fixora_submit_fix", run.runId, SKILLS.fix, `attempt ${attempt}, with \`status\` and \`diff\` from git`),
-    })
-    if (!r.value) {
-      if (feedback && r.outcome === "done") {
-        const answer = await lastAssistantText(this.rt, sessionID)
-        run.status = "done"
-        await stageEnd(this.rt, run, "fix", "ok", "answered")
-        await present(this.ctx, run.originSessionID, `fixora ${run.runId}: answer`, answer || "The worker finished without changes and without a report.")
-        return "stop"
+    if (!run.checkout.active || !run.branch) throw new FixoraStop(`The prepare stage did not end with a checked-out branch.${this.lastRejection()} See the worker session, then \`/fixora retry ${run.runId} --from prepare\`.`)
+    if (!run.base.remoteUrl && stages.includes("prepare")) await notify(this.ctx, run.originSessionID, `fixora ${run.runId}: no remote "${run.base.remote}" — push and MR will be skipped`)
+    if (stages.includes("triage")) {
+      if (!run.triage) {
+        if (outcome !== "done") this.stopFor(outcome, "the analysis", budget, "analyse")
+        throw new FixoraStop(`The worker did not produce a valid triage.${this.lastRejection()} See the worker session, then \`/fixora retry ${run.runId} --from analyse\`.`)
       }
-      this.stopFor(r.outcome, "the fix phase", budget, feedback ? "fix" : "fix")
-    }
-    this.adopt(r.value)
-    if (!run.fix!.changesMade) {
-      if (feedback) {
-        const answer = await lastAssistantText(this.rt, sessionID)
-        run.status = "done"
-        await stageEnd(this.rt, run, "fix", "ok", "answered without changes")
-        await present(this.ctx, run.originSessionID, `fixora ${run.runId}: answer`, answer || run.fix!.rationale)
-        return "stop"
+      const t = run.triage
+      const sc = t.suspectCommits[0]
+      await this.rt.emit("run.card", { runId: run.runId, sessionID: run.originSessionID, kind: "triage", data: { rootCause: t.rootCause, confidence: t.confidence, category: t.category, risk: t.risk.level, classification: t.classification, introducedBy: sc ? `${sc.sha.slice(0, 10)} ${sc.subject}${t.introducedInRelease ? ` · ${t.introducedInRelease}` : ""}` : undefined, reopened: run.reopened ? (t.reopenReason ?? run.reopened.reason) : undefined } })
+      await present(this.ctx, run.originSessionID, `fixora ${run.runId}: root cause — ${t.classification}, ${Math.round(t.confidence * 100)}%`, renderTriageCard(run, this.crash!))
+      if (t.classification !== "fixable" || t.confidence < this.opts.confidence.minToFix) {
+        const why = t.classification !== "fixable" ? `classified as ${t.classification}` : `confidence ${Math.round(t.confidence * 100)}% is below minToFix ${Math.round(this.opts.confidence.minToFix * 100)}%`
+        run.status = "skipped"
+        run.skipReason = why
+        if (this.opts.jira.ticketOnSkip && run.flags.ticket) await this.ticketOnSkip().catch(() => {})
+        throw new FixoraStop(`Fixora stopped after the analysis: ${why}. ${t.classification === "needs_human" ? "A human decision is needed; see analysis.md. " : ""}See analysis.md in ${run.folder}; \`/fixora retry ${run.runId} --from analyse\` runs the analysis again, or lower "confidence.minToFix".`)
       }
-      throw new FixoraStop(`The worker made no changes: ${run.fix!.unresolved.join("; ") || run.fix!.summary}. See the worker session, then \`/fixora retry ${run.runId} --from fix\`.`)
     }
-    if (feedback) {
-      // A new change set: validate, review, commit and push again (the MR, when any, is updated).
-      run.pipeline.validated = false
-      run.pipeline.reviewed = false
-      run.pipeline.committed = false
-      run.pipeline.pushed = false
-      run.tests = undefined
+    if (stages.includes("fix")) {
+      if (!run.fix || run.fix.attempt !== attempt) {
+        if (this.o.feedback && outcome === "done") return this.answerOnly(sessionID)
+        if (outcome !== "done") this.stopFor(outcome, "the fix stage", budget, "fix")
+        throw new FixoraStop(`The worker did not produce a valid fix report.${this.lastRejection()} \`/fixora retry ${run.runId} --from fix\` to try again.`)
+      }
+      if (!run.fix.changesMade) {
+        if (this.o.feedback) return this.answerOnly(sessionID)
+        throw new FixoraStop(`The worker made no changes: ${run.fix.unresolved.join("; ") || run.fix.summary}. See the worker session, then \`/fixora retry ${run.runId} --from fix\`.`)
+      }
+      if (this.o.feedback) {
+        run.pipeline.validated = false
+        run.pipeline.reviewed = false
+        run.pipeline.committed = false
+        run.pipeline.pushed = false
+      }
     }
-    await stageEnd(this.rt, run, "fix", "ok", `${run.fix!.filesChanged.length} file(s): ${run.fix!.summary}`)
+    await saveRun(this.ctx, run)
     return "next"
+  }
+
+  /** `/fixora feedback` that was a question: show the answer, nothing to validate or publish. */
+  private async answerOnly(sessionID: string): Promise<"stop"> {
+    const run = this.run
+    const answer = await lastAssistantText(this.rt, sessionID)
+    run.status = "done"
+    if (run.timings.fix?.status === "running") await stageEnd(this.rt, run, "fix", "ok", "answered")
+    await present(this.ctx, run.originSessionID, `fixora ${run.runId}: answer`, answer || run.fix?.rationale || "The worker finished without changes and without a report.")
+    return "stop"
   }
 
   private async validate(): Promise<"next" | "loop"> {
@@ -522,12 +441,13 @@ export class Pipeline {
     const sessionID = await ensureWorker(this.rt, run, "fixer", { phase: this.o.feedback ? "feedback" : "fix" })
     const attempt = latestFixAttempt(run)
     const budget = this.opts.worker.maxPhaseMinutes.fix
+    await stageBegin(this.rt, run, "fix")
     const r = await awaitSubmission(this.rt, run, sessionID, fixFollowUpPrompt(run, { attempt, problems: text }), {
       minutes: budget,
       signal: this.o.signal,
       label: `asking the agent to fix the problems (attempt ${attempt})`,
       pick: (fresh) => (fresh.fix?.attempt === attempt ? fresh : undefined),
-      nudge: nudgePrompt("fixora_submit_fix", run.runId, SKILLS.fix, `attempt ${attempt}, with \`status\` and \`diff\` from git`),
+      nudge: nudgePrompt("fixora_submit_fix", run.runId, [SKILLS.fix], `attempt ${attempt}, with \`status\` and \`diff\` from git`),
     })
     if (!r.value) this.stopFor(r.outcome, `fix attempt ${attempt}`, budget, "fix")
     this.adopt(r.value)
@@ -562,12 +482,14 @@ export class Pipeline {
     return "next"
   }
 
-  /** Commit, push and MR by the worker after the approval gate(s). Re-entrant: only missing parts are prompted. */
+  /** The PUBLISH turn: ticket, commit, push, MR, links and restore in one prompt after one approval. */
   private async publish(): Promise<"next" | "stop"> {
     const run = this.run
     await stageBegin(this.rt, run, "publish")
     const target = this.opts.mr.target ?? run.base.branch
-    const mr = renderMr(run, { crash: this.crash, draft: this.opts.mr.draft, base: target })
+    const jira = this.rt.services.jira
+    const ticketWanted = !run.jiraKey && run.flags.ticket && !run.flags.dryRun && jiraAvailable(jira, this.opts)
+    const mr = renderMr(run, { crash: this.crash, draft: this.opts.mr.draft, base: target, jiraPlaceholder: ticketWanted })
     const commitMessageFile = join(run.folder, "commit-message.txt")
     const mrBodyFile = join(run.folder, "mr.md")
     await writeFile(mrBodyFile, `# ${mr.title}\n\n${mr.body}\n`)
@@ -579,48 +501,63 @@ export class Pipeline {
       return "stop"
     }
     const files = run.fix?.filesChanged ?? run.change?.paths ?? []
-    const needCommit = !run.pipeline.committed
-    const gates = gateKinds(this.opts)
-    const pushDecision = decideApproval(gates.push, run, this.opts, { serviceAvailable: !!run.base.remoteUrl })
-    const needPush = pushDecision.decision !== "skip" && !run.pipeline.pushed
-    const wantMr = run.flags.mr && !!this.remote && !run.mrUrl && pushDecision.decision !== "skip"
+    const decision = decideApproval("publish", run, this.opts, { serviceAvailable: !!run.base.remoteUrl })
+    const wantPush = decision.decision !== "skip" && !run.pipeline.pushed
+    const wantMr = decision.decision !== "skip" && run.flags.mr && !!this.remote && !run.mrUrl
     const order = this.remote ? mrProviderOrder(this.rt.services, this.remote, { forge: this.opts.mr.forge }) : []
     const provider: MrProvider = order[0] ?? "url"
     const mrTarget = this.remote ? { remote: this.remote, base: target, branch: run.branch! } : undefined
-    const preview = renderApprovalPreview(run, { kind: gates.push, branch: run.branch, remote: this.remote?.web ?? run.base.remoteUrl ?? undefined, target, mr: gates.push === "publish" && wantMr ? { ...mr, provider } : undefined, crashUrl: this.crashUrl() })
+    const preview = renderApprovalPreview(run, { kind: "publish", branch: run.branch, remote: this.remote?.web ?? run.base.remoteUrl ?? undefined, target, mr: wantMr ? { ...mr, provider } : undefined, crashUrl: this.crashUrl(), ticket: ticketWanted ? { project: this.opts.jira.project, issueType: this.opts.jira.issueType, parent: this.opts.jira.parent } : undefined })
     await writeFile(join(run.folder, "publish-preview.md"), `${preview}\n`)
-
-    const grants: WorkerGrants = { commit: needCommit }
-    if (pushDecision.decision === "skip") {
-      run.approvals[gates.push] = "skipped"
-      this.notes.push(`Push skipped (${pushDecision.reason}). The fix is committed on \`${run.branch}\`.`)
-    } else if (needPush || wantMr) {
-      if (pushDecision.decision === "ask") {
-        const resources = [
-          `push branch ${run.branch} to ${run.base.remote} (${this.remote?.web ?? run.base.remoteUrl})`,
-          `${files.length} file(s)${run.change ? `, +${run.change.added} −${run.change.deleted}` : ""}`,
-          run.tests ? `checks: ${summarizeChecks(run.tests)}` : "checks: none",
-          `review: ${run.reviews[run.reviews.length - 1]?.verdict ?? "none"} · confidence ${Math.round((run.triage?.confidence ?? 0) * 100)}%`,
-        ]
-        if (gates.push === "publish" && wantMr) resources.push(`open ${this.opts.mr.draft ? "draft " : ""}MR via ${provider} → ${target}: ${mr.title}`)
-        await approve(this.rt, run, gates.push, {
-          resources,
-          summary: gates.push === "publish" ? `push ${run.branch} and open a ${this.opts.mr.draft ? "draft " : ""}MR` : `push ${run.branch}`,
-          previewPath: join(run.folder, "publish-preview.md"),
-          preview: this.gatePreview({ mrTitle: gates.push === "publish" && wantMr ? mr.title : undefined, mrBody: gates.push === "publish" && wantMr ? mr.body : undefined, target, provider }),
-        })
-      } else {
-        run.approvals[gates.push] = "auto"
-        await notify(this.ctx, run.originSessionID, `fixora ${run.runId}: auto-approved (${pushDecision.reason})`)
-      }
-      grants.push = needPush
-      if (gates.push === "publish") grants.mr = wantMr
+    if (decision.decision === "skip") {
+      run.approvals.publish = "skipped"
+      this.notes.push(`Push skipped (${decision.reason}). The fix is committed on \`${run.branch}\`.`)
+    } else if (decision.decision === "ask") {
+      const resources = [
+        ...(ticketWanted ? [`create Jira ${this.opts.jira.issueType} in ${this.opts.jira.project}${this.opts.jira.parent ? ` under ${this.opts.jira.parent}` : ""}`] : []),
+        `push branch ${run.branch} to ${run.base.remote} (${this.remote?.web ?? run.base.remoteUrl})`,
+        `${files.length} file(s)${run.change ? `, +${run.change.added} −${run.change.deleted}` : ""}`,
+        run.tests ? `checks: ${summarizeChecks(run.tests)}` : "checks: none",
+        `review: ${run.reviews[run.reviews.length - 1]?.verdict ?? "none"} · confidence ${Math.round((run.triage?.confidence ?? 0) * 100)}%`,
+        ...(wantMr ? [`open ${this.opts.mr.draft ? "draft " : ""}MR via ${provider} → ${target}: ${mr.title}`] : []),
+      ]
+      await approve(this.rt, run, "publish", {
+        resources,
+        summary: `${ticketWanted ? "create the Jira ticket, " : ""}push ${run.branch}${wantMr ? ` and open a ${this.opts.mr.draft ? "draft " : ""}MR` : ""}`,
+        previewPath: join(run.folder, "publish-preview.md"),
+        preview: this.gatePreview({ mrTitle: wantMr ? mr.title : undefined, mrBody: wantMr ? mr.body : undefined, target, provider, ticket: ticketWanted }),
+      })
+    } else {
+      run.approvals.publish = "auto"
+      await notify(this.ctx, run.originSessionID, `fixora ${run.runId}: auto-approved (${decision.reason})`)
     }
-    // With approvals: "each", the MR has its own gate after the push.
-    const plan = (g: WorkerGrants): PublishPlan => ({
-      commit: !!g.commit,
-      push: !!g.push,
-      mr: !!g.mr,
+    if (ticketWanted) run.approvals.ticket = run.approvals.publish ?? "approved"
+    // Everything the turn may do, with the matching grants.
+    const grants: WorkerGrants = { commit: !run.pipeline.committed, push: wantPush, mr: wantMr, jiraWrite: ticketWanted || (!!run.jiraKey && connected(jira) && !!jira.capabilities.addComment), sourceWrite: this.opts.sourceWriteBack && run.source !== "manual" }
+    const ticket = ticketWanted ? await this.ticketPlan() : undefined
+    const closeLoop: OpStep[] = []
+    if ((ticketWanted || run.jiraKey) && connected(jira) && jira.capabilities.addComment && (wantMr || run.mrUrl || this.o.feedback)) {
+      const key = run.jiraKey ?? "<key>"
+      closeLoop.push({ call: { toolId: jira.capabilities.addComment, namespace: jira.namespace, input: jiraCommentInput(key, renderJiraComment(this.o.feedback ? "feedback" : "mr", run, { mrUrl: run.mrUrl ?? "<mrUrl>", message: this.o.feedback })) } })
+      if (this.opts.jira.transitionOnMr && !this.o.feedback && jira.capabilities.getTransitions && jira.capabilities.transition) {
+        closeLoop.push({ call: { toolId: jira.capabilities.getTransitions, namespace: jira.namespace, input: jiraTransitionsInput(key) }, note: `then pick the transition whose name matches "${this.opts.jira.transitionOnMr}" (case and punctuation insensitive) and apply it with \`${jira.capabilities.transition}\` { issue_key: "${key}", transition_id: "<id>" }; skip when no transition matches and say so in results.transition` })
+      }
+    }
+    if (grants.sourceWrite) {
+      const call = sourceById(run.source).annotatePlan?.(sourceContext(this.rt), run.crashId, { text: `Fixora opened <mrUrl>${ticketWanted || run.jiraKey ? " (Jira <key>)" : ""}. Root cause: ${run.triage?.rootCause.slice(0, 300) ?? ""}`, mrUrl: run.mrUrl, jiraKey: run.jiraKey }, this.extra)
+      if (call) closeLoop.push({ call })
+    }
+    // An MR from an earlier round (feedback) gets its body refreshed instead of a new one.
+    const update = run.mrUrl && run.mrProvider && run.mrProvider !== "url" && mrTarget && this.o.feedback ? renderMrOp({ provider: run.mrProvider as MrProvider, op: "update", target: mrTarget, id: run.mrId, url: run.mrUrl, title: mr.title, bodyFile: mrBodyFile, services: this.rt.services, toolProps: (id) => toolProps(this.rt, id) }) : undefined
+    if (update) {
+      grants.mr = true
+      closeLoop.unshift(update.toolId ? { call: { toolId: update.toolId, namespace: update.namespace, input: update.input ?? {} }, note: `update the existing merge request ${run.mrUrl} with the new body (send the contents of ${mrBodyFile} as the description/body)` } : { command: update.command, note: `update the existing merge request ${run.mrUrl}` })
+    }
+    const plan: PublishPlan = {
+      ticket,
+      commit: !run.pipeline.committed,
+      push: wantPush,
+      mr: wantMr,
       files,
       commitMessageFile,
       mrBodyFile,
@@ -628,21 +565,30 @@ export class Pipeline {
       remote: run.base.remote,
       branch: run.branch!,
       target,
-      attempts: g.mr && mrTarget ? renderMrAttempts({ order, target: mrTarget, mr: { ...mr, draft: this.opts.mr.draft, labels: this.opts.mr.labels, reviewers: this.opts.mr.reviewers }, services: this.rt.services, toolProps: (id) => toolProps(this.rt, id), bodyFile: mrBodyFile }) : [],
+      attempts: wantMr && mrTarget ? renderMrAttempts({ order, target: mrTarget, mr: { ...mr, draft: this.opts.mr.draft, labels: this.opts.mr.labels, reviewers: this.opts.mr.reviewers }, services: this.rt.services, toolProps: (id) => toolProps(this.rt, id), bodyFile: mrBodyFile }) : [],
+      closeLoop,
+      restore: restorePlan(run),
       committedSha: run.commitShas[run.commitShas.length - 1],
       pushedAlready: run.pipeline.pushed,
+    }
+    const sessionID = await ensureWorker(this.rt, run, "fixer", { phase: "publish", grants })
+    const token = await this.expect("publish")
+    const budget = this.opts.worker.maxPhaseMinutes.publish + this.opts.worker.maxPhaseMinutes.restore
+    const r = await awaitSubmission(this.rt, run, sessionID, publishPrompt(run, plan), {
+      minutes: budget,
+      signal: this.o.signal,
+      label: `the agent is publishing (${[ticketWanted && "ticket", grants.commit && "commit", wantPush && "push", wantMr && "MR", closeLoop.length && "links", "restore"].filter(Boolean).join(" + ")})`,
+      pick: (fresh) => (fresh.meta?.received === token ? fresh : undefined),
+      nudge: nudgePrompt("fixora_submit_publish (then the links and restore steps)", run.runId, [SKILLS.publish], "what succeeded so far (committed / pushed / mr) and the errors"),
     })
-    if (grants.commit || grants.push || grants.mr) await this.publishWith(grants, plan(grants))
-    if (gates.mr && wantMr && !run.mrUrl && run.pipeline.pushed) {
-      await approve(this.rt, run, "mr", { resources: [`open ${this.opts.mr.draft ? "draft " : ""}MR via ${provider} → ${target}: ${mr.title}`], summary: `open a merge request via ${provider}`, previewPath: mrBodyFile, preview: this.gatePreview({ mrTitle: mr.title, mrBody: mr.body, target, provider }) })
-      await this.publishWith({ mr: true }, plan({ mr: true }))
+    if (!r.value) this.stopFor(r.outcome, "the publish turn", budget, "publish")
+    this.adopt(r.value)
+    if (ticketWanted) {
+      if (run.jiraKey) await this.rt.emit("run.card", { runId: run.runId, sessionID: run.originSessionID, kind: "ticket", data: { jiraKey: run.jiraKey, jiraUrl: run.jiraUrl } })
+      else this.notes.push(`No Jira ticket was created: ${run.meta?.ticketError ?? "the agent did not report one"}.`)
     }
-    // An existing MR (feedback round) gets its body refreshed by the worker.
-    if (run.mrUrl && run.mrProvider && run.mrProvider !== "url" && mrTarget && this.o.feedback && run.pipeline.pushed) {
-      const op = renderMrOp({ provider: run.mrProvider as MrProvider, op: "update", target: mrTarget, id: run.mrId, url: run.mrUrl, title: mr.title, bodyFile: mrBodyFile, services: this.rt.services, toolProps: (id) => toolProps(this.rt, id) })
-      if (op) await this.runOp({ phase: "publish", grants: { mr: true }, op: "close-mr", title: `update the merge request ${run.mrUrl} with the new body`, steps: [op.toolId ? { call: { toolId: op.toolId, namespace: op.namespace, input: op.input ?? {} }, note: `send the contents of ${mrBodyFile} as the description/body` } : { command: op.command }], report: "{ updated: true }", minutes: this.opts.worker.maxPhaseMinutes.publish, fatal: false })
-    }
-    if (pushDecision.decision === "skip") {
+    if (grants.commit && !run.pipeline.committed) throw new FixoraStop(`The fix was not committed: ${run.meta?.publishErrors ?? "no commit reported"}. \`/fixora retry ${run.runId} --from publish\`.`)
+    if (decision.decision === "skip") {
       run.status = "done"
       await stageEnd(this.rt, run, "publish", "ok", `committed ${run.commitShas[run.commitShas.length - 1]?.slice(0, 10) ?? ""} (push skipped)`)
       return "stop"
@@ -653,64 +599,121 @@ export class Pipeline {
       run.meta = { ...run.meta, compareUrl: compare ?? null }
       this.notes.push(`No merge request was opened (${run.meta?.mrSkippedReason ?? run.meta?.publishErrors ?? "no provider worked"})${compare ? `; open it at ${compare}` : ""}.`)
     } else if (!run.flags.mr && this.remote) run.meta = { ...run.meta, compareUrl: compareUrl(this.remote, target, run.branch!) }
-    await stageEnd(this.rt, run, "publish", "ok", `${run.commitShas[run.commitShas.length - 1]?.slice(0, 10) ?? ""} → ${run.base.remote}/${run.branch}${run.mrUrl ? ` · ${run.mrUrl}` : ""}`)
-    return "next"
-  }
-
-  private async publishWith(grants: WorkerGrants, plan: PublishPlan) {
-    const run = this.run
-    const sessionID = await ensureWorker(this.rt, run, "fixer", { phase: "publish", grants })
-    const token = await this.expect("publish")
-    const budget = this.opts.worker.maxPhaseMinutes.publish
-    const r = await awaitSubmission(this.rt, run, sessionID, publishPrompt(run, plan), {
-      minutes: budget,
-      signal: this.o.signal,
-      label: `the agent is publishing (${[grants.commit && "commit", grants.push && "push", grants.mr && "MR"].filter(Boolean).join(" + ")})`,
-      pick: (fresh) => (fresh.meta?.received === token ? fresh : undefined),
-      nudge: nudgePrompt("fixora_submit_publish", run.runId, SKILLS.publish, "what succeeded so far (committed / pushed / mr) and the errors"),
-    })
-    if (!r.value) this.stopFor(r.outcome, "the publish phase", budget, "publish")
-    this.adopt(r.value)
-    if (grants.commit && !run.pipeline.committed) throw new FixoraStop(`The fix was not committed: ${run.meta?.publishErrors ?? "no commit reported"}. \`/fixora retry ${run.runId} --from publish\`.`)
-  }
-
-  private async closeLoop(): Promise<"next"> {
-    const run = this.run
-    await stageBegin(this.rt, run, "close-loop")
-    const jira = this.rt.services.jira
-    const steps: Array<{ call?: { toolId: string; namespace?: string; input: Record<string, unknown>; note?: string }; note?: string }> = []
-    const grants: WorkerGrants = {}
-    if (run.jiraKey && connected(jira) && jira.capabilities.addComment) {
-      grants.jiraWrite = true
-      const kind = this.o.feedback ? "feedback" : "mr"
-      if (run.mrUrl || this.o.feedback) steps.push({ call: { toolId: jira.capabilities.addComment, namespace: jira.namespace, input: jiraCommentInput(run.jiraKey, renderJiraComment(kind, run, { mrUrl: run.mrUrl, message: this.o.feedback })) } })
-      if (this.opts.jira.transitionOnMr && run.mrUrl && !this.o.feedback && jira.capabilities.getTransitions && jira.capabilities.transition) {
-        steps.push({ call: { toolId: jira.capabilities.getTransitions, namespace: jira.namespace, input: jiraTransitionsInput(run.jiraKey) }, note: `then pick the transition whose name matches "${this.opts.jira.transitionOnMr}" (case and punctuation insensitive) and apply it with \`${jira.capabilities.transition}\` { issue_key: "${run.jiraKey}", transition_id: "<id>" }; skip when no transition matches and say so in results.transition` })
+    await stageEnd(this.rt, run, "publish", "ok", `${run.commitShas[run.commitShas.length - 1]?.slice(0, 10) ?? ""} → ${run.base.remote}/${run.branch}${run.mrUrl ? ` · ${run.mrUrl}` : ""}${run.jiraKey ? ` · ${run.jiraKey}` : ""}`)
+    if (closeLoop.length) {
+      let r2: { ok?: boolean; errors?: string[] } = {}
+      try {
+        r2 = JSON.parse(String(run.meta?.closeLoopResult ?? "{}")) as { ok?: boolean; errors?: string[] }
+      } catch {
+        // no report
       }
-    }
-    if (this.opts.sourceWriteBack && run.source !== "manual") {
-      const call = sourceById(run.source).annotatePlan?.(sourceContext(this.rt), run.crashId, { text: `Fixora opened ${run.mrUrl ?? `branch ${run.branch}`}${run.jiraKey ? ` (Jira ${run.jiraKey})` : ""}. Root cause: ${run.triage?.rootCause.slice(0, 300) ?? ""}`, mrUrl: run.mrUrl, jiraKey: run.jiraKey }, this.extra)
-      if (call) {
-        grants.sourceWrite = true
-        steps.push({ call })
-      }
-    }
-    if (steps.length === 0) {
       run.pipeline.loopClosed = true
-      await stageEnd(this.rt, run, "close-loop", "ok", "nothing to link")
-      return "next"
+      await stageBegin(this.rt, run, "close-loop")
+      await stageEnd(this.rt, run, "close-loop", r2.ok === false ? "failed" : "ok", r2.ok === false ? `partly: ${(r2.errors ?? []).join("; ")}` : run.jiraKey ? `Jira ${run.jiraKey} updated` : "linked")
     }
-    const result = await this.runOp({ phase: "close-loop", grants, op: "close-loop", title: `link the result on ${[run.jiraKey && `Jira ${run.jiraKey}`, this.opts.sourceWriteBack && run.source].filter(Boolean).join(" and ")}`, steps, report: "{ comment: true/false, transition: \"<name or none>\", note: true/false }", minutes: this.opts.worker.maxPhaseMinutes.crash, fatal: false })
-    run.pipeline.loopClosed = true
-    await stageEnd(this.rt, run, "close-loop", "ok", result?.ok === false ? `partly: ${result.errors.join("; ")}` : run.jiraKey ? `Jira ${run.jiraKey} updated` : "source annotated")
     return "next"
   }
 
-  /** Always runs in `finally`: the worker checks the previous branch out again and pops the stash. */
+  /** The exact Jira calls for this crash's ticket (search for a duplicate, then create); writes ticket-preview.md. */
+  private async ticketPlan(): Promise<TicketPlan> {
+    const run = this.run
+    const jira = this.rt.services.jira!
+    if (!this.crash) throw new Error(`cannot plan the Jira ticket before the crash was fetched (run ${run.runId})`)
+    const issue = renderJiraIssue(run, this.crash)
+    await writeFile(join(run.folder, "ticket-preview.md"), `${issue.description}\n`)
+    const createTool = jira.capabilities.createIssue!
+    return {
+      namespace: jira.namespace,
+      searchTool: jira.capabilities.search!,
+      searchInput: jiraSearchInput(dedupeJql(this.opts.jira.project, run.fingerprint), 5),
+      createTool,
+      createInput: jiraCreateInput({ project: this.opts.jira.project!, issueType: this.opts.jira.issueType, summary: issue.summary, description: issue.description, labels: [...new Set([...this.opts.jira.labels, "fixora"])], parent: this.opts.jira.parent }, { additionalFieldsType: schemaParamType({ properties: toolProps(this.rt, createTool) }, "additional_fields") }),
+      commentTool: jira.capabilities.addComment,
+      reopenComment: run.reopened && jira.capabilities.addComment ? jiraCommentInput("<key>", renderJiraComment("reopened", run, { reason: run.reopened.reason })) : undefined,
+      browseBase: jiraBaseUrl(jira),
+    }
+  }
+
+  /**
+   * The branch name for the work turn. With `branchNaming.template` the plugin renders the exact
+   * name; a `{ticket}` placeholder means the Jira ticket is created first (after the ticket
+   * approval, unless auto), so the branch carries its key. Without a template the agent infers a
+   * name from the repository and the default name is the fallback.
+   */
+  private async planBranch(preparing: boolean): Promise<{ branch: string; exact: boolean; ticket?: TicketPlan; ticketFallback?: string }> {
+    const run = this.run
+    const template = this.opts.branchNaming.template
+    if (run.branch) return { branch: run.branch, exact: false }
+    if (!template || !preparing) return { branch: branchName(this.opts.branchPrefix, run.runId, run.title, run.counters.restarts), exact: false }
+    const ticketFallback = slug(run.crashId, 12)
+    const ticket = template.includes("{ticket}") && !run.jiraKey ? await this.ticketBeforeBranch() : undefined
+    const key = run.jiraKey ?? (ticket ? "<key>" : ticketFallback)
+    const branch = branchFromTemplate(this.opts.branchPrefix, template, { type: this.opts.branchNaming.type, ticket: key, slug: slug(run.title, 32), runId: run.runId, crashId: run.crashId }, run.counters.restarts)
+    run.meta = { ...run.meta, plannedBranch: branch, ticketFallback }
+    await saveRun(this.ctx, run)
+    return { branch, exact: true, ticket, ticketFallback }
+  }
+
+  /** `branchNaming.template` has `{ticket}` and a ticket can still be created for this run. */
+  private ticketBeforeBranchWanted(): boolean {
+    const run = this.run
+    const template = this.opts.branchNaming.template
+    if (!template?.includes("{ticket}") || run.jiraKey || run.branch) return false
+    return decideApproval("ticket", run, this.opts, { serviceAvailable: jiraAvailable(this.rt.services.jira, this.opts) }).decision !== "skip"
+  }
+
+  /** The ticket approval for a branch name that needs the key; declined → no ticket this run, the crash id is used instead. */
+  private async ticketBeforeBranch(): Promise<TicketPlan | undefined> {
+    const run = this.run
+    const jira = this.rt.services.jira
+    const available = jiraAvailable(jira, this.opts)
+    const decision = decideApproval("ticket", run, this.opts, { serviceAvailable: available })
+    if (decision.decision === "skip") {
+      if (run.flags.ticket && !run.flags.dryRun) this.notes.push(`Branch named with the crash id: ${decision.reason}.`)
+      return undefined
+    }
+    if (!this.crash) {
+      this.notes.push("Branch named with the crash id: the crash was not fetched before the branch was needed.")
+      return undefined
+    }
+    const plan = await this.ticketPlan()
+    if (decision.decision === "ask") {
+      try {
+        await approve(this.rt, run, "ticket", {
+          resources: [`create Jira ${this.opts.jira.issueType} in ${this.opts.jira.project}: ${run.title}`, `name the branch ${this.opts.branchPrefix}${this.opts.branchNaming.template} with its key`],
+          summary: `create the Jira ticket first (the branch name needs its key)`,
+          previewPath: join(run.folder, "ticket-preview.md"),
+          preview: { jira: { project: this.opts.jira.project, issueType: this.opts.jira.issueType, summary: run.title }, previewPath: join(run.folder, "ticket-preview.md") },
+        })
+      } catch (error) {
+        if (!(error instanceof ApprovalRejected)) throw error
+        run.flags = { ...run.flags, ticket: false }
+        run.approvals.ticket = "rejected"
+        run.status = "running"
+        this.notes.push("Jira ticket declined; the branch is named with the crash id.")
+        return undefined
+      }
+    } else run.approvals.ticket = "auto"
+    run.status = "running"
+    return plan
+  }
+
+  /** `jira.ticketOnSkip`: a ticket for a crash the analysis classified as not fixable. */
+  private async ticketOnSkip() {
+    const run = this.run
+    const jira = this.rt.services.jira
+    if (!jiraAvailable(jira, this.opts) || run.jiraKey) return
+    const ticket = await this.ticketPlan()
+    const issue = { summary: `[Crash] ${run.title}` }
+    const decision = decideApproval("ticket", run, this.opts, { serviceAvailable: true })
+    if (decision.decision === "ask") await approve(this.rt, run, "ticket", { resources: [`create Jira ${this.opts.jira.issueType} in ${this.opts.jira.project}: ${issue.summary}`], summary: `create a Jira ${this.opts.jira.issueType} for the skipped crash`, previewPath: join(run.folder, "ticket-preview.md"), preview: { jira: { project: this.opts.jira.project, issueType: this.opts.jira.issueType, summary: issue.summary }, previewPath: join(run.folder, "ticket-preview.md") } })
+    await this.runOp({ phase: "ticket", grants: { jiraWrite: true }, op: "jira-comment", title: "create the Jira ticket for this crash (the analysis found nothing to fix here)", steps: [{ call: { toolId: ticket.searchTool, namespace: ticket.namespace, input: ticket.searchInput }, note: "reuse a hit (fixora_submit_ticket action reused), else create it with the next call" }, { call: { toolId: ticket.createTool, namespace: ticket.namespace, input: ticket.createInput }, note: 'then fixora_submit_ticket with action "created", key and url, and finally fixora_submit_ops' }], report: "{ key }", minutes: this.opts.worker.maxPhaseMinutes.crash, fatal: false })
+  }
+
+  /** Runs in `finally` for every path that did not restore inside the publish turn. */
   private async restore() {
     const run = this.run
     if (!run.checkout?.active) return
-    // The run's outcome is already decided; the restore stage must not reset it to "running".
     const outcome = { status: run.status, error: run.error, step: run.step }
     await stageBegin(this.rt, run, "restore")
     run.status = outcome.status
@@ -728,8 +731,8 @@ export class Pipeline {
     this.notes.push(`⚠ Your checkout is still on \`${run.branch}\`${run.checkout.stashRef ? " and your changes are stashed" : ""}. Restore by hand:\n\`\`\`\n${manualRestoreText(run)}\n\`\`\``)
   }
 
-  /** One ops prompt in the fixer session: close-loop / restore / MR update. Never throws when `fatal` is false. */
-  private async runOp(o: { phase: "close-loop" | "restore" | "publish" | "clean"; grants?: WorkerGrants; op: string; title: string; steps: Array<{ call?: { toolId: string; namespace?: string; input: Record<string, unknown>; note?: string }; command?: string; note?: string }>; report: string; minutes: number; fatal: boolean; signal?: AbortSignal | undefined }): Promise<{ ok: boolean; errors: string[]; results: Record<string, unknown> } | undefined> {
+  /** One ops prompt in the fixer session (restore on failure paths, ticket on skip). Never throws when `fatal` is false. */
+  private async runOp(o: { phase: "restore" | "ticket" | "clean"; grants?: WorkerGrants; op: string; title: string; steps: OpStep[]; report: string; minutes: number; fatal: boolean; signal?: AbortSignal | undefined }): Promise<{ ok: boolean; errors: string[]; results: Record<string, unknown> } | undefined> {
     const run = this.run
     const sessionID = await ensureWorker(this.rt, run, "fixer", { phase: o.phase, grants: o.grants })
     const token = await this.expect(o.op)
@@ -739,7 +742,7 @@ export class Pipeline {
       signal: "signal" in o ? o.signal : this.o.signal,
       label: o.title,
       pick: (fresh) => (fresh.meta?.received === token ? fresh : undefined),
-      nudge: nudgePrompt("fixora_submit_ops", run.runId, SKILLS.ops, `op "${o.op}", ok true/false, results, errors`),
+      nudge: nudgePrompt("fixora_submit_ops", run.runId, [SKILLS.ops], `op "${o.op}", ok true/false, results, errors`),
     })
     if (!r.value) {
       if (o.fatal) this.stopFor(r.outcome, o.title, o.minutes, run.step)
@@ -763,7 +766,7 @@ export class Pipeline {
   }
 
   /** What the TUI approval dialog shows; the markdown preview file stays the source for the permission fallback. */
-  private gatePreview(o: { mrTitle?: string; mrBody?: string; target: string; provider: string }) {
+  private gatePreview(o: { mrTitle?: string; mrBody?: string; target: string; provider: string; ticket: boolean }) {
     const run = this.run
     const review = run.reviews[run.reviews.length - 1]
     return {
@@ -782,6 +785,7 @@ export class Pipeline {
       mrBody: o.mrBody ? o.mrBody.slice(0, 6000) : undefined,
       mrProvider: o.provider,
       jiraKey: run.jiraKey,
+      jira: o.ticket ? { project: this.opts.jira.project, issueType: this.opts.jira.issueType } : undefined,
       crashUrl: this.crashUrl(),
       previewPath: join(run.folder, "publish-preview.md"),
     }
@@ -803,5 +807,5 @@ function blockedHelp(run: RunRecord): string {
   const detail = run.error ? ` (${run.error})` : ""
   if (run.blockedReason === "not-a-repo") return `Fixora needs a git repository: ${run.repo} is not one${detail}. Open the project checkout in DXcoder and run the command again.`
   if (run.blockedReason === "base-missing") return `Base branch "${run.base.branch}" was not found on remote "${run.base.remote}" nor locally${detail}. Set "baseBranch" in the plugin options or pass --base <branch>, check that \`git fetch\` works in a terminal, then \`/fixora retry ${run.runId}\`.`
-  return `The prepare phase was blocked${detail}. \`/fixora retry ${run.runId}\` after fixing the cause.`
+  return `The prepare stage was blocked${detail}. \`/fixora retry ${run.runId}\` after fixing the cause.`
 }

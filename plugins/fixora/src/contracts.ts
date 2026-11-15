@@ -401,6 +401,8 @@ export interface PrepareContext {
   baseBranch: string
   /** A branch the run already created (resumed runs must check that one out). */
   existingBranch?: string
+  /** The name the configured naming convention produced (new runs must use exactly that). */
+  expectedBranch?: string
 }
 
 export interface PrepareSubmission {
@@ -469,6 +471,7 @@ export function validatePrepare(input: unknown, ctx: PrepareContext): Validation
       if (!isValidBranchName(branch)) c.errors.push(`"${branch}" is not a valid branch name`)
       if (isProtectedBranch(branch, ctx.baseBranch)) c.errors.push(`"${branch}" is a protected branch name`)
       if (ctx.existingBranch && branch !== ctx.existingBranch) c.errors.push(`this run already uses branch "${ctx.existingBranch}"; check that one out instead of creating "${branch}"`)
+      else if (ctx.expectedBranch && branch !== ctx.expectedBranch) c.errors.push(`the branch name for this run is "${ctx.expectedBranch}" (configured naming convention); use exactly that name (got "${branch}")`)
     }
     if (dirty && !stashRef) c.errors.push("the checkout is dirty but no stashRef was reported: stop and submit stage \"inspect\" so Fixora can ask the user before anything is stashed")
     const tc = c.obj("toolchain")

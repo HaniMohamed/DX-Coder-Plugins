@@ -2,7 +2,7 @@ import { Plugin, Skill } from "@opencode/plugin"
 import matter from "gray-matter"
 import { readFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
-import { COMMAND, parseCommand, USAGE, type Flags } from "./src/command.js"
+import { COMMAND, parseCommand, SUBCOMMANDS, USAGE, type Flags, type Parsed } from "./src/command.js"
 import { describeError } from "./src/errors.js"
 import { prepareRun, presentList, refreshServices, runClean, runDoctor, runFeedback, runFix, runFixed, runList, runPaste, runReport, runReset, runRestart, runRetry, runStatus, runSync, runTop, startPipeline, warnLegacyOnce } from "./src/flows.js"
 import { ackGate, decideGate } from "./src/gate.js"
@@ -52,12 +52,16 @@ export default Plugin.define({
       return r.value
     }
     const initial = readOptions(ctx.options)
+    const version = await readFile(new URL("./package.json", import.meta.url), "utf8")
+      .then((t) => String((JSON.parse(t) as { version?: string }).version ?? "unknown"))
+      .catch(() => "unknown")
     const rt: Runtime = {
       ctx,
       opts: initial.ok ? initial.value : DEFAULTS,
       services: {},
       emit: async () => {},
       inflight: new Map(),
+      version,
     }
 
     // Bundled worker skills, loaded the same way the Figma and jira-planner plugins load theirs.
@@ -247,13 +251,9 @@ export default Plugin.define({
       }
     })()
 
-    await ctx.command.transform((editor) => {
-      editor.add({
-        name: COMMAND,
-        description: "Fix production crashes: pick a crash from Sentry / Crashlytics (or paste a trace); the coding agent then finds the root cause in this checkout, fixes and tests it on a fixora/ branch, a second agent session reviews it, and after your approval the agent pushes and opens a draft MR (with a Jira ticket when available). Your branch and local changes are restored afterwards.",
-        execute: async (input) => {
-          const sessionID = input.sessionID
-          const parsed = parseCommand(input.prompt.text)
+    /** One dispatcher for `/fixora <verb> …` and every `/fixora:<verb> …` command. */
+    const dispatch = async (sessionID: string, text: string) => {
+          const parsed = parseCommand(text)
           if ("error" in parsed) {
             await notify(ctx, sessionID, `fixora: ${parsed.error.split("\n")[0]}`, parsed.error)
             return
@@ -261,6 +261,17 @@ export default Plugin.define({
           try {
             rt.opts = readOpts()
             await warnLegacyOnce(rt, sessionID)
+            await runVerb(sessionID, parsed)
+          } catch (error) {
+            if (error instanceof FixoraStop) {
+              await tell(ctx, sessionID, `fixora stopped: ${error.message.split("\n")[0]!.slice(0, 140)}`, error.message)
+              return
+            }
+            const message = error instanceof Error ? `${error.name}: ${error.message}` : describeError(error)
+            await tell(ctx, sessionID, `fixora failed: ${message.slice(0, 140)}`, `The command failed:\n\n\`\`\`\n${message}\n\`\`\``)
+          }
+    }
+    const runVerb = async (sessionID: string, parsed: Parsed) => {
             switch (parsed.verb) {
               case "help":
                 await tell(ctx, sessionID, "fixora usage", `\`\`\`\n${USAGE}\n\`\`\``)
@@ -317,16 +328,22 @@ export default Plugin.define({
                 await runDoctor(rt, { sessionID, all: parsed.all, probe: parsed.probe, tool: parsed.tool })
                 break
             }
-          } catch (error) {
-            if (error instanceof FixoraStop) {
-              await tell(ctx, sessionID, `fixora stopped: ${error.message.split("\n")[0]!.slice(0, 140)}`, error.message)
-              return
-            }
-            const message = error instanceof Error ? `${error.name}: ${error.message}` : describeError(error)
-            await tell(ctx, sessionID, `fixora failed: ${message.slice(0, 140)}`, `The command failed:\n\n\`\`\`\n${message}\n\`\`\``)
-          }
-        },
+    }
+
+    await ctx.command.transform((editor) => {
+      editor.add({
+        name: COMMAND,
+        description: "Fix production crashes: pick a crash from Sentry / Crashlytics (or paste a trace); the coding agent then finds the root cause in this checkout, fixes and tests it on a fixora/ branch, a second agent session reviews it, and after your approval the agent pushes and opens a draft MR (with a Jira ticket when available). Your branch and local changes are restored afterwards. Verbs: fix, paste, top, batch, status, retry, feedback, restart, fixed, report, clean, sync, reset, doctor (each also a /fixora:<verb> command).",
+        execute: (input) => dispatch(input.sessionID, input.prompt.text),
       })
+      // Every verb as its own command so the palette lists `/fixora:status`, `/fixora:fix`, …
+      for (const sub of SUBCOMMANDS) {
+        editor.add({
+          name: sub.name,
+          description: `${sub.description}${sub.args ? ` — /${sub.name} ${sub.args}` : ""}`,
+          execute: (input) => dispatch(input.sessionID, `${sub.verb} ${input.prompt.text}`),
+        })
+      }
     })
   },
 })

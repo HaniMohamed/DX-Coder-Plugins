@@ -29,6 +29,8 @@ export interface Runtime {
   lockPollMs?: number
   /** Legacy-option warnings were shown once in this process. */
   warnedLegacy?: boolean
+  /** The plugin version (package.json next to the bundle), shown by detect and doctor so a stale install is visible. */
+  version?: string
 }
 
 export const toolProps = (rt: Runtime, toolId: string): Record<string, unknown> => rt.schemas?.get(toolId)?.props ?? {}

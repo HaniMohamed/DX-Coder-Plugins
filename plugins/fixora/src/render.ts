@@ -138,7 +138,7 @@ const wrap = (text: string, width: number) =>
     }, [])
     .join("\n")
 
-export function renderMr(run: RunRecord, o: { crash?: Crash; draft: boolean; base: string }): { title: string; body: string } {
+export function renderMr(run: RunRecord, o: { crash?: Crash; draft: boolean; base: string; jiraPlaceholder?: boolean }): { title: string; body: string } {
   const t = run.triage
   const f = run.fix
   const review = run.reviews[run.reviews.length - 1]
@@ -151,6 +151,7 @@ export function renderMr(run: RunRecord, o: { crash?: Crash; draft: boolean; bas
   L.push(`- Source: ${run.source}${o.crash?.url ? ` — ${o.crash.url}` : ""}`)
   if (o.crash?.userCount !== undefined || o.crash?.eventCount !== undefined) L.push(`- Impact: ${o.crash?.userCount ?? "?"} users, ${o.crash?.eventCount ?? "?"} events${o.crash?.appVersion ? ` (last seen in ${o.crash.appVersion})` : ""}`)
   if (run.jiraKey) L.push(`- Jira: ${run.jiraUrl ? `[${run.jiraKey}](${run.jiraUrl})` : run.jiraKey}`)
+  else if (o.jiraPlaceholder) L.push("- Jira: {{JIRA}}")
   L.push("", "## Root cause", "")
   if (t) {
     L.push(t.rootCause, "")
@@ -267,7 +268,7 @@ export function renderValidationCard(run: RunRecord): string {
   return L.join("\n")
 }
 
-export function renderApprovalPreview(run: RunRecord, o: { kind: "ticket" | "publish" | "push" | "mr" | "stash" | "delete-branch"; branch?: string; remote?: string; target?: string; mr?: { title: string; body: string; provider: string }; jira?: { project?: string; issueType: string; summary?: string; parent?: string }; stash?: { files: number; status: string }; crashUrl?: string }): string {
+export function renderApprovalPreview(run: RunRecord, o: { kind: "ticket" | "publish" | "push" | "mr" | "stash" | "delete-branch"; branch?: string; remote?: string; target?: string; mr?: { title: string; body: string; provider: string }; jira?: { project?: string; issueType: string; summary?: string; parent?: string }; ticket?: { project?: string; issueType: string; parent?: string }; stash?: { files: number; status: string }; crashUrl?: string }): string {
   const L: string[] = []
   L.push(`# Fixora · ${run.runId} · approval: ${o.kind}`, "")
   L.push(`Crash: ${run.title}${o.crashUrl ? ` — ${o.crashUrl}` : ""}`, "")
@@ -283,6 +284,7 @@ export function renderApprovalPreview(run: RunRecord, o: { kind: "ticket" | "pub
   }
   if (o.kind === "ticket" && o.jira) L.push(`Will create a Jira **${o.jira.issueType}** in project **${o.jira.project ?? "?"}**${o.jira.parent ? ` under **${o.jira.parent}**` : ""}: "${o.jira.summary ?? ""}"`, "")
   if (o.kind !== "ticket") {
+    if (o.ticket) L.push(`Will create a Jira **${o.ticket.issueType}** in project **${o.ticket.project ?? "?"}**${o.ticket.parent ? ` under **${o.ticket.parent}**` : ""} (or reuse one with the same fingerprint).`, "")
     L.push(`Branch: \`${o.branch}\` → ${o.remote}${o.target ? ` (target ${o.target})` : ""}`)
     if (run.fix) L.push(`Files: ${run.fix.filesChanged.map((f) => `\`${f}\``).join(", ")}${run.change ? ` (+${run.change.added} −${run.change.deleted})` : ""}`)
     if (run.commitShas.length) L.push(`Commit: ${run.commitShas[run.commitShas.length - 1]!.slice(0, 10)}`)

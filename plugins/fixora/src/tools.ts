@@ -1,6 +1,7 @@
-// Plugin-registered tools: the structured submissions the worker sessions end their phases with
+// Plugin-registered tools: the structured submissions the worker sessions end their stages with
 // (validated on receipt and persisted) and `fixora_start` for the interactive picker in the origin
-// session. The tools are the only channel from the agent back to the plugin.
+// session. The tools are the only channel from the agent back to the plugin, and their replies steer
+// the agent: CONTINUE with the next stage of the turn, or STOP.
 
 import type { Plugin } from "@opencode/plugin"
 import { existsSync } from "node:fs"
@@ -8,17 +9,17 @@ import { mkdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { markPrepared, markRestored } from "./checkout.js"
 import { validateFix, validateOps, validatePrepare, validatePublish, validateReview, validateTicket, validateTriage } from "./contracts.js"
+import { duplicateMessage, indexCrash } from "./crashindex.js"
 import { describeError } from "./errors.js"
-import { forbiddenReason } from "./permissions.js"
-import { sourceContext, type Runtime } from "./progress.js"
+import { FORBIDDEN_GLOBS, forbiddenReason } from "./permissions.js"
+import { sourceContext, stageBegin, stageEnd, type Runtime } from "./progress.js"
 import { renderCrashMarkdown, renderProject } from "./render.js"
 import { interpretCrashList, sourceById } from "./sources/index.js"
 import type { ListResult } from "./sources/types.js"
-import { getJson, keys, loadRun, loadWorker, now, saveRun, setJson } from "./state.js"
+import { getJson, keys, loadRun, loadWorker, now, saveRun, saveWorker, setJson } from "./state.js"
 import { applyOverrides, hasTestRunner, isTestFile, normalizeChecks, normalizeEcosystems, requiredChecks } from "./toolchain.js"
-import type { Crash, FixReport, ReviewVerdict, Source, Triage, Validation, WorkerInfo, WorkerPhase } from "./types.js"
+import type { Crash, CrashSummary, FixReport, ReviewVerdict, RunRecord, Source, Triage, Validation, WorkerInfo, WorkerPhase } from "./types.js"
 import { reportFromCommands, summaryFromSubmission } from "./validate.js"
-import { FORBIDDEN_GLOBS } from "./permissions.js"
 
 export interface ToolDeps {
   rt: () => Runtime
@@ -35,7 +36,7 @@ export interface CrashListRecord {
   query: { top: number; minUsers?: number; source?: Source }
   plans: Array<{ source: Source; calls: Array<{ toolId: string; input: Record<string, unknown>; appId?: string; label?: string }> }>
   planErrors: string[]
-  result?: { crashes: import("./types.js").CrashSummary[]; errors: string[]; raw?: unknown; at: string }
+  result?: { crashes: CrashSummary[]; errors: string[]; raw?: unknown; at: string }
 }
 
 const schema = (properties: Record<string, unknown>, required: string[]) => ({ type: "object", properties, required, additionalProperties: true })
@@ -159,6 +160,19 @@ function failure(errors: string[], what: string) {
 }
 
 const ok = (content: string, extra: Record<string, unknown> = {}) => ({ output: { ok: true, ...extra }, content })
+const CONTINUE = (what: string) => `\n\nCONTINUE: ${what}`
+const STOP = (why = "end your turn now") => `\n\nSTOP: ${why}.`
+
+/** The stages the current work turn still has to do (set by the pipeline before the prompt). */
+/** The branch name the naming convention planned for a new run, with `<key>` resolved to the ticket (or its fallback). */
+export const plannedBranch = (run: RunRecord): string | undefined => {
+  const planned = run.meta?.plannedBranch
+  if (typeof planned !== "string" || !planned) return undefined
+  return planned.replace("<key>", run.jiraKey ?? String(run.meta?.ticketFallback ?? run.crashId))
+}
+
+const plannedStages = (run: RunRecord): string[] => String(run.meta?.workStages ?? "").split(",").filter(Boolean)
+const checksText = (run: RunRecord) => (run.toolchain?.checks ?? []).map((c) => `\`${c.command}\`${c.cwd ? ` (in ${c.cwd})` : ""}${c.optional ? " (optional)" : ""}`).join(", ") || "none detected"
 
 export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): Promise<void> {
   const worker = async (sessionID: string, role: WorkerInfo["role"], phases?: WorkerPhase[]): Promise<{ info: WorkerInfo } | { error: string }> => {
@@ -176,6 +190,16 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
   const received = (run: { meta?: Record<string, unknown> }) => {
     run.meta = { ...run.meta, received: typeof run.meta?.expect === "string" ? run.meta.expect : null }
   }
+  /** A submission this turn already accepted (the agent called the tool again): answer the same way, change nothing. */
+  const alreadyReceived = (run: { meta?: Record<string, unknown> }) => typeof run.meta?.expect === "string" && run.meta.received === run.meta.expect
+  /** Records why a report was refused so the pipeline can show it when the turn ends without a valid one. */
+  const rejected = async (run: RunRecord, what: string, errors: string[]) => {
+    run.meta = { ...run.meta, lastRejection: `${what}: ${errors.join("; ")}`.slice(0, 600) }
+    await saveRun(ctx, run)
+    return failure(errors, what)
+  }
+  /** Moves the worker session to its next phase (the tool hook reads it on every call). */
+  const phase = async (sessionID: string, info: WorkerInfo, next: WorkerPhase) => saveWorker(ctx, sessionID, { ...info, phase: next })
 
   await ctx.tool.transform((editor) => {
     editor.add({
@@ -202,13 +226,13 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         if (results.length < planned) errors.push(`${planned - results.length} planned call(s) were not reported`)
         record.result = { crashes, errors: [...record.planErrors, ...errors], raw: results.map((r) => ({ source: r.source, toolId: r.toolId, appId: r.appId, raw: r.raw, error: r.error })), at: now() }
         await setJson(ctx, keys.crashes(requestId), record)
-        return ok(`Crash list recorded: ${crashes.length} crash(es)${errors.length ? `, ${errors.length} error(s)` : ""}. Stop here.`, { count: crashes.length })
+        return ok(`Crash list recorded: ${crashes.length} crash(es)${errors.length ? `, ${errors.length} error(s)` : ""}.${STOP()}`, { count: crashes.length })
       },
     })
 
     editor.add({
       name: "submit_crash",
-      description: "Fixora worker (crash phase): submit the raw replies of the crash fetch (issue, and the sample event when one was fetched), passed through unchanged from the same execute script that made the calls. Validated on receipt; errors tell you which follow-up call to make.",
+      description: "Fixora worker (fetch stage): submit the raw replies of the crash fetch (issue, and the sample event when one was fetched), passed through unchanged from the same execute script that made the calls. Validated on receipt; errors tell you which follow-up call to make.",
       input: CRASH_SCHEMA,
       options: { namespace: "fixora", codemode: true },
       async execute(input, c) {
@@ -216,6 +240,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         if ("error" in w) return failure([w.error], "crash")
         const run = await loadRun(ctx, w.info.runId!)
         if (!run) return failure([`run ${w.info.runId} not found`], "crash")
+        if (alreadyReceived(run) && existsSync(join(run.folder, "crash.json"))) return ok(`The crash of run ${run.runId} is already recorded; nothing changed.${plannedStages(run).includes("prepare") && w.info.phase === "crash" ? CONTINUE("the prepare stage") : STOP("do not submit it again")}`)
         const raw = input as { source?: string; appId?: string; issue?: unknown; events?: unknown; extraCalls?: unknown; error?: string }
         if (raw.source !== run.source) return failure([`source must be "${run.source}"`], "crash")
         if (raw.error && raw.issue === undefined) return failure([`the crash could not be fetched: ${raw.error}. Check the tool id / input in the prompt and try again; if the server keeps failing, report it in your final message and stop.`], "crash")
@@ -227,28 +252,43 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         try {
           crash = source.mapCrash!({ appId: raw.appId, issue: raw.issue, events: raw.events, extraCalls: Array.isArray(raw.extraCalls) ? (raw.extraCalls as never) : undefined }, sc, run.crashId, extra)
         } catch (error) {
-          return failure([describeError(error)], "crash")
+          return rejected(run, "crash", [describeError(error)])
         }
         if (crash.frames.length === 0 && raw.events === undefined) {
           const plan = source.fetchPlan!(sc, run.crashId, extra)
-          if (plan.followUps.length) return failure([`no stack frames could be read from the issue reply. Make a follow-up call (${plan.followUps.map((f) => `\`${f.toolId}\``).join(" or ")}) as the prompt describes and resubmit with its reply as \`events\``], "crash")
+          if (plan.followUps.length) return rejected(run, "crash", [`no stack frames could be read from the issue reply. Make a follow-up call (${plan.followUps.map((f) => `\`${f.toolId}\``).join(" or ")}) as the prompt describes and resubmit with its reply as \`events\``])
         }
         await mkdir(run.folder, { recursive: true })
         await persist(run.folder, "crash.json", crash)
-        await persist(run.folder, "crash.md", `${renderCrashMarkdown(crash, { reopened: run.reopened ? { ...run.reopened } : undefined })}\n`)
         run.title = crash.title
         run.fingerprint = crash.fingerprint
         run.meta = { ...run.meta, crashUrl: crash.url ?? null, platform: crash.platform ?? null, appVersion: crash.appVersion ?? null, language: crash.language, symbolication: crash.symbolication, userCount: crash.userCount ?? null, eventCount: crash.eventCount ?? null, crashFetchedAt: now() }
         if (crash.appId && extra?.appId !== crash.appId) run.meta.refExtra = JSON.stringify({ ...extra, appId: crash.appId })
+        const index = await indexCrash(ctx, run, crash)
+        await persist(run.folder, "crash.md", `${renderCrashMarkdown(crash, { reopened: run.reopened ? { ...run.reopened } : undefined })}\n`)
         received(run)
+        if (index.duplicateOf) {
+          run.skipReason = `same crash fingerprint as run ${index.duplicateOf.runId} (${index.duplicateOf.status}${index.duplicateOf.mrUrl ? `, MR ${index.duplicateOf.mrUrl}` : ""})`
+          run.error = duplicateMessage(index.duplicateOf)
+          await stageEnd(rt, run, "fetch", "skipped", run.skipReason)
+          run.status = "skipped"
+          await saveRun(ctx, run)
+          return ok(`Crash recorded, but ${run.skipReason}.${STOP("this crash is already being handled")}`)
+        }
+        await stageEnd(rt, run, "fetch", "ok", `${crash.exceptionType ?? crash.title} · ${crash.frames.length} frames · ${crash.language}${crash.symbolication !== "ok" ? ` · symbolication: ${crash.symbolication}` : ""}`)
+        const next = plannedStages(run).includes("prepare")
+        if (next) {
+          await stageBegin(rt, run, "prepare")
+          await phase(c.sessionID, w.info, "prepare")
+        }
         await saveRun(ctx, run)
-        return ok(`Crash recorded: ${crash.exceptionType ?? crash.title}, ${crash.frames.length} frame(s), ${crash.language}. Stop here.`)
+        return ok(`Crash recorded: ${crash.exceptionType ?? crash.title}, ${crash.frames.length} frame(s), ${crash.language}${run.reopened ? " (reopened crash)" : ""}.${next ? CONTINUE("the prepare stage (inspect the checkout first)") : STOP()}`)
       },
     })
 
     editor.add({
       name: "submit_prepare",
-      description: "Fixora worker (prepare phase): report the checkout (stage inspect when it is dirty, so Fixora can ask the user before stashing; stage ready after the fix branch is checked out and the toolchain detected).",
+      description: "Fixora worker (prepare stage): report the checkout (stage inspect when it is dirty, so Fixora can ask the user before stashing; stage ready after the fix branch is checked out and the toolchain scanned).",
       input: PREPARE_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
@@ -257,42 +297,60 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         const run = await loadRun(ctx, w.info.runId!)
         if (!run) return failure([`run ${w.info.runId} not found`], "prepare report")
         const rt = deps.rt()
-        const result = validatePrepare(input, { runId: run.runId, branchPrefix: rt.opts.branchPrefix, baseBranch: run.base.branch, existingBranch: run.branch })
-        if (!result.ok) return failure(result.errors, "prepare report")
+        if (alreadyReceived(run) && run.checkout.active) return ok(`The checkout of run ${run.runId} is already recorded (branch ${run.branch}); nothing changed.${plannedStages(run).includes("triage") ? CONTINUE("the analyse stage") : STOP("do not submit it again")}`)
+        // "ready" on a dirty checkout without an approved stash: the agent went past the inspect step.
+        // Take it as the inspect report so the user is asked before anything is stashed.
+        const stashApproved = run.approvals.stash === "approved" || run.approvals.stash === "auto"
+        const rawP = input as { stage?: unknown; dirty?: unknown; stashRef?: unknown; status?: unknown }
+        const demoted = rawP.stage === "ready" && rawP.dirty === true && !rawP.stashRef && !stashApproved
+        const result = validatePrepare(demoted ? { ...(input as Record<string, unknown>), stage: "inspect" } : input, { runId: run.runId, branchPrefix: rt.opts.branchPrefix, baseBranch: run.base.branch, existingBranch: run.branch, expectedBranch: plannedBranch(run) })
+        if (!result.ok) return rejected(run, "prepare report", demoted ? [...result.errors, "the checkout is dirty and stashing was not approved yet: this report is taken as stage \"inspect\""] : result.errors)
         const p = result.value
+        if (p.branch && p.branch === p.previousBranch) return rejected(run, "prepare report", [`previousBranch must be the branch that was checked out before the fix branch, not the fix branch itself ("${p.branch}")`])
+        received(run)
         if (p.blocked) {
-          run.status = "blocked"
           run.blockedReason = p.blocked
           run.error = p.blockedDetail ?? p.blocked
           run.meta = { ...run.meta, prepareStage: "blocked" }
-          received(run)
+          await stageEnd(rt, run, "prepare", "failed", p.blocked)
+          run.status = "blocked"
           await saveRun(ctx, run)
-          return ok(`Reported: ${p.blocked}. Stop here.`)
+          return ok(`Reported: ${p.blocked}.${STOP()}`)
         }
         if (p.stage === "inspect") {
           run.checkout = { ...run.checkout, active: false, previousBranch: p.previousBranch, previousHeadSha: p.previousHeadSha }
           run.gitRoot = p.repoRoot || run.gitRoot
           run.meta = { ...run.meta, prepareStage: "inspect", prepareDirty: p.dirty, prepareStatus: (p.status ?? "").slice(0, 20_000), prepareDirtyFiles: p.dirtyFiles ?? (p.status ? p.status.split("\n").filter(Boolean).length : 0) }
-          received(run)
           await saveRun(ctx, run)
-          return ok(p.dirty ? "Reported a dirty checkout. Stop here: Fixora will ask the user whether to stash, then prompt you again." : "Reported a clean checkout. Continue with fetch, branch, checkout and toolchain detection, then submit stage \"ready\".")
+          return ok(p.dirty ? `Reported a dirty checkout.${STOP("Fixora asks the user whether to stash, then prompts you again")}` : `Reported a clean checkout.${CONTINUE('fetch the base branch, create / check out the fix branch, scan the toolchain, then call fixora_submit_prepare with stage "ready"')}`)
         }
         markPrepared(run, { previousBranch: p.previousBranch, previousHeadSha: p.previousHeadSha, stashRef: p.stashRef ?? null, branch: p.branch!, gitRoot: p.repoRoot, baseSha: p.baseSha, remoteUrl: p.remoteUrl })
         const checks = applyOverrides(normalizeChecks(p.toolchain?.checks), rt.opts.testCommands)
         run.toolchain = { ecosystems: normalizeEcosystems(p.toolchain?.ecosystems), checks, conventionFiles: p.conventionFiles }
-        run.meta = { ...run.meta, prepareStage: "ready", prepareSetup: JSON.stringify(p.toolchain?.setup ?? []).slice(0, 4000), prepareNotes: p.notes.join("; ").slice(0, 2000) }
+        run.meta = { ...run.meta, prepareStage: "ready", prepareNotes: p.notes.join("; ").slice(0, 2000) }
         await mkdir(run.folder, { recursive: true })
         await persist(run.folder, "project.md", `${renderProject({ toolchain: run.toolchain, forbidden: [...FORBIDDEN_GLOBS, ...rt.opts.validate.denyPaths], limits: rt.opts.validate })}\n`)
         await persist(run.folder, "limits.json", { maxFilesChanged: rt.opts.validate.maxFilesChanged, maxDiffLines: rt.opts.validate.maxDiffLines, testTimeoutSec: rt.opts.testCommands.timeoutSec, mode: run.flags.testFirst ? "test-first" : "fix", maxFixRounds: rt.opts.maxFixRounds })
-        received(run)
+        await stageEnd(rt, run, "prepare", "ok", `${run.branch} from ${run.base.remote}/${run.base.branch}${run.base.sha ? `@${run.base.sha.slice(0, 8)}` : ""}${run.checkout.stashRef ? " · changes stashed" : ""}`)
+        const stages = plannedStages(run)
+        let next: string | undefined
+        if (stages.includes("triage")) {
+          await stageBegin(rt, run, "analyse")
+          await phase(c.sessionID, w.info, "triage")
+          next = `the analyse stage (read-only): read ${join(run.folder, "crash.md")} and ${join(run.folder, "project.md")}, find the root cause, write analysis.md, then call fixora_submit_triage`
+        } else if (stages.includes("fix")) {
+          await stageBegin(rt, run, "fix")
+          await phase(c.sessionID, w.info, run.meta?.feedback ? "feedback" : "fix")
+          next = `the fix stage as the prompt describes; checks to run: ${checksText(run)}`
+        }
         await saveRun(ctx, run)
-        return ok(`Checkout prepared on ${run.branch} (${run.toolchain.ecosystems.map((e) => e.id).join(", ") || "no ecosystem"}; ${checks.length} check(s)). Stop here.`)
+        return ok(`Checkout prepared on ${run.branch} (${run.toolchain.ecosystems.map((e) => e.id).join(", ") || "no ecosystem"}; checks: ${checksText(run)}).${next ? CONTINUE(next) : STOP()}`)
       },
     })
 
     editor.add({
       name: "submit_triage",
-      description: "Fixora worker (triage phase): submit the root-cause analysis for the current run. Validated on receipt; errors are returned so you can correct and resubmit.",
+      description: "Fixora worker (analyse stage): submit the root-cause analysis for the current run. Validated on receipt; errors are returned so you can correct and resubmit.",
       input: TRIAGE_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
@@ -300,25 +358,36 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         if ("error" in w) return failure([w.error], "triage")
         const run = await loadRun(ctx, w.info.runId!)
         if (!run) return failure([`run ${w.info.runId} not found`], "triage")
+        const rt = deps.rt()
         const root = run.gitRoot ?? run.repo
         const result: Validation<Triage> = validateTriage(input, { runId: run.runId, fileExists: (p) => existsSync(join(root, p)) })
-        if (!result.ok) return failure(result.errors, "triage")
+        if (!result.ok) return rejected(run, "triage", result.errors)
         run.triage = result.value
         run.pipeline.analysed = true
         received(run)
-        await saveRun(ctx, run)
         await persist(run.folder, "triage.json", result.value)
-        return ok(`Triage accepted: ${result.value.classification}, confidence ${Math.round(result.value.confidence * 100)}%. You may stop now unless asked to continue.`)
+        const t = result.value
+        const fixable = t.classification === "fixable" && t.confidence >= rt.opts.confidence.minToFix
+        await stageEnd(rt, run, "analyse", "ok", `${t.classification} · confidence ${Math.round(t.confidence * 100)}% · risk ${t.risk.level}`)
+        const next = fixable && plannedStages(run).includes("fix")
+        if (next) {
+          await stageBegin(rt, run, "fix")
+          await phase(c.sessionID, w.info, "fix")
+        }
+        await saveRun(ctx, run)
+        const attempt = run.counters.fixRounds + run.counters.reviewRounds + run.counters.feedback + 1
+        if (next) return ok(`Triage accepted: ${t.classification}, confidence ${Math.round(t.confidence * 100)}%.${CONTINUE(`the fix stage (attempt ${attempt}): implement the strategy you submitted, add the regression test, run the checks (${checksText(run)}), then \`git add -N . && git status --porcelain=v1 --untracked-files=all\` and \`git diff HEAD\`, and call fixora_submit_fix with attempt ${attempt} and both outputs as status / diff`)}`)
+        return ok(`Triage accepted: ${t.classification}, confidence ${Math.round(t.confidence * 100)}%.${STOP(fixable ? "end your turn" : `Fixora stops here (${t.classification !== "fixable" ? `classified as ${t.classification}` : "confidence below the threshold"})`)}`)
       },
     })
 
     editor.add({
       name: "submit_ticket",
-      description: "Fixora worker (ticket phase): report the Jira ticket that was created or reused (or why it failed).",
+      description: "Fixora worker (publish turn): report the Jira ticket that was created or reused (or why it failed).",
       input: TICKET_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
-        const w = await worker(c.sessionID, "fixer", ["ticket", "close-loop"])
+        const w = await worker(c.sessionID, "fixer", ["prepare", "ticket", "publish", "close-loop"])
         if ("error" in w) return failure([w.error], "ticket report")
         const run = await loadRun(ctx, w.info.runId!)
         if (!run) return failure([`run ${w.info.runId} not found`], "ticket report")
@@ -334,13 +403,17 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         }
         received(run)
         await saveRun(ctx, run)
-        return ok(t.action === "failed" ? "Failure recorded. Stop here." : `Ticket ${t.key} (${t.action}) recorded. Stop here.`)
+        if (w.info.phase === "prepare") {
+          const branch = plannedBranch(run)
+          return ok(t.action === "failed" ? `Ticket failure recorded.${CONTINUE(`the prepare stage; the branch name is now \`${branch}\``)}` : `Ticket ${t.key} (${t.action}) recorded.${CONTINUE(`the prepare stage with branch \`${branch}\``)}`)
+        }
+        return ok(t.action === "failed" ? `Ticket failure recorded.${CONTINUE("the next step of the prompt")}` : `Ticket ${t.key} (${t.action}) recorded.${CONTINUE(`the next step of the prompt (use ${t.key} wherever it says <key>)`)}`)
       },
     })
 
     editor.add({
       name: "submit_fix",
-      description: "Fixora worker (fix phase): submit the fix report after changing code and running the project's checks, with `status` (git status --porcelain=v1 after git add -N .) and `diff` (git diff HEAD) verbatim. Validated against them, forbidden paths and limits; errors are returned so you can correct and resubmit.",
+      description: "Fixora worker (fix stage): submit the fix report after changing code and running the project's checks, with `status` (git status --porcelain=v1 after git add -N .) and `diff` (git diff HEAD) verbatim. Validated against them, forbidden paths and limits; errors are returned so you can correct and resubmit.",
       input: FIX_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
@@ -369,7 +442,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
           testFirst: run.flags.testFirst,
           requiredChecks: run.meta?.tests === "skip" ? [] : requiredChecks(checks).map((k) => k.command),
         })
-        if (!result.ok) return failure(result.errors, "fix report")
+        if (!result.ok) return rejected(run, "fix report", result.errors)
         run.fix = result.value
         run.pipeline.fixed = result.value.changesMade
         if (result.value.changesMade) {
@@ -379,9 +452,10 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
           await persist(run.folder, `verification.${attempt}.json`, run.tests)
         }
         received(run)
+        if (run.step === "fix" && run.timings.fix?.status === "running") await stageEnd(rt, run, "fix", "ok", result.value.changesMade ? `${result.value.filesChanged.length} file(s): ${result.value.summary}` : "no changes")
         await saveRun(ctx, run)
         await persist(run.folder, `fix.${attempt}.json`, result.value)
-        return ok(result.value.changesMade ? "Fix report accepted. Fixora will now check the change set and run an independent review. Stop here." : "Report accepted (no changes). Stop here.")
+        return ok(result.value.changesMade ? `Fix report accepted. Fixora now checks the change set and runs an independent review.${STOP()}` : `Report accepted (no changes).${STOP()}`)
       },
     })
 
@@ -403,13 +477,13 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         received(run)
         await saveRun(ctx, run)
         await persist(run.folder, `review.${attempt}.json`, result.value)
-        return ok(`Review recorded: ${result.value.verdict}. Stop here.`)
+        return ok(`Review recorded: ${result.value.verdict}.${STOP()}`)
       },
     })
 
     editor.add({
       name: "submit_publish",
-      description: "Fixora worker (publish phase): report what was committed, pushed and opened as a merge request (partial results are fine; list errors).",
+      description: "Fixora worker (publish turn): report what was committed, pushed and opened as a merge request (partial results are fine; list errors). The prompt's remaining steps (links, restore) follow.",
       input: PUBLISH_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
@@ -418,7 +492,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         const run = await loadRun(ctx, w.info.runId!)
         if (!run) return failure([`run ${w.info.runId} not found`], "publish report")
         const result = validatePublish(input, { runId: run.runId, grants: w.info.grants ?? {}, branch: run.branch ?? "", remote: run.base.remote })
-        if (!result.ok) return failure(result.errors, "publish report")
+        if (!result.ok) return rejected(run, "publish report", result.errors)
         const p = result.value
         if (p.committed) {
           if (!run.commitShas.includes(p.committed.sha)) run.commitShas.push(p.committed.sha)
@@ -433,16 +507,16 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
           run.pipeline.mrOpened = true
         }
         if (p.mrSkipped) run.meta = { ...run.meta, compareUrl: p.mrSkipped.compareUrl ?? null, mrSkippedReason: p.mrSkipped.reason }
-        run.meta = { ...run.meta, publishErrors: p.errors.join("; ").slice(0, 2000) || null }
+        run.meta = { ...run.meta, publishErrors: p.errors.join("; ").slice(0, 2000) || null, publishedAt: now() }
         received(run)
         await saveRun(ctx, run)
-        return ok(`Publish report recorded (${[p.committed && "committed", p.pushed && "pushed", p.mr && "MR opened", p.mrSkipped && "MR skipped"].filter(Boolean).join(", ") || "nothing"}). Stop here.`)
+        return ok(`Publish report recorded (${[p.committed && "committed", p.pushed && "pushed", p.mr && "MR opened", p.mrSkipped && "MR skipped"].filter(Boolean).join(", ") || "nothing"}).${CONTINUE("the remaining steps of the prompt (links, then restore the checkout)")}`)
       },
     })
 
     editor.add({
       name: "submit_ops",
-      description: "Fixora worker: report the outcome of an ops prompt (restore, close-loop, sync, close-mr, jira-comment, clean, annotate).",
+      description: "Fixora worker: report the outcome of an ops step (restore, close-loop, sync, close-mr, jira-comment, clean, annotate).",
       input: OPS_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
@@ -454,7 +528,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         const at = now()
         if (!info.runId) {
           await setJson(ctx, keys.ops(c.sessionID), { ...o, at })
-          return ok(`${o.op} recorded. Stop here.`)
+          return ok(`${o.op} recorded.${STOP()}`)
         }
         const run = await loadRun(ctx, info.runId)
         if (!run) return failure([`run ${info.runId} not found`], "ops report")
@@ -464,6 +538,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
             break
           case "close-loop":
             run.pipeline.loopClosed = true
+            run.meta = { ...run.meta, closeLoopResult: JSON.stringify({ ok: o.ok, errors: o.errors, results: o.results }).slice(0, 2000) }
             break
           case "close-mr":
             if (o.ok && run.mrUrl) run.mrStatus = "closed"
@@ -479,13 +554,14 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         run.meta = { ...run.meta, opsResult: JSON.stringify({ op: o.op, ok: o.ok, errors: o.errors, results: o.results, at }).slice(0, 4000) }
         received(run)
         await saveRun(ctx, run)
-        return ok(`${o.op} recorded (${o.ok ? "ok" : "with errors"}). Stop here.`)
+        const more = o.op === "close-loop" ? CONTINUE("the restore step of the prompt") : STOP()
+        return ok(`${o.op} recorded (${o.ok ? "ok" : "with errors"}).${more}`)
       },
     })
 
     editor.add({
       name: "start",
-      description: "Start Fixora runs for one or more crash references (e.g. \"sentry:12345\", \"crashlytics:abc\", or a crash URL). Use after the user picked crashes from the /fixora list. Not available inside Fixora worker sessions.",
+      description: 'Start Fixora runs for one or more crash references (e.g. "sentry:12345", "crashlytics:abc", or a crash URL). Use after the user picked crashes from the /fixora list. Not available inside Fixora worker sessions.',
       input: START_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {

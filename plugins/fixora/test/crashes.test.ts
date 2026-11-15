@@ -8,6 +8,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { runFix, runList } from "../src/flows.js"
+import { slug } from "../src/git.js"
 import { readOptions } from "../src/options.js"
 import type { Runtime } from "../src/progress.js"
 import { registerPluginTools, type CrashListRecord } from "../src/tools.js"
@@ -26,11 +27,19 @@ let rt: Runtime
 const listerPrompts: string[] = []
 
 const worker: Worker = async (prompt, session, tool) => {
+  for (let guard = 0; guard < 6; guard++) {
+    const reply = await stage(prompt, session, tool)
+    if (!reply || !/CONTINUE:/.test(reply)) return
+  }
+}
+
+/** One stage of the scripted agent; returns the tool reply so the loop can honour CONTINUE / STOP. */
+const stage = async (prompt: { text: string }, session: { id: string }, tool: (name: string) => { execute: (input: unknown, ctx: ReturnType<typeof toolCtx>) => Promise<{ output?: unknown; content?: string }> }): Promise<string | undefined> => {
   const w = mock.storage.get(`fixora/worker/${session.id}`) as WorkerInfo
   const call = async (name: string, input: unknown) => {
     const r = await tool(name).execute(input, toolCtx(session.id))
     if ((r.output as { ok?: boolean }).ok !== true) throw new Error(`${name} rejected: ${r.content}`)
-    return r
+    return r.content ?? ""
   }
   if (w.phase === "crashes") {
     listerPrompts.push(prompt.text)
@@ -42,8 +51,7 @@ const worker: Worker = async (prompt, session, tool) => {
         return { source: "crashlytics", toolId: c.toolId, appId: c.appId, raw: text("crashlytics/get_report.topIssues.v15.yaml") }
       }),
     )
-    await call("fixora_submit_crashes", { version: 1, requestId: w.requestId, results })
-    return
+    return call("fixora_submit_crashes", { version: 1, requestId: w.requestId, results })
   }
   if (w.phase === "crash") {
     const runId = w.runId!
@@ -52,15 +60,16 @@ const worker: Worker = async (prompt, session, tool) => {
       const r = await tool("fixora_submit_crash").execute({ version: 1, runId, source: "sentry", issue: { id: "4523123", title: "TypeError", permalink: "https://acme.sentry.io/issues/4523123/" } }, toolCtx(session.id))
       expect((r.output as { ok: boolean }).ok).toBe(false)
       expect(r.content).toContain("sentry_search_errors")
-      await call("fixora_submit_crash", { version: 1, runId, source: "sentry", issue: { id: "4523123", title: "TypeError", permalink: "https://acme.sentry.io/issues/4523123/" }, events: fixture("sentry/get_issue_details.node.json") })
-      return
+      return call("fixora_submit_crash", { version: 1, runId, source: "sentry", issue: { id: "4523123", title: "TypeError", permalink: "https://acme.sentry.io/issues/4523123/" }, events: fixture("sentry/get_issue_details.node.json") })
     }
-    await call("fixora_submit_crash", { version: 1, runId, source: "crashlytics", appId: ANDROID, issue: text("crashlytics/get_issue.v15.yaml"), events: text("crashlytics/batch_get_events.v15.yaml") })
-    return
+    return call("fixora_submit_crash", { version: 1, runId, source: "crashlytics", appId: ANDROID, issue: text("crashlytics/get_issue.v15.yaml"), events: text("crashlytics/batch_get_events.v15.yaml") })
   }
   if (w.phase === "prepare") {
-    await call("fixora_submit_prepare", { version: 1, runId: w.runId, stage: "inspect", blocked: "base-missing", blockedDetail: "fatal: couldn't find remote ref main", conventionFiles: [], notes: [] })
-    return
+    // A `{ticket}` branch template puts the Jira step before the branch: report the ticket, then stop at base-missing.
+    if (/Before creating the branch \(the name needs the ticket key\)/.test(prompt.text)) {
+      await call("fixora_submit_ticket", { version: 1, runId: w.runId, action: "created", key: "DE-456", url: "https://jira.example.com/browse/DE-456" })
+    }
+    return call("fixora_submit_prepare", { version: 1, runId: w.runId, stage: "inspect", blocked: "base-missing", blockedDetail: "fatal: couldn't find remote ref main", conventionFiles: [], notes: [] })
   }
   throw new Error(`unexpected phase ${w.phase}`)
 }
@@ -136,7 +145,9 @@ describe("crash fetch through the fixer session", () => {
     expect(run.title).toContain("TypeError")
     expect(readFileSync(join(run.folder, "crash.md"), "utf8")).toContain("src/cart/service.ts")
     const fixer = mock.sessions.get(run.sessions.fixer!)!
-    expect(fixer.prompts.map((p) => p.skills?.[0]?.id)).toEqual(["fixora-crashes", "fixora-prepare"])
+    // One work turn: fetch → prepare → analyse → fix, steered by the tool replies (it stopped at prepare).
+    expect(fixer.prompts).toHaveLength(1)
+    expect(fixer.prompts[0]!.skills?.map((s) => s.id)).toEqual(["fixora-crashes", "fixora-prepare", "fixora-triage", "fixora-fix"])
     expect(fixer.prompts[0]!.text).toContain("sentry_get_issue_details")
     expect(fixer.prompts[0]!.text).toContain('"organizationSlug": "acme"')
     expect(run.checkout.active).toBe(false)
@@ -155,5 +166,39 @@ describe("crash fetch through the fixer session", () => {
     expect(fixer.prompts[0]!.text).toContain("firebase_crashlytics_get_issue")
     expect(fixer.prompts[0]!.text).toContain("firebase_crashlytics_batch_get_events")
     expect(fixer.prompts[0]!.text).toContain(`Report \`appId\` as ${ANDROID}`)
+  })
+
+  test("a {ticket} branch template: the crash is fetched in its own turn, the ticket is approved and created before the branch, the name carries its key", async () => {
+    const saved = { opts: rt.opts, tools: [...mock.mcpTools] }
+    mock.mcpTools.push(fakeMcpTool("jira_jira_search", { jql: {} }), fakeMcpTool("jira_jira_create_issue", { project_key: {}, summary: {}, issue_type: {}, description: {}, additional_fields: {} }), fakeMcpTool("jira_jira_get_issue", { issue_key: {} }))
+    mock.mcpServers.push({ name: "jira", status: "connected" })
+    const options = { crashlytics: { appIds: [ANDROID, IOS] }, jira: { project: "DE" }, branchNaming: { template: "{type}/{ticket}-{slug}", type: "fix" } }
+    const parsed = readOptions(options)
+    if (!parsed.ok) throw new Error(parsed.errors.join())
+    rt.opts = parsed.value
+    try {
+      const run = await runFix(rt, { sessionID: "origin", ref: `crashlytics:fedcba9876543210fedcba9876543210@${ANDROID}`, flags: { dryRun: false, ticket: true, mr: true, push: true, auto: false, force: false, forceTriage: false } })
+      expect(run.status).toBe("blocked")
+      expect(run.blockedReason).toBe("base-missing")
+      expect(run.timings.fetch?.status).toBe("ok")
+      expect(run.jiraKey).toBe("DE-456")
+      expect(run.approvals.ticket).toBe("approved")
+      expect(mock.permissionRequests.filter((p) => p.action === "fixora.ticket")).toHaveLength(1)
+      expect(run.meta?.plannedBranch).toBe(`fixora/fix/<key>-${slug(run.title, 32)}`)
+      const fixer = mock.sessions.get(run.sessions.fixer!)!
+      // Turn 1: fetch only (the ticket needs the crash). Turn 2: prepare → analyse → fix with the ticket step first.
+      expect(fixer.prompts.map((p) => p.skills?.map((s) => s.id))).toEqual([["fixora-crashes"], ["fixora-prepare", "fixora-triage", "fixora-fix"]])
+      expect(fixer.prompts[1]!.text).toContain("`fixora/fix/<key>-")
+      expect(fixer.prompts[1]!.text).toContain("tools.jira.jira_create_issue")
+      expect(fixer.prompts[1]!.text).toContain('"project_key": "DE"')
+      expect(readFileSync(join(run.folder, "ticket-preview.md"), "utf8")).toContain("h2. Stack trace")
+      // The failure message carries the reason the last prepare report was refused (none here: base-missing was accepted).
+      expect(run.error).not.toContain("Last report refused")
+    } finally {
+      rt.opts = saved.opts
+      mock.mcpTools.length = 0
+      mock.mcpTools.push(...saved.tools)
+      mock.mcpServers.pop()
+    }
   })
 })

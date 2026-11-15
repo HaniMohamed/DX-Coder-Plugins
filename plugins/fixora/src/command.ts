@@ -40,23 +40,47 @@ export type ParseResult = Parsed | { error: string }
 
 export const RUN_ID_PATTERN = /^(sentry|crashlytics|manual)-[A-Za-z0-9._-]{1,64}$/
 
+export type Verb = Parsed["verb"]
+
+export interface Subcommand {
+  verb: Verb
+  /** The host command name (`/fixora:status`). */
+  name: string
+  /** Arguments as shown in the usage text. */
+  args: string
+  description: string
+}
+
+/**
+ * Every verb is also its own host command (`/fixora:status …`) so the command palette lists them
+ * next to `/fixora`; `/fixora status …` keeps working as the long form.
+ */
+export const SUBCOMMANDS: Subcommand[] = [
+  { verb: "list", name: `${COMMAND}:list`, args: "", description: "list the top crashes from every detected source" },
+  { verb: "fix", name: `${COMMAND}:fix`, args: "<source>:<id> | <crash url>", description: "fix one crash (e.g. sentry:12345, crashlytics:abc, or a Sentry / Firebase console URL)" },
+  { verb: "paste", name: `${COMMAND}:paste`, args: '<file> [--title ".."] [--platform ..] [--language ..]', description: "fix a pasted stack trace saved in a file" },
+  { verb: "top", name: `${COMMAND}:top`, args: "[N]", description: "fix the top N new crashes (default 1)" },
+  { verb: "batch", name: `${COMMAND}:batch`, args: "[--top N] [--min-users N] [--source s] [--minutes M]", description: "batch mode with a time budget" },
+  { verb: "status", name: `${COMMAND}:status`, args: "[<runId>]", description: "runs table or one run's detail" },
+  { verb: "retry", name: `${COMMAND}:retry`, args: "<runId> [--from <step>] [--fresh]", description: "resume a stopped run; --fresh forgets the worker sessions and redoes prepare" },
+  { verb: "feedback", name: `${COMMAND}:feedback`, args: '<runId> "<message>"', description: "ask for a change or a question on the fix (same branch, MR updated)" },
+  { verb: "restart", name: `${COMMAND}:restart`, args: "<runId>", description: "close the MR and start a fresh fix cycle" },
+  { verb: "fixed", name: `${COMMAND}:fixed`, args: "<runId> --release <X> [--platform android|ios|web]", description: "record the release that ships the fix (reopen tracking)" },
+  { verb: "report", name: `${COMMAND}:report`, args: "[--days 30]", description: "funnel, timings, MR status, reopen rate" },
+  { verb: "clean", name: `${COMMAND}:clean`, args: "<runId> [--remote]", description: "restore the checkout, delete the local branch (and, after approval, the remote branch)" },
+  { verb: "sync", name: `${COMMAND}:sync`, args: "", description: "refresh MR statuses" },
+  { verb: "reset", name: `${COMMAND}:reset`, args: "[--files]", description: "forget every run, crash and cache record (after approval); --files also deletes <repo>/.dxcoder/fixora" },
+  { verb: "doctor", name: `${COMMAND}:doctor`, args: "[--all] [--probe] [--tool <id>]", description: "MCP servers / tools Fixora detects; --probe calls the crash source; --tool prints a tool's input schema" },
+  { verb: "help", name: `${COMMAND}:help`, args: "", description: "show this usage" },
+]
+
+const pad = (s: string, n: number) => (s.length >= n ? `${s}  ` : s.padEnd(n))
+
 export const USAGE = [
   "Usage:",
-  `  /${COMMAND}                                   list the top crashes from every detected source`,
-  `  /${COMMAND} fix <source>:<id> | <crash url>   fix one crash (e.g. sentry:12345, crashlytics:abc, or a Sentry / Firebase console URL)`,
-  `  /${COMMAND} paste <file> [--title ".."]       fix a pasted stack trace saved in a file`,
-  `  /${COMMAND} top [N]                           fix the top N new crashes (default 1)`,
-  `  /${COMMAND} batch [--top N] [--min-users N] [--source s] [--minutes M]`,
-  `  /${COMMAND} status [<runId>]                  runs table or one run's detail`,
-  `  /${COMMAND} retry <runId> [--from <step>] [--fresh]   resume a stopped run; --fresh forgets the worker sessions and redoes prepare`,
-  `  /${COMMAND} feedback <runId> "<message>"      ask for a change or a question on the fix (same branch, MR updated)`,
-  `  /${COMMAND} restart <runId>                   close the MR and start a fresh fix cycle`,
-  `  /${COMMAND} fixed <runId> --release <X> [--platform android|ios|web]`,
-  `  /${COMMAND} report [--days 30]                funnel, timings, MR status, reopen rate`,
-  `  /${COMMAND} clean <runId> [--remote]          restore the checkout, delete the local branch (and, after approval, the remote branch)`,
-  `  /${COMMAND} sync                              refresh MR statuses`,
-  `  /${COMMAND} reset [--files]                   forget every run, crash and cache record (after approval); --files also deletes <repo>/.dxcoder/fixora`,
-  `  /${COMMAND} doctor [--all] [--probe] [--tool <id>]  MCP servers / tools Fixora detects; --probe calls the crash source; --tool prints a tool's input schema`,
+  pad(`  /${COMMAND}`, 54) + "list the top crashes from every detected source",
+  ...SUBCOMMANDS.filter((c) => c.verb !== "list").map((c) => pad(`  /${c.name} ${c.args}`.trimEnd(), 54) + c.description),
+  `(the long form \`/${COMMAND} <verb> …\` works too)`,
   "Flags: --dry-run --no-ticket --no-mr --no-push --auto --force --test-first --base <branch>",
   "       --model <providerID/modelID> --tests full|mapped|skip",
 ].join("\n")

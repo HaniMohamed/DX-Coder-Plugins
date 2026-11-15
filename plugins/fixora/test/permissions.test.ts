@@ -176,7 +176,9 @@ describe("guardWorkerShell per phase", () => {
     expect(shell("publish", "git push origin main", g)).toContain("push only fixora/run-1-x")
     expect(shell("publish", "git push origin fixora/other", g)).toContain("push only fixora/run-1-x")
     expect(shell("publish", "git push origin --delete fixora/run-1-x", g)).toContain("never force")
-    expect(shell("publish", "git checkout main", g)).toContain("publish only")
+    expect(shell("publish", "git checkout main", g)).toBeUndefined() // the publish turn restores the checkout
+    expect(shell("publish", "git stash pop stash@{0}", g)).toBeUndefined()
+    expect(shell("publish", "git reset --hard", g)).toContain("publish only")
     // Without the grants nothing is allowed.
     expect(shell("publish", "git commit -F x", { grants: {} })).toContain("commit is not granted")
     expect(shell("publish", "git push -u origin fixora/run-1-x", { grants: { commit: true } })).toContain("push is not granted")

@@ -326,8 +326,8 @@ export const notConnectedInstructions = (s: DetectedService) =>
  * exposed" (e.g. the Firebase MCP server hides its crashlytics_* tools unless started with
  * `--only crashlytics` or inside a folder with a Crashlytics app), or a naming mismatch.
  */
-export function renderDoctor(o: { servers: ServerInfo[]; toolIds: string[]; services: Services; options: { sources: string[]; crashlytics: { appIds: string[] }; jira: { project?: string; parent?: string; issueType: string } }; all?: boolean; warnings?: string[] }): string {
-  const L: string[] = ["## Fixora doctor", ""]
+export function renderDoctor(o: { servers: ServerInfo[]; toolIds: string[]; services: Services; options: { sources: string[]; crashlytics: { appIds: string[] }; jira: { project?: string; parent?: string; issueType: string } }; all?: boolean; warnings?: string[]; version?: string }): string {
+  const L: string[] = [`## Fixora doctor${o.version ? ` (plugin ${o.version})` : ""}`, ""]
   L.push("### MCP servers", "")
   if (o.servers.length === 0) L.push("- none configured (`opencode.jsonc` → `mcp.servers`)")
   for (const s of o.servers) {

@@ -6,9 +6,21 @@ disable-model-invocation: true
 
 # Fixora publish — exactly what was approved
 
-The user saw a preview and approved this step. The prompt says which of commit / push / merge
-request you may do; do only those, in order, and report what happened. Nothing here is creative:
-the commit message and the MR body are prepared files, the branch and remote are given.
+The user saw a preview and approved this turn. The prompt lists, in order, which of these you do:
+Jira ticket, commit, push, merge request, links (Jira comment / transition, crash-source note) and,
+always last, the restore of the user's checkout. Do only the listed steps, in that order, in this one
+turn, and report each with the tool the prompt names (`fixora_submit_ticket`, `fixora_submit_publish`,
+`fixora_submit_ops`). Nothing here is creative: the commit message and the MR body are prepared
+files, the branch and remote are given, the tool inputs are given.
+
+## Jira ticket (only when listed)
+
+Search with the given JQL; reuse a hit (`fixora_submit_ticket` with action `reused`), else create
+with the given input (action `created`), then carry on. If the server rejects `additional_fields`
+as the wrong type, resend once with the other encoding (JSON string ↔ object). Any other failure →
+action `failed` with the exact error, and carry on with the next step. Where later steps say `<key>`,
+use the ticket key; `git commit … --trailer "Jira: <key>"` adds it to the commit, and `{{JIRA}}` in
+the MR body is replaced by the key and url (or the line is deleted when no ticket exists).
 
 ## Commit (only when the prompt grants it)
 
@@ -58,4 +70,18 @@ Report `mr: { url, id, provider, status }` where `provider` is one of `gitlab-mc
 
 Partial results are expected and fine (for example committed and pushed, MR skipped): report what
 succeeded and the exact error of what did not. Call the tool once; correct and resubmit on validation
-errors; then stop. Never retry a push or commit on your own initiative.
+errors; then carry on with the links and the restore. Never retry a push or commit on your own initiative.
+
+## Links (only when listed)
+
+Make the listed Jira / crash-source calls with `<key>` and `<mrUrl>` filled in; for the transition,
+pick the one whose name matches the wanted name ignoring case and punctuation, skip it when none
+matches. Report with `fixora_submit_ops` op `close-loop`: `{ ok, results: { comment, transition, note }, errors }`.
+
+## Restore (always last, even after a failed step)
+
+Run the listed commands: `git checkout <previous branch or commit>`, then, when a stash is named,
+`git stash list` to find the entry whose message is `fixora/<runId>` and `git stash pop stash@{n}`.
+If the pop conflicts, leave the stash in place, do not resolve anything, and report `ok: false` with
+the conflicting files. Report with `fixora_submit_ops` op `restore`:
+`{ ok, results: { branch, stashPopped }, errors }`. Then stop.

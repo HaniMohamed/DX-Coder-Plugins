@@ -41,6 +41,10 @@ checkout is already on the fix branch, report those recorded values again and do
 3. Branch name:
    - The prompt names an existing branch for this run → `git checkout <branch>` (or
      `git checkout -b <branch> <remote>/<branch>` when it only exists on the remote). Never rename it.
+   - The prompt gives the name "from the configured naming convention" → use it exactly as written.
+     When the prompt has a Jira ticket step before the branch, do that step first (search, reuse or
+     create, `fixora_submit_ticket`) and put the ticket key where the name says `<key>`; if no ticket
+     could be created, use the fallback id the prompt names. Do not look for a convention yourself.
    - Otherwise run ONE `git branch -r --list | head -20`. If a convention is obvious from those names
      (ticket prefixes, kebab-case, `type/short-description`…), build a name that **starts with the
      prefix from the prompt** (`fixora/`) and follows the rest of it, e.g.
@@ -111,6 +115,10 @@ List the convention documents present: `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.m
 }
 ```
 
-Rules: `branch` must start with the prefix from the prompt and must not be a protected name;
-`dirty: true` with `stage: "ready"` needs a `stashRef` (else stop at stage inspect); shas are hex.
-Call the tool once per stage; correct and resubmit on validation errors; then stop.
+Rules: `branch` must start with the prefix from the prompt (or be exactly the name the prompt gives)
+and must not be a protected name; `dirty: true` with `stage: "ready"` needs a `stashRef` (without an
+approved stash Fixora reads such a report as stage inspect and asks the user); `previousBranch` is
+the branch you found in step 1, never the fix branch; shas are hex. A reply "was NOT accepted" lists
+what to fix: correct only that and call the tool again, do not start over.
+Call the tool once per stage; correct and resubmit on validation errors. The reply ends with
+CONTINUE (go straight on to the analyse stage in this same turn, as the prompt lists it) or STOP.

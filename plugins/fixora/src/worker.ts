@@ -81,7 +81,7 @@ function attachments(folder: string, names: string[]) {
 
 /** Sends one prompt (text + skill + attachments) and waits for the session to go idle, within the phase budget. */
 export async function promptSession(rt: Runtime, sessionID: string, prompt: Prompt, o: { folder?: string; minutes: number; signal?: AbortSignal }): Promise<Outcome> {
-  await rt.ctx.session.prompt({ sessionID: sessionID as never, text: prompt.text, files: o.folder ? attachments(o.folder, prompt.files) : [], skills: [{ id: prompt.skill }] } as never)
+  await rt.ctx.session.prompt({ sessionID: sessionID as never, text: prompt.text, files: o.folder ? attachments(o.folder, prompt.files) : [], skills: prompt.skills.map((id) => ({ id })) } as never)
   return waitWithTimeout(rt, sessionID, o.minutes * 60_000, o.signal)
 }
 

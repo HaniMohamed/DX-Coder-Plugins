@@ -326,7 +326,10 @@ export function judgeGit(inv: GitInvocation, w: WorkerInfo): string | undefined 
         if (isProtectedBranch(target, base)) return deny("protected branch")
         return undefined
       }
-      return deny("publish only adds, commits and pushes the fix")
+      // The publish turn ends by restoring the user's checkout.
+      if (["checkout", "switch"].includes(inv.verb)) return hasFlag(a, "-f", "--force", "-b", "-B", "-c") || a.includes("--") ? deny("plain checkout of the previous branch only") : undefined
+      if (inv.verb === "stash") return ["pop", "apply", "list", "show", "drop"].includes(a[0] ?? "") ? undefined : deny("only stash pop / apply / list / drop")
+      return deny("publish only adds, commits, pushes the fix and restores the checkout")
     }
     case "restore":
       if (["checkout", "switch"].includes(inv.verb)) return hasFlag(a, "-f", "--force", "-b", "-B", "-c") || a.includes("--") ? deny("plain checkout of the previous branch only") : undefined

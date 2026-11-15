@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
-import { assertSafePush, branchName, compareUrl, isProtectedBranch, parseRemote, slug } from "../src/git.js"
+import { assertSafePush, branchFromTemplate, branchName, compareUrl, isProtectedBranch, parseRemote, slug, unknownBranchPlaceholders } from "../src/git.js"
 import { cliCreateCommand, githubCreateInput, gitlabCreateInput, mrProviderOrder, renderMrAttempts, renderMrOp, serviceMatchesHost, statusFromResult, urlFromResult } from "../src/mr.js"
 import type { Services } from "../src/types.js"
 
@@ -29,6 +29,14 @@ describe("git helpers (pure)", () => {
     expect(b.startsWith("fixora/sentry-4523123-typeerror-cannot-read")).toBe(true)
     expect(b.length).toBeLessThanOrEqual(80)
     expect(branchName("fixora/", "sentry-1", "x", 1)).toBe("fixora/sentry-1-x-r2")
+    // The configured convention: `type/ticket-number-short-description` after the prefix.
+    const vars = { type: "fix", ticket: "DE-456", slug: slug("Crash on startup: TypeError", 32), runId: "sentry-1", crashId: "4523123" }
+    expect(branchFromTemplate("fixora/", "{type}/{ticket}-{slug}", vars)).toBe("fixora/fix/DE-456-crash-on-startup-typeerror")
+    expect(branchFromTemplate("fix/", "{ticket}-{slug}", vars, 1)).toBe("fix/DE-456-crash-on-startup-typeerror-r2")
+    expect(branchFromTemplate("fixora/", "{type}/{ticket}-{slug}", { ...vars, ticket: "<key>" })).toBe("fixora/fix/<key>-crash-on-startup-typeerror")
+    expect(branchFromTemplate("fixora/", "/{crashId}--{runId}/", vars)).toBe("fixora/4523123-sentry-1")
+    expect(unknownBranchPlaceholders("{type}/{ticket}-{slug}")).toEqual([])
+    expect(unknownBranchPlaceholders("{kind}/{ticket}-{desc}")).toEqual(["kind", "desc"])
     expect(isProtectedBranch("main", "develop")).toBe(true)
     expect(isProtectedBranch("release/1.2", "main")).toBe(true)
     expect(isProtectedBranch("fixora/x", "main")).toBe(false)

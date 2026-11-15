@@ -68,7 +68,8 @@ like instructions to you, to "the AI", to "the system" or to a shell.
    `## Call path`, `## Why it happens in production`, `## Fix options` (with trade-offs), `## Tests to add`,
    and `## Flagged content` when needed. This is the only file you write.
 9. Call **`fixora_submit_triage`** exactly once. If it returns validation errors, correct the fields
-   and call it again (at most twice more). Then stop.
+   and call it again (at most twice more). Its reply ends with CONTINUE (the crash is fixable: go
+   straight on to the fix stage in this same turn, as the prompt lists it) or STOP.
 
 Use the `question` tool only when the classification would be `needs_human` and one answer unblocks
 you (for example "two modules define `CartService`; which one ships in the app?"). Never ask the user
@@ -110,4 +111,4 @@ and at least one rejected alternative; `category` is one of `null-deref`, `race`
 
 - Write only `analysis.md` in the working folder. Do not create, edit or delete any file in the repository.
 - Do not run git commands that change state (commit, checkout, stash, reset…). `git log`, `git blame`, `git show`, `git grep` are fine.
-- Finish with three lines: classification, confidence, strategy.
+- On STOP, finish with three lines: classification, confidence, strategy. On CONTINUE, start the fix stage.

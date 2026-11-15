@@ -65,6 +65,30 @@ export function slug(text: string, max = 40): string {
 }
 
 /** `fixora/sentry-123-null-check-in-cart` (≤ 80 chars); restart suffix `-r2`. */
+export const BRANCH_PLACEHOLDERS = ["type", "ticket", "slug", "runId", "crashId"] as const
+export type BranchPlaceholder = (typeof BRANCH_PLACEHOLDERS)[number]
+
+/** Placeholders a `branchNaming.template` uses that Fixora does not know. */
+export function unknownBranchPlaceholders(template: string): string[] {
+  return [...template.matchAll(/\{([^}]*)\}/g)].map((m) => m[1]!).filter((p) => !(BRANCH_PLACEHOLDERS as readonly string[]).includes(p))
+}
+
+/**
+ * The branch name from the configured naming convention: `<prefix>` + the template with its
+ * placeholders filled in (`{type}/{ticket}-{slug}` → `fixora/fix/DE-456-null-coupon`). Separators
+ * are collapsed; a restart appends `-r<n>` like the default name.
+ */
+export function branchFromTemplate(prefix: string, template: string, vars: Record<BranchPlaceholder, string>, restart = 0): string {
+  const body = template
+    .replace(/\{(type|ticket|slug|runId|crashId)\}/g, (_, k: BranchPlaceholder) => vars[k])
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/\/+/g, "/")
+    .replace(/^[-/]+|[-/]+$/g, "")
+  const base = `${prefix}${body}`.slice(0, 100)
+  return restart > 0 ? `${base}-r${restart + 1}` : base
+}
+
 export function branchName(prefix: string, runId: string, title: string, restart = 0): string {
   const base = `${prefix}${slug(runId, 48)}-${slug(title, 32)}`.replace(/-+/g, "-").slice(0, 76)
   return restart > 0 ? `${base}-r${restart + 1}` : base

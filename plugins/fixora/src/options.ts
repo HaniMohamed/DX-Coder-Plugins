@@ -1,6 +1,7 @@
 // Plugin options from opencode.jsonc ("plugins": [{ "package": ..., "options": {...} }]). Invalid values
 // stop the command with the error list instead of being silently defaulted.
 
+import { unknownBranchPlaceholders } from "./git.js"
 import type { Validation } from "./types.js"
 
 export type Effect3 = "allow" | "deny" | "ask"
@@ -16,6 +17,12 @@ export interface FixoraOptions {
   baseBranch: string
   remote: string
   branchPrefix: string
+  /**
+   * The repository's branch naming convention, applied after `branchPrefix`. Placeholders: `{type}`
+   * (`branchNaming.type`), `{ticket}` (the Jira key; the ticket is then created before the branch),
+   * `{slug}` (crash title), `{runId}`, `{crashId}`. Without a template the agent infers a name.
+   */
+  branchNaming: { template?: string; type: string; example?: string }
   worker: {
     agent: string
     model?: ModelRef
@@ -35,7 +42,7 @@ export interface FixoraOptions {
   maxFixRounds: number
   maxReviewRounds: number
   confidence: { minToFix: number; minToPublish: number; autoApprove: number }
-  approvals: "publish" | "each" | "auto"
+  approvals: "publish" | "auto"
   mode: "fix" | "test-first"
   jira: {
     project?: string
@@ -66,6 +73,7 @@ export const DEFAULTS: FixoraOptions = {
   baseBranch: "main",
   remote: "origin",
   branchPrefix: "fixora/",
+  branchNaming: { type: "fix" },
   worker: { agent: "build", shell: "allow", maxPhaseMinutes: { crash: 5, prepare: 10, triage: 10, fix: 20, review: 10, publish: 10, restore: 5, list: 5 } },
   review: {},
   testCommands: { timeoutSec: 600, fullSuiteMaxMinutes: 15 },
@@ -196,6 +204,11 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
     baseBranch: r.str("baseBranch", d.baseBranch)!,
     remote: r.str("remote", d.remote)!,
     branchPrefix: normalizePrefix(r.str("branchPrefix", d.branchPrefix)!),
+    branchNaming: {
+      template: r.str("branchNaming.template")?.trim() || undefined,
+      type: r.str("branchNaming.type", d.branchNaming.type)!.trim() || d.branchNaming.type,
+      example: r.str("branchNaming.example")?.trim() || undefined,
+    },
     worker: {
       agent: r.str("worker.agent", d.worker.agent)!,
       model: r.model("worker.model"),
@@ -233,7 +246,7 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
       minToPublish: r.num("confidence.minToPublish", d.confidence.minToPublish, { min: 0, max: 1 }),
       autoApprove: r.num("confidence.autoApprove", d.confidence.autoApprove, { min: 0, max: 1 }),
     },
-    approvals: r.oneOf("approvals", ["publish", "each", "auto"] as const, d.approvals),
+    approvals: r.getRaw("approvals") === "each" ? "publish" : r.oneOf("approvals", ["publish", "auto"] as const, d.approvals),
     mode: r.oneOf("mode", ["fix", "test-first"] as const, d.mode),
     jira: {
       project: r.str("jira.project"),
@@ -276,6 +289,12 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
     }
   }
   if (/^(main|master|develop|release|hotfix)\/$/.test(value.branchPrefix)) r.errors.push(`branchPrefix must not be a protected branch name (${value.branchPrefix})`)
+  if (value.branchNaming.template) {
+    const unknown = unknownBranchPlaceholders(value.branchNaming.template)
+    if (unknown.length) r.errors.push(`branchNaming.template: unknown placeholder(s) ${unknown.map((p) => `{${p}}`).join(", ")}; use {type}, {ticket}, {slug}, {runId}, {crashId}`)
+    if (!/\{(ticket|slug|runId|crashId)\}/.test(value.branchNaming.template)) r.errors.push("branchNaming.template must contain {ticket}, {slug}, {runId} or {crashId} so every run gets its own branch")
+    if (/[\s~^:?*[\\]|\.\.|@\{/.test(value.branchNaming.template)) r.errors.push("branchNaming.template contains characters git does not allow in branch names")
+  }
   if (value.jira.parent && !JIRA_KEY.test(value.jira.parent)) r.errors.push(`jira.parent must be an issue key like "DE-62556" (got ${JSON.stringify(value.jira.parent)})`)
   if (/sub-?task/i.test(value.jira.issueType) && !value.jira.parent) r.errors.push(`jira.issueType ${JSON.stringify(value.jira.issueType)} needs "jira": { "parent": "<story key>" }`)
   return r.errors.length > 0 ? { ok: false, errors: r.errors } : { ok: true, value }
@@ -291,12 +310,16 @@ const LEGACY_OPTIONS: Array<[path: string, why: string]> = [
   ["jira.password", "Jira is reached only through a Jira MCP server"],
   ["jira.sslVerify", "Jira is reached only through a Jira MCP server"],
 ]
+const LEGACY_VALUES: Array<[path: string, value: unknown, why: string]> = [["approvals", "each", 'treated as "publish": one approval covers the Jira ticket, the push and the merge request']]
 
 /** Human-readable notes about legacy keys present in the raw options (shown by `/fixora doctor` and once per session). */
 export function legacyOptionWarnings(raw: unknown): string[] {
   if (!isRecord(raw)) return []
   const get = (path: string) => path.split(".").reduce<unknown>((acc, key) => (isRecord(acc) ? acc[key] : undefined), raw)
-  return LEGACY_OPTIONS.filter(([path]) => get(path) !== undefined).map(([path, why]) => `\`${path}\` is ignored: ${why}`)
+  return [
+    ...LEGACY_OPTIONS.filter(([path]) => get(path) !== undefined).map(([path, why]) => `\`${path}\` is ignored: ${why}`),
+    ...LEGACY_VALUES.filter(([path, value]) => get(path) === value).map(([path, value, why]) => `\`${path}: ${JSON.stringify(value)}\` is ${why}`),
+  ]
 }
 
 export const JIRA_KEY = /^[A-Z][A-Z0-9_]*-\d+$/
