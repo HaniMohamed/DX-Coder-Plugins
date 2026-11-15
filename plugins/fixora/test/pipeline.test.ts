@@ -13,6 +13,7 @@ import { slug } from "../src/git.js"
 import { readOptions } from "../src/options.js"
 import type { Runtime } from "../src/progress.js"
 import { loadRun } from "../src/state.js"
+import { eventEmitter } from "../src/rpc.js"
 import { registerPluginTools } from "../src/tools.js"
 import type { RunRecord, WorkerInfo } from "../src/types.js"
 import { mockCtx, toolCtx, type MockCtx, type Worker } from "./mock-ctx.js"
@@ -170,7 +171,13 @@ beforeAll(async () => {
   mock = mockCtx({ directory: repo, options, worker })
   const opts = readOptions(options)
   if (!opts.ok) throw new Error(opts.errors.join())
-  rt = { ctx: mock.ctx, opts: opts.value, services: {}, emit: async (name, data) => void mock.rpcEvents.push({ name, data }), inflight: new Map(), lockPollMs: 5 }
+  // Like the host: an event payload with an `undefined` field fails schema decoding and is refused.
+  const strictHost = async (name: string, data: Record<string, unknown>) => {
+    const bad = Object.entries(data).filter(([, v]) => v === undefined).map(([k]) => k)
+    if (bad.length) throw new Error(`event ${name}: undefined field(s) ${bad.join(", ")}`)
+    mock.rpcEvents.push({ name, data })
+  }
+  rt = { ctx: mock.ctx, opts: opts.value, services: {}, emit: eventEmitter(strictHost, (e) => void (rt.lastEmitError = String(e))), inflight: new Map(), lockPollMs: 5 }
   await registerPluginTools(mock.ctx, { rt: () => rt, isWorkerSession: async (id) => mock.sessions.has(id), start: async () => ({ started: [], errors: [] }) })
   // The checkout the agent "works in": the plugin only ever checks that triaged paths exist here.
   const fs = await import("node:fs/promises")
@@ -246,6 +253,13 @@ describe("pipeline orchestration", () => {
     expect(commitMessage).toContain(`Fixora-Run: ${run.runId}`)
     expect(mock.rpcEvents.some((e) => e.name === "run.started")).toBe(true)
     expect(mock.rpcEvents.filter((e) => e.name === "run.stage").length).toBeGreaterThan(8)
+    // Every stage reached the (strict) host: begin and end of prepare, analyse, fix, review, publish.
+    expect(rt.lastEmitError).toBeUndefined()
+    const stageEvents = mock.rpcEvents.filter((e) => e.name === "run.stage").map((e) => e.data as { step: string; status: string })
+    for (const step of ["prepare", "analyse", "fix", "validate", "review", "publish"]) {
+      expect(stageEvents.some((e) => e.step === step && e.status === "running")).toBe(true)
+      expect(stageEvents.some((e) => e.step === step && e.status === "ok")).toBe(true)
+    }
     expect(mock.rpcEvents.some((e) => e.name === "run.done")).toBe(true)
     const final = mock.synthetics.filter((s) => s.resume).pop()!
     expect(final.text).toContain("finished in")

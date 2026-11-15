@@ -9,7 +9,7 @@ import { ackGate, decideGate } from "./src/gate.js"
 import { DEFAULTS, readOptions, type FixoraOptions } from "./src/options.js"
 import { guardWorkerTool, SHELL_TOOLS, WRITE_TOOLS } from "./src/permissions.js"
 import { describeToolCall, FixoraStop, notify, progress, tell, type Runtime } from "./src/progress.js"
-import { FixoraRpc, prunedHandlers } from "./src/rpc.js"
+import { eventEmitter, FixoraRpc, prunedHandlers } from "./src/rpc.js"
 import { funnel, listCrashIndex, listRuns, loadRun, loadWorker } from "./src/state.js"
 import { registerPluginTools } from "./src/tools.js"
 import type { RunRecord } from "./src/types.js"
@@ -180,13 +180,13 @@ export default Plugin.define({
           return funnel(runs, crashes, { days: (input as { days?: number }).days ?? 30 }) as unknown as Record<string, unknown>
         },
       })
-      rt.emit = async (name, data) => {
-        try {
-          await (reg.events.emit as unknown as (n: string, d: Record<string, unknown>) => Promise<void>)(name, data)
-        } catch {
-          // a TUI may not be attached; events are best effort
-        }
-      }
+      rt.emit = eventEmitter(
+        (name, data) => (reg.events.emit as unknown as (n: string, d: Record<string, unknown>) => Promise<void>)(name, data),
+        (error) => {
+          rt.emitFailures = (rt.emitFailures ?? 0) + 1
+          rt.lastEmitError = describeError(error).slice(0, 300)
+        },
+      )
     } catch {
       // RPC registration is optional (older hosts)
     }

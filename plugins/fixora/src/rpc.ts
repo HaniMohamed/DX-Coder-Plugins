@@ -144,6 +144,21 @@ export interface GatePreview {
  * the value `undefined` fails as "Expected string". Drop such keys (recursively) and turn Dates into
  * ISO strings before a reply leaves a handler.
  */
+/**
+ * Wraps the host's event emitter: payloads are pruned of `undefined` (the host decodes them against
+ * the event schema and rejects `undefined` for optional fields, which silently dropped every stage
+ * event) and failures are counted so `/fixora doctor` can show them.
+ */
+export function eventEmitter(send: (name: string, data: Record<string, unknown>) => Promise<void>, report?: (error: unknown) => void): (name: string, data: Record<string, unknown>) => Promise<void> {
+  return async (name, data) => {
+    try {
+      await send(name, pruneUndefined(data))
+    } catch (error) {
+      report?.(error)
+    }
+  }
+}
+
 export function pruneUndefined<T>(value: T): T {
   if (value instanceof Date) return value.toISOString() as unknown as T
   if (Array.isArray(value)) return value.map(pruneUndefined) as unknown as T

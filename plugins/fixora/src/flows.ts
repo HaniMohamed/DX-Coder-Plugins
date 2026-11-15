@@ -338,7 +338,7 @@ export async function runDoctor(rt: Runtime, input: { sessionID: string; all?: b
     await tell(rt.ctx, input.sessionID, `fixora doctor --tool ${input.tool}`, markdown)
     return markdown
   }
-  let markdown = renderDoctor({ servers, toolIds: tools.map((t) => t.id), services: rt.services, options: rt.opts, all: input.all, warnings: legacyOptionWarnings(rt.ctx.options), version: rt.version })
+  let markdown = renderDoctor({ servers, toolIds: tools.map((t) => t.id), services: rt.services, options: rt.opts, all: input.all, warnings: legacyOptionWarnings(rt.ctx.options), version: rt.version, eventFailures: rt.emitFailures ? `${rt.emitFailures} panel event(s) were refused by the host — last error: ${rt.lastEmitError ?? "?"}` : undefined })
   if (input.probe) markdown += `\n\n${await probeSources(rt, input.sessionID)}`
   await tell(rt.ctx, input.sessionID, "fixora doctor", markdown)
   return markdown

@@ -17,7 +17,7 @@ import { connected } from "./mcp.js"
 import { mrProviderOrder, renderMrAttempts, renderMrOp, type MrProvider } from "./mr.js"
 import { fixFollowUpPrompt, nudgePrompt, opsPrompt, publishPrompt, renderTestFailureText, restorePlan, restoreSteps, SKILLS, workPrompt, type OpStep, type PublishPlan, type TicketPlan, type WorkStage } from "./prompts.js"
 import { appendLog, FixoraStop, notify, present, sourceContext, stageBegin, stageEnd, toolProps, type Runtime } from "./progress.js"
-import { manualRestoreText, renderApprovalPreview, renderCommitMessage, renderCrashMarkdown, renderFinalReport, renderJiraComment, renderJiraIssue, renderMr, renderTriageCard, renderValidationCard } from "./render.js"
+import { renderApprovalPreview, renderCommitMessage, renderCrashMarkdown, renderFinalReport, renderJiraComment, renderJiraIssue, renderMr, renderTriageCard, renderValidationCard } from "./render.js"
 import { ensureRunRepo } from "./repo.js"
 import { latestFixAttempt, runReview } from "./review.js"
 import { scanAddedLines } from "./secrets.js"
@@ -60,6 +60,11 @@ export class Pipeline {
   }
   private log(line: string) {
     return appendLog(this.run.folder, line)
+  }
+  /** What the worker said last (its final message), for failures where it stopped without a report. */
+  private async lastWords(sessionID: string): Promise<string> {
+    const text = (await lastAssistantText(this.rt, sessionID)).replace(/\s+/g, " ").trim()
+    return text ? ` The worker's last message: "${text.slice(0, 500)}${text.length > 500 ? "…" : ""}".` : ""
   }
   /** The reason the last report of this run was refused, for failure messages. */
   private lastRejection(): string {
@@ -348,7 +353,7 @@ export class Pipeline {
     if (stages.includes("triage")) {
       if (!run.triage) {
         if (outcome !== "done") this.stopFor(outcome, "the analysis", budget, "analyse")
-        throw new FixoraStop(`The worker did not produce a valid triage.${this.lastRejection()} See the worker session, then \`/fixora retry ${run.runId} --from analyse\`.`)
+        throw new FixoraStop(`The worker ended its turn without a triage report.${this.lastRejection()}${await this.lastWords(sessionID)} \`/fixora retry ${run.runId} --from analyse\` continues in the same session.`)
       }
       const t = run.triage
       const sc = t.suspectCommits[0]
@@ -366,7 +371,7 @@ export class Pipeline {
       if (!run.fix || run.fix.attempt !== attempt) {
         if (this.o.feedback && outcome === "done") return this.answerOnly(sessionID)
         if (outcome !== "done") this.stopFor(outcome, "the fix stage", budget, "fix")
-        throw new FixoraStop(`The worker did not produce a valid fix report.${this.lastRejection()} \`/fixora retry ${run.runId} --from fix\` to try again.`)
+        throw new FixoraStop(`The worker ended its turn without a fix report.${this.lastRejection()}${await this.lastWords(sessionID)} \`/fixora retry ${run.runId} --from fix\` continues in the same session.`)
       }
       if (!run.fix.changesMade) {
         if (this.o.feedback) return this.answerOnly(sessionID)
@@ -725,10 +730,11 @@ export class Pipeline {
       run.step = outcome.step
       return
     }
-    await stageEnd(this.rt, run, "restore", "failed", result?.errors.join("; ") || "the worker did not report back")
+    const why = result?.errors.join("; ") || "the worker did not report back"
+    await stageEnd(this.rt, run, "restore", "failed", why)
     run.step = outcome.step
     run.error = outcome.error
-    this.notes.push(`⚠ Your checkout is still on \`${run.branch}\`${run.checkout.stashRef ? " and your changes are stashed" : ""}. Restore by hand:\n\`\`\`\n${manualRestoreText(run)}\n\`\`\``)
+    this.notes.push(`⚠ The agent could not restore your checkout (${why}); it is still on \`${run.branch}\`${run.checkout.stashRef ? " and your changes are stashed" : ""}. The commands to run by hand are below.`)
   }
 
   /** One ops prompt in the fixer session (restore on failure paths, ticket on skip). Never throws when `fatal` is false. */

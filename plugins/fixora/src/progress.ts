@@ -31,6 +31,9 @@ export interface Runtime {
   warnedLegacy?: boolean
   /** The plugin version (package.json next to the bundle), shown by detect and doctor so a stale install is visible. */
   version?: string
+  /** TUI events the host refused (schema), for doctor. */
+  emitFailures?: number
+  lastEmitError?: string
 }
 
 export const toolProps = (rt: Runtime, toolId: string): Record<string, unknown> => rt.schemas?.get(toolId)?.props ?? {}
