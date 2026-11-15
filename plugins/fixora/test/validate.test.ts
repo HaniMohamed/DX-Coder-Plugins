@@ -39,6 +39,23 @@ describe("parsePorcelain", () => {
     ])
     expect(parsePorcelain("")).toEqual([])
   })
+  test("parsePorcelain keeps the path when the leading space of an entry was stripped", () => {
+    // " M packages/…" passed through a trim becomes "M packages/…"; slicing at 3 would yield "ackages/…".
+    expect(parsePorcelain("M packages/gosi_core/lib/src/services/auth_token_service.dart\n M lib/b.dart\nD gone.dart\n?? new.dart")).toEqual([
+      { path: "packages/gosi_core/lib/src/services/auth_token_service.dart", status: "modified" },
+      { path: "lib/b.dart", status: "modified" },
+      { path: "gone.dart", status: "deleted" },
+      { path: "new.dart", status: "untracked" },
+    ])
+    expect(parsePorcelain("M  staged.ts\nMM both.ts")).toEqual([
+      { path: "staged.ts", status: "modified" },
+      { path: "both.ts", status: "modified" },
+    ])
+    expect(parsePorcelain("M a\0 M b\0")).toEqual([
+      { path: "a", status: "modified" },
+      { path: "b", status: "modified" },
+    ])
+  })
 })
 
 describe("diffs", () => {

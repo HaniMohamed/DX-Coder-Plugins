@@ -8,9 +8,13 @@ export interface ChangedFile {
 
 export const isHexSha = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{7,64}$/i.test(v)
 
+const STATUS_CHAR = /[ MTADRCU?!]/
+
 /**
  * Parses `git status --porcelain=v1` output, NUL- or newline-separated (`-z` or plain). Rename
  * entries ("R  new -> old" / NUL-separated pairs) keep the new path; directories are dropped.
+ * An entry whose leading space was stripped on the way here ("M path" for " M path": agents and
+ * hosts trim tool output) is read as an unstaged change instead of losing the path's first character.
  */
 export function parsePorcelain(text: string): ChangedFile[] {
   const out: ChangedFile[] = []
@@ -18,10 +22,19 @@ export function parsePorcelain(text: string): ChangedFile[] {
   const parts = nul ? text.split("\0") : text.split(/\r?\n/)
   for (let i = 0; i < parts.length; i++) {
     const entry = parts[i]!
-    if (entry.length < 4) continue
-    const x = entry[0]!
-    const y = entry[1]!
-    let path = entry.slice(3)
+    if (entry.length < 3) continue
+    let x: string
+    let y: string
+    let path: string
+    if (entry[2] === " " && STATUS_CHAR.test(entry[0]!) && STATUS_CHAR.test(entry[1]!)) {
+      x = entry[0]!
+      y = entry[1]!
+      path = entry.slice(3)
+    } else if (entry[1] === " " && entry[2] !== " " && STATUS_CHAR.test(entry[0]!)) {
+      x = " "
+      y = entry[0]!
+      path = entry.slice(2)
+    } else continue
     let status: ChangedFile["status"] = "modified"
     if (x === "?" && y === "?") status = "untracked"
     else if (x === "!" && y === "!") continue

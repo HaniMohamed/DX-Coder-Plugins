@@ -154,12 +154,21 @@ const OPS_SCHEMA = schema({ version: { type: "number", const: 1 }, runId: S, op:
 
 const START_SCHEMA = schema({ refs: A(S), flags: schema({ dryRun: B, ticket: B, mr: B, push: B, auto: B, force: B, testFirst: B }, []) }, ["refs"])
 
+/**
+ * Declared on every tool: the host refuses a result that carries `output` from a tool without an
+ * output schema ("Tool result declared output without an output schema"). The structured value is
+ * `{ ok, message, errors?, … }` (`fixora_start`: `{ started, errors }`); the schema stays open. `message`
+ * repeats the content text because a CodeMode script receives the output only, and the CONTINUE /
+ * STOP instruction must reach the agent that way too.
+ */
+const RESULT_SCHEMA = { type: "object", properties: { ok: B, message: S, errors: A(S) }, additionalProperties: true }
+
 function failure(errors: string[], what: string) {
   const text = `${what} was NOT accepted. Fix these problems and call the tool again:\n- ${errors.join("\n- ")}`
-  return { output: { ok: false, errors }, content: text }
+  return { output: { ok: false, errors, message: text }, content: text }
 }
 
-const ok = (content: string, extra: Record<string, unknown> = {}) => ({ output: { ok: true, ...extra }, content })
+const ok = (content: string, extra: Record<string, unknown> = {}) => ({ output: { ok: true, message: content, ...extra }, content })
 const CONTINUE = (what: string) => `\n\nCONTINUE: ${what}`
 const STOP = (why = "end your turn now") => `\n\nSTOP: ${why}.`
 
@@ -206,6 +215,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
       name: "submit_crashes",
       description: "Fixora lister: submit the raw replies of the crash-source calls you were asked to make (one entry per call, the reply value passed through unchanged). Call it from the same execute script that made the calls, passing the reply variables. Then stop.",
       input: CRASHES_SCHEMA,
+      output: RESULT_SCHEMA,
       options: { namespace: "fixora", codemode: true },
       async execute(input, c) {
         const w = await worker(c.sessionID, "lister")
@@ -234,6 +244,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
       name: "submit_crash",
       description: "Fixora worker (fetch stage): submit the raw replies of the crash fetch (issue, and the sample event when one was fetched), passed through unchanged from the same execute script that made the calls. Validated on receipt; errors tell you which follow-up call to make.",
       input: CRASH_SCHEMA,
+      output: RESULT_SCHEMA,
       options: { namespace: "fixora", codemode: true },
       async execute(input, c) {
         const w = await worker(c.sessionID, "fixer", ["crash"])
@@ -290,6 +301,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
       name: "submit_prepare",
       description: "Fixora worker (prepare stage): report the checkout (stage inspect when it is dirty, so Fixora can ask the user before stashing; stage ready after the fix branch is checked out and the toolchain scanned).",
       input: PREPARE_SCHEMA,
+      output: RESULT_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
         const w = await worker(c.sessionID, "fixer", ["prepare"])
@@ -353,6 +365,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
       name: "submit_triage",
       description: "Fixora worker (analyse stage): submit the root-cause analysis for the current run. Validated on receipt; errors are returned so you can correct and resubmit.",
       input: TRIAGE_SCHEMA,
+      output: RESULT_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
         const w = await worker(c.sessionID, "fixer", ["triage"])
@@ -386,6 +399,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
       name: "submit_ticket",
       description: "Fixora worker (publish turn): report the Jira ticket that was created or reused (or why it failed).",
       input: TICKET_SCHEMA,
+      output: RESULT_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
         const w = await worker(c.sessionID, "fixer", ["prepare", "ticket", "publish", "close-loop"])
@@ -416,6 +430,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
       name: "submit_fix",
       description: "Fixora worker (fix stage): submit the fix report after changing code and running the project's checks, with `status` (git status --porcelain=v1 after git add -N .) and `diff` (git diff HEAD) verbatim. Validated against them, forbidden paths and limits; errors are returned so you can correct and resubmit.",
       input: FIX_SCHEMA,
+      output: RESULT_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
         const w = await worker(c.sessionID, "fixer", ["fix", "feedback"])
@@ -464,6 +479,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
       name: "submit_review",
       description: "Fixora reviewer: submit the review verdict for the current diff. Any blocker finding makes the verdict a rejection.",
       input: REVIEW_SCHEMA,
+      output: RESULT_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
         const w = await worker(c.sessionID, "reviewer")
@@ -486,6 +502,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
       name: "submit_publish",
       description: "Fixora worker (publish turn): report what was committed, pushed and opened as a merge request (partial results are fine; list errors). The prompt's remaining steps (links, restore) follow.",
       input: PUBLISH_SCHEMA,
+      output: RESULT_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
         const w = await worker(c.sessionID, "fixer", ["publish"])
@@ -519,6 +536,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
       name: "submit_ops",
       description: "Fixora worker: report the outcome of an ops step (restore, close-loop, sync, close-mr, jira-comment, clean, annotate).",
       input: OPS_SCHEMA,
+      output: RESULT_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
         const info = await loadWorker(ctx, c.sessionID)
@@ -569,6 +587,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
       name: "start",
       description: 'Start Fixora runs for one or more crash references (e.g. "sentry:12345", "crashlytics:abc", or a crash URL). Use after the user picked crashes from the /fixora list. Not available inside Fixora worker sessions.',
       input: START_SCHEMA,
+      output: RESULT_SCHEMA,
       options: { namespace: "fixora", codemode: false },
       async execute(input, c) {
         if (await deps.isWorkerSession(c.sessionID)) return failure(["fixora_start cannot be called from a worker session"], "start")

@@ -9,6 +9,8 @@ export interface RegisteredTool {
   name: string
   description: string
   input: unknown
+  /** The host refuses a result that carries `output` from a tool that declares no output schema. */
+  output?: unknown
   options?: { namespace?: string; codemode?: boolean }
   execute: (input: unknown, ctx: { sessionID: string; agent: string; messageID: string; id: string; signal: AbortSignal; progress: () => Promise<void> }) => Promise<{ output?: unknown; content?: string }>
 }
