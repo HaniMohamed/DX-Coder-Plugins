@@ -10,6 +10,7 @@ import type { JSX } from "@opentui/solid"
 import { createMemo, createSignal, For, Show, Switch, Match } from "solid-js"
 import type { Store } from "solid-js/store"
 import { bar, fmtDuration, fmtPct, sparkline } from "../render.js"
+import type { FunnelStats } from "../state.js"
 import { awaitingGates, fmtClock, fmtShort, meter, panelRun, relTime, runsForSession, SPINNER, STAGE_TITLES, STATUS_GLYPH, truncate, type GateView, type PanelView, type RunView, type TuiState } from "./store.js"
 
 export interface Fixora {
@@ -94,14 +95,15 @@ function Tabs(props: { fx: Fixora }) {
   const tab = (view: PanelView, label: string) => (
     <S fg={props.fx.state.view === view ? t.text.base : t.text.muted}>{props.fx.state.view === view ? <b>{label}</b> : label}</S>
   )
+  // Rendered INSIDE a <text>, so this must yield spans only (a nested <text> crashes the slot).
   return (
-    <text>
+    <>
       {tab("run", "run")}
       <S fg={t.text.muted}> · </S>
       {tab("runs", "runs")}
       <S fg={t.text.muted}> · </S>
       {tab("report", "report")}
-    </text>
+    </>
   )
 }
 
@@ -111,7 +113,7 @@ export function FixoraPanel(props: { fx: Fixora; panel: PanelInput }) {
   const fx = props.fx
   const t = fx.context.theme
   return (
-    <box flexDirection="column" flexGrow={1} paddingLeft={1} paddingRight={1} backgroundColor={props.panel.presentation === "panel" ? t.background.raised.base : t.background.base}>
+    <box width="100%" height="100%" flexDirection="column" minHeight={0} paddingLeft={1} paddingRight={1} backgroundColor={props.panel.presentation === "panel" ? t.background.raised.base : t.background.base}>
       <Switch>
         <Match when={fx.state.view === "runs"}>
           <RunsView fx={fx} panel={props.panel} />
@@ -182,7 +184,7 @@ function RunDetail(props: { fx: Fixora; panel: PanelInput }) {
         </text>
         <Show when={run()}>
           <text fg={t.text.muted}>
-            {STATUS_LABEL[r().status] ?? r().status} {elapsed()}
+            {`${STATUS_LABEL[r().status] ?? r().status} ${elapsed()}`}
           </text>
         </Show>
       </box>
@@ -197,7 +199,7 @@ function RunDetail(props: { fx: Fixora; panel: PanelInput }) {
               </S>
               <S fg={t.text.muted}> · {truncate(r().title, Math.max(10, width() - r().runId.length - 6))}</S>
             </text>
-            <scrollbox flexGrow={1} scrollY>
+            <scrollbox flexGrow={1} minHeight={0} scrollY>
               <box flexDirection="column">
                 <For each={r().stages}>
                   {(stage) => {
@@ -211,7 +213,7 @@ function RunDetail(props: { fx: Fixora; panel: PanelInput }) {
                           <S fg={stage.status === "pending" ? t.text.muted : t.text.base}>{STAGE_TITLES[stage.step].padEnd(18)}</S>
                           <S fg={t.text.muted}>{truncate(detail(), Math.max(8, width() - 30))}</S>
                           <Show when={(stage.attempt ?? 1) > 1}>
-                            <S fg={t.text.feedback.warning.base}> ×{stage.attempt}</S>
+                            <S fg={t.text.feedback.warning.base}> ×{String(stage.attempt)}</S>
                           </Show>
                         </text>
                         <text fg={t.text.muted}>{right()}</text>
@@ -219,6 +221,23 @@ function RunDetail(props: { fx: Fixora; panel: PanelInput }) {
                     )
                   }}
                 </For>
+                <Show when={r().status === "running" && (r().activity?.length ?? 0) > 0}>
+                  <Rule fx={fx} width={width()} />
+                  <text>
+                    <S fg={t.hue.accent[200]}>{SPINNER[Math.floor(fx.state.now / 250) % SPINNER.length]!} </S>
+                    <S fg={t.text.base}>
+                      <b>Live</b>
+                    </S>
+                    <S fg={t.text.muted}> · {STAGE_TITLES[r().step] ?? r().step} · {fmtClock(fx.state.now - (r().stages.find((s) => s.status === "running")?.startedAt ?? r().startedAt))}</S>
+                  </text>
+                  <For each={(r().activity ?? []).slice(-4)}>
+                    {(line, i) => (
+                      <text fg={i() === (r().activity?.slice(-4).length ?? 1) - 1 ? t.text.base : t.text.muted} wrapMode="none">
+                        {`  ${truncate(line, Math.max(10, width() * 2))}`}
+                      </text>
+                    )}
+                  </For>
+                </Show>
                 <Show when={r().rootCause}>
                   <Rule fx={fx} width={width()} />
                   <box flexDirection="row" justifyContent="space-between">
@@ -258,7 +277,7 @@ function RunDetail(props: { fx: Fixora; panel: PanelInput }) {
                     <text>
                       <S fg={t.text.muted}>Diff      </S>
                       <S fg={t.text.base}>{truncate(r().files!.join("  "), width() - 12)}</S>
-                      <S fg={t.text.muted}> · {r().files!.length} file(s)</S>
+                      <S fg={t.text.muted}> · {String(r().files!.length)} file(s)</S>
                     </text>
                   </Show>
                   <Show when={r().review}>
@@ -287,7 +306,7 @@ function RunDetail(props: { fx: Fixora; panel: PanelInput }) {
                   <Rule fx={fx} width={width()} />
                   <text>
                     <S fg={t.text.feedback.warning.base}>⏸ Awaiting your decision: </S>
-                    <S fg={t.text.base}>{gate()?.summary}</S>
+                    <S fg={t.text.base}>{gate()?.summary ?? ""}</S>
                     <S fg={t.text.muted}> — press a</S>
                   </text>
                 </Show>
@@ -372,11 +391,11 @@ function RunsView(props: { fx: Fixora; panel: PanelInput }) {
           <Tabs fx={fx} />
         </text>
         <text fg={t.text.muted}>
-          {counts().running} running · {counts().awaiting} awaiting you · {counts().done} done
+          {`${counts().running} running · ${counts().awaiting} awaiting you · ${counts().done} done`}
         </text>
       </box>
       <Rule fx={fx} width={width()} />
-      <scrollbox flexGrow={1} scrollY>
+      <scrollbox flexGrow={1} minHeight={0} scrollY>
         <box flexDirection="column">
           <Show when={runs().length === 0}>
             <text fg={t.text.muted}>No runs yet. /fixora picks a crash, /fixora paste {"<file>"} fixes a pasted trace.</text>
@@ -410,11 +429,14 @@ function RunsView(props: { fx: Fixora; panel: PanelInput }) {
 
 // ---------- report view ----------
 
+const EMPTY_REPORT: FunnelStats = { days: 30, total: 0, byStatus: {}, funnel: [], daily: [], timing: { samples: 0 }, mrs: { opened: 0, merged: 0, closed: 0, pending: 0 }, releases: { fixed: 0, reopened: 0, reopenRate: 0 }, top: { platforms: [], versions: [], sources: [] }, recent: [] }
+
 function ReportView(props: { fx: Fixora; panel: PanelInput }) {
   const fx = props.fx
   const t = fx.context.theme
   const width = () => Math.max(40, props.panel.width - 2)
-  const s = () => fx.state.report!
+  // `Show` reads its children eagerly, so never dereference an absent report.
+  const s = () => fx.state.report ?? EMPTY_REPORT
   fx.context.keymap.layer(() => ({
     enabled: () => props.panel.focused,
     commands: [
@@ -437,13 +459,13 @@ function ReportView(props: { fx: Fixora; panel: PanelInput }) {
           <Tabs fx={fx} />
         </text>
         <text fg={t.text.muted}>
-          last {fx.state.report?.days ?? 30} days · {fx.state.report?.total ?? 0} run(s)
+          {`last ${fx.state.report?.days ?? 30} days · ${fx.state.report?.total ?? 0} run(s)`}
         </text>
       </box>
       <Rule fx={fx} width={width()} />
       <Show when={fx.state.report} fallback={<text fg={t.text.muted}>Loading…</text>}>
         {
-          <scrollbox flexGrow={1} scrollY>
+          <scrollbox flexGrow={1} minHeight={0} scrollY>
             <box flexDirection="column" gap={1}>
               <box flexDirection="column">
                 <For each={s().funnel}>
@@ -461,17 +483,17 @@ function ReportView(props: { fx: Fixora; panel: PanelInput }) {
                 <text>
                   <S fg={t.text.muted}>Trend  created </S>
                   <S fg={t.categorical[0]![200]}>{sparkline(s().daily.map((d) => d.created))}</S>
-                  <S fg={t.text.base}> {s().daily.reduce((a, d) => a + d.created, 0)}</S>
+                  <S fg={t.text.base}> {String(s().daily.reduce((a, d) => a + d.created, 0))}</S>
                 </text>
                 <text>
                   <S fg={t.text.muted}>       done    </S>
                   <S fg={t.text.feedback.success.base}>{sparkline(s().daily.map((d) => d.completed))}</S>
-                  <S fg={t.text.base}> {s().daily.reduce((a, d) => a + d.completed, 0)}</S>
+                  <S fg={t.text.base}> {String(s().daily.reduce((a, d) => a + d.completed, 0))}</S>
                 </text>
                 <text>
                   <S fg={t.text.muted}>       failed  </S>
                   <S fg={t.text.feedback.error.base}>{sparkline(s().daily.map((d) => d.failed))}</S>
-                  <S fg={t.text.base}> {s().daily.reduce((a, d) => a + d.failed, 0)}</S>
+                  <S fg={t.text.base}> {String(s().daily.reduce((a, d) => a + d.failed, 0))}</S>
                 </text>
               </box>
               <box flexDirection="column">
@@ -480,11 +502,11 @@ function ReportView(props: { fx: Fixora; panel: PanelInput }) {
                 </text>
                 <text fg={t.text.base}>
                   <S fg={t.text.muted}>MRs      </S>
-                  {s().mrs.opened} opened · {s().mrs.merged} merged · {s().mrs.closed} closed · {s().mrs.pending} pending
+                  {`${s().mrs.opened} opened · ${s().mrs.merged} merged · ${s().mrs.closed} closed · ${s().mrs.pending} pending`}
                 </text>
                 <text fg={t.text.base}>
                   <S fg={t.text.muted}>Releases </S>
-                  {s().releases.fixed} fixed · {s().releases.reopened} reopened ({fmtPct(s().releases.reopenRate)})
+                  {`${s().releases.fixed} fixed · ${s().releases.reopened} reopened (${fmtPct(s().releases.reopenRate)})`}
                 </text>
                 <Show when={s().top.platforms.length}>
                   <text fg={t.text.base}>
@@ -575,7 +597,7 @@ export function GateDialog(props: { fx: Fixora; gate: GateView }) {
             <S fg={t.text.base}>{p().files!.join("  ")}</S>
             <S fg={t.text.muted}>
               {" "}
-              · {p().files!.length} file(s){p().additions !== undefined ? ` · +${p().additions} −${p().deletions ?? 0}` : ""}
+              {` · ${p().files!.length} file(s)${p().additions !== undefined ? ` · +${p().additions} −${p().deletions ?? 0}` : ""}`}
             </S>
           </text>
         </Show>
@@ -639,25 +661,43 @@ export function GateDialog(props: { fx: Fixora; gate: GateView }) {
 
 // ---------- small surfaces ----------
 
+/**
+ * Sidebar block: one row per run of this session with its live timer. The host closes the panel
+ * when the sidebar is shown, so a click on a row (or on the header) reopens the panel on that run.
+ */
 export function SidebarBadge(props: { fx: Fixora; sessionID: string }) {
   const fx = props.fx
   const t = fx.context.theme
   const runs = createMemo(() => runsForSession(fx.state, props.sessionID))
+  const [hover, setHover] = createSignal<string | undefined>(undefined)
+  const open = (runId?: string) => fx.actions.show("run", runId ?? runs()[0]?.runId)
   return (
     <Show when={runs().length > 0}>
-      <box flexDirection="column">
-        <text fg={t.text.base}>
-          <b>Fixora</b>
-        </text>
+      <box flexDirection="column" onMouseUp={() => open()}>
+        <box flexDirection="row" justifyContent="space-between" onMouseOver={() => setHover("header")} onMouseOut={() => setHover(undefined)}>
+          <text fg={t.text.base}>
+            <b>Fixora</b>
+          </text>
+          <text fg={t.text.muted}>{hover() ? "open ▸" : ""}</text>
+        </box>
         <For each={runs().slice(0, 3)}>
           {(r) => (
-            <text>
-              <S fg={tone(fx, r.status)}>{glyphOf(fx, r.status)} </S>
-              <S fg={t.text.muted}>
-                {STAGE_TITLES[r.step] ?? r.step}
-                {r.status === "running" ? ` ${fmtClock(fx.state.now - r.startedAt)}` : r.status === "awaiting-approval" ? " · needs you" : ""}
-              </S>
-            </text>
+            <box
+              onMouseUp={(event) => {
+                event.stopPropagation()
+                open(r.runId)
+              }}
+              onMouseOver={() => setHover(r.runId)}
+              onMouseOut={() => setHover(undefined)}
+            >
+              <text>
+                <S fg={tone(fx, r.status)}>{glyphOf(fx, r.status)} </S>
+                <S fg={hover() === r.runId ? t.text.base : t.text.muted}>
+                  {STAGE_TITLES[r.step] ?? r.step}
+                  {r.status === "running" ? ` ${fmtClock(fx.state.now - r.startedAt)}` : r.status === "awaiting-approval" ? " · needs you" : ""}
+                </S>
+              </text>
+            </box>
           )}
         </For>
       </box>
@@ -672,14 +712,14 @@ export function FooterChip(props: { fx: Fixora }) {
   const awaiting = createMemo(() => awaitingGates(fx.state).length)
   return (
     <Show when={running() + awaiting() > 0}>
-      <box flexShrink={0}>
+      <box flexShrink={0} onMouseUp={() => fx.actions.show("run")}>
         <text>
           <S fg={t.text.muted}>fixora </S>
           <Show when={running() > 0}>
-            <S fg={t.hue.accent[200]}>◐{running()} </S>
+            <S fg={t.hue.accent[200]}>{`◐${running()} `}</S>
           </Show>
           <Show when={awaiting() > 0}>
-            <S fg={t.text.feedback.warning.base}>⏸{awaiting()}</S>
+            <S fg={t.text.feedback.warning.base}>{`⏸${awaiting()}`}</S>
           </Show>
         </text>
       </box>
@@ -696,7 +736,7 @@ export function ComposerStrip(props: { fx: Fixora; sessionID: string }) {
       <box paddingLeft={1}>
         <text>
           <S fg={t.text.feedback.warning.base}>
-            ⏸ Fixora needs a decision on {gate()?.runId}: {gate()?.summary}
+            {`⏸ Fixora needs a decision on ${gate()?.runId ?? ""}: ${gate()?.summary ?? ""}`}
           </S>
           <S fg={t.text.muted}> — /fixora panel then a, or the palette command "Fixora: answer pending approval"</S>
         </text>

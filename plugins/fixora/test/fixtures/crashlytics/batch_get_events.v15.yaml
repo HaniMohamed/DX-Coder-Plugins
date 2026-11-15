@@ -1,0 +1,33 @@
+- name: |
+    projects/10866044419/apps/1:10866044419:android:6352c04266dbc3babba836/events/evt-1
+  eventTime: |
+    '2026-11-13T21:14:02.000Z'
+  issue: |
+    id: 0123456789abcdef0123456789abcdef
+    title: Null check operator used on a null value
+    subtitle: checkout_page.dart - _CheckoutPageState.build
+    errorType: FATAL
+  version: |
+    displayVersion: 3.1.9
+    buildVersion: '319'
+  device: |
+    manufacturer: samsung
+    model: SM-G991B
+  operatingSystem: |
+    displayName: Android 14
+    displayVersion: '14'
+  exceptions: |-
+    _TypeError: Null check operator used on a null value
+    at _CheckoutPageState.build (package:taminaty/ui/checkout_page.dart:301)
+    at _CheckoutPageState._submit(bool) (package:taminaty/ui/checkout_page.dart:287)
+    at CartRepository.load (package:gosi_core/src/cart_repository.dart:42)
+    at StatefulElement.build (package:flutter/src/widgets/framework.dart:5080)
+    at _runGuarded (dart:async/zone.dart:1399)
+  threads: |-
+    Thread: main (crashed)
+    at android.os.Looper.loop (Looper.java:201)
+  logs: |-
+    [2026-11-13T21:14:01Z] opening checkout
+  customKeys: |
+    - key: user_type
+      value: citizen

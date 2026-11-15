@@ -123,3 +123,26 @@ describe("guardWorkerShell", () => {
     expect(guardWorkerShell({ ...r, tool: "shell", input: { command: "ls -la" } })).toContain("only read-only git")
   })
 })
+
+describe("remapToWorktree", () => {
+  const o = { repo: "/Users/me/projects/app", worktree: "/Users/me/.local/share/dxcoder/worktree/abc/fixora-x" }
+  test("rewrites absolute paths of the original checkout onto the worktree", async () => {
+    const { remapToWorktree } = await import("../src/permissions.js")
+    expect(remapToWorktree({ filePath: "/Users/me/projects/app/lib/a/b.dart" }, o)).toEqual({ filePath: `${o.worktree}/lib/a/b.dart` })
+    expect(remapToWorktree({ path: "/Users/me/projects/app" }, o)).toEqual({ path: o.worktree })
+    expect(remapToWorktree({ path: "/Users/me/projects/app-other/x.dart" }, o)).toEqual({ path: "/Users/me/projects/app-other/x.dart" })
+    const same = { path: "lib/a/b.dart" }
+    expect(remapToWorktree(same, o)).toBe(same)
+    expect(remapToWorktree({ path: `${o.worktree}/lib/a.dart` }, o)).toEqual({ path: `${o.worktree}/lib/a.dart` })
+    expect(remapToWorktree({ path: "/Users/me/projects/app/x" }, { worktree: o.worktree })).toEqual({ path: "/Users/me/projects/app/x" })
+    expect(remapToWorktree({ cwd: "/Users/me/projects/app/lib", pattern: "**/*.dart" }, o)).toEqual({ cwd: `${o.worktree}/lib`, pattern: "**/*.dart" })
+  })
+})
+
+describe("isGeneratedChange", () => {
+  test("lockfiles, caches and build outputs are ignored; sources are not", async () => {
+    const { isGeneratedChange } = await import("../src/permissions.js")
+    for (const p of ["pubspec.lock", "packages/core/pubspec.lock", "bun.lock", "web/package-lock.json", ".dart_tool/package_config.json", "packages/ui/.dart_tool/x", "node_modules/a/b.js", "build/app.apk", "ios/Pods/x", ".flutter-plugins-dependencies"]) expect(isGeneratedChange(p)).toBe(true)
+    for (const p of ["lib/cart/service.dart", "test/cart_test.dart", "pubspec.yaml", "src/lock.ts", "README.md"]) expect(isGeneratedChange(p)).toBe(false)
+  })
+})

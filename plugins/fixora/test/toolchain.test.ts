@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { DEFAULTS } from "../src/options.js"
-import { detectEcosystems, isTestFile, mergeOverrides, nearestEcosystems, parseCheckOutput } from "../src/toolchain.js"
+import { buildCheckPlan, capChecks, detectEcosystems, isTestFile, mergeOverrides, nearestEcosystems, parseCheckOutput } from "../src/toolchain.js"
 import { checkChangedFiles, isToolMissing, summarizeChecks } from "../src/validate.js"
 
 let root: string
@@ -55,7 +55,7 @@ describe("detectEcosystems", () => {
     expect(nearestEcosystems(eco, ["apps/mobile/lib/x.dart"]).map((e) => e.id)).toEqual(["flutter"])
     expect(nearestEcosystems(eco, ["apps/mobile/android/app/src/main/A.kt"]).map((e) => e.id)).toEqual(["gradle"])
     expect(nearestEcosystems(eco, ["src/x.ts"]).map((e) => e.id)).toEqual(["node"])
-    expect(nearestEcosystems(eco, []).length).toBe(eco.length)
+    expect(nearestEcosystems(eco, []).map((e) => e.id)).toEqual(["node"])
   })
 
   test("mergeOverrides replaces or disables kinds", async () => {
@@ -102,5 +102,65 @@ describe("checkChangedFiles / summarizeChecks", () => {
     expect(summarizeChecks({ diffHash: "x", commands: [r, { ...r, kind: "lint", exitCode: 1, summary: "" }], allPassed: false })).toBe("unit ✓ (3 passed) · lint ✗")
     expect(isToolMissing({ ...r, exitCode: 127, outputTail: "sh: tsc: command not found" })).toBe(true)
     expect(isToolMissing({ ...r, exitCode: 1, outputTail: "1 fail" })).toBe(false)
+  })
+})
+
+describe("buildCheckPlan (monorepo scoping)", () => {
+  const eco = (id: string, root: string, checks: Array<[string, string, boolean?]>, subset?: (files: string[]) => string | undefined): import("../src/toolchain.js").Ecosystem =>
+    ({ id: id as never, root, bootstrap: [], checks: checks.map(([kind, command, optional]) => ({ kind: kind as never, command, cwd: root, timeoutMs: 1000, optional })), subset, testFilePatterns: [/_test\.dart$/, /\.test\.ts$/], testDirs: ["test"] })
+  const ecosystems = [
+    eco("flutter", "", [["lint", "flutter analyze"], ["unit", "flutter test"]], (f) => (f.length ? `flutter test ${f.join(" ")}` : undefined)),
+    eco("flutter", "packages/core", [["lint", "flutter analyze"], ["unit", "flutter test"]], (f) => (f.length ? `flutter test ${f.join(" ")}` : undefined)),
+    eco("flutter", "packages/ui", [["lint", "flutter analyze"], ["unit", "flutter test"]]),
+    eco("gradle", "android", [["build", "./gradlew compileDebugKotlin", true], ["unit", "./gradlew testDebugUnitTest"]]),
+    eco("xcode", "ios", [["build", "xcodebuild build", true]]),
+  ]
+  const overrides = { timeoutSec: 600, fullSuiteMaxMinutes: 15 }
+  test("only the package owning the changed files, subset then full suite, no duplicates", () => {
+    const plan = buildCheckPlan({ ecosystems, overrides, changedPaths: ["packages/core/lib/a.dart", "packages/core/test/a_test.dart"], scope: "mapped", timeoutMs: 600000, fullSuiteMaxMinutes: 15 })
+    expect(plan.map((c) => `${c.cwd}: ${c.command}`)).toEqual(["packages/core: flutter analyze", "packages/core: flutter test test/a_test.dart", "packages/core: flutter test"])
+  })
+  test("root-level files run only the root ecosystem, never every nested package or the native builds", () => {
+    const plan = buildCheckPlan({ ecosystems, overrides, changedPaths: ["lib/main.dart"], scope: "mapped", timeoutMs: 600000, fullSuiteMaxMinutes: 15 })
+    expect(plan.map((c) => c.command)).toEqual(["flutter analyze", "flutter test"])
+    expect(nearestEcosystems(ecosystems, []).map((e) => e.root)).toEqual([""])
+    expect(nearestEcosystems(ecosystems, ["docs/x.md"]).map((e) => e.root)).toEqual([""])
+  })
+  test("android changes run the gradle checks; skip scope drops tests; cap keeps priority", () => {
+    const plan = buildCheckPlan({ ecosystems, overrides, changedPaths: ["android/app/src/main/A.kt"], scope: "mapped", timeoutMs: 600000, fullSuiteMaxMinutes: 15 })
+    expect(plan.map((c) => c.command)).toEqual(["./gradlew compileDebugKotlin", "./gradlew testDebugUnitTest"])
+    expect(buildCheckPlan({ ecosystems, overrides, changedPaths: ["android/app/src/main/A.kt"], scope: "skip", timeoutMs: 600000, fullSuiteMaxMinutes: 15 }).map((c) => c.kind)).toEqual(["build"])
+    const many = Array.from({ length: 12 }, (_, i) => ({ kind: (i % 2 ? "build" : "lint") as never, command: `c${i}`, cwd: "", timeoutMs: 1, optional: i > 9 }))
+    const capped = capChecks(many, 8)
+    expect(capped).toHaveLength(8)
+    expect(capped.filter((c) => c.optional)).toHaveLength(0)
+    expect(capped.filter((c) => c.kind === "lint")).toHaveLength(5)
+  })
+})
+
+describe("bootstrap of a fresh worktree", () => {
+  test("flutter needs pub get until packages are resolved; fvm is honoured; node installs when node_modules is missing", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "fixora-bootstrap-"))
+    try {
+      await writeFile(join(dir, "pubspec.yaml"), "name: app\ndependencies:\n  flutter:\n    sdk: flutter\n")
+      await writeFile(join(dir, ".fvmrc"), '{"flutter":"3.24.0"}')
+      await mkdir(join(dir, "web"), { recursive: true })
+      await writeFile(join(dir, "web", "package.json"), JSON.stringify({ name: "web", scripts: { test: "vitest run" }, devDependencies: { vitest: "^2" } }))
+      await writeFile(join(dir, "web", "pnpm-lock.yaml"), "")
+      const eco = await detectEcosystems(dir)
+      const flutter = eco.find((e) => e.id === "flutter")!
+      expect(flutter.bootstrap.map((c) => c.command)).toEqual(["fvm flutter pub get"])
+      expect(flutter.checks.map((c) => c.command)).toEqual(["fvm flutter analyze", "fvm flutter test"])
+      const node = eco.find((e) => e.id === "node")!
+      expect(node.bootstrap.map((c) => c.command)).toEqual(["pnpm install --frozen-lockfile"])
+      const plan = buildCheckPlan({ ecosystems: eco, overrides: { timeoutSec: 600, fullSuiteMaxMinutes: 15 }, changedPaths: ["lib/main.dart"], scope: "mapped", timeoutMs: 600000, fullSuiteMaxMinutes: 15 })
+      expect(plan.map((c) => `${c.kind}:${c.command}`)).toEqual(["setup:fvm flutter pub get", "lint:fvm flutter analyze", "unit:fvm flutter test"])
+      expect(plan[0]!.timeoutMs).toBeGreaterThanOrEqual(15 * 60_000)
+      await mkdir(join(dir, ".dart_tool"), { recursive: true })
+      await writeFile(join(dir, ".dart_tool", "package_config.json"), "{}")
+      expect((await detectEcosystems(dir)).find((e) => e.id === "flutter")!.bootstrap).toEqual([])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

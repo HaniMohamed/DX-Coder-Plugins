@@ -8,17 +8,19 @@ import { join } from "node:path"
 import type { Flags } from "./command.js"
 import { git } from "./git.js"
 import { connectJira } from "./jira.js"
-import { connected, detectServices, INSTALL_SOURCES, listServers, renderDoctor } from "./mcp.js"
+import { connected, detectServices, INSTALL_SOURCES, listServers, renderDoctor, renderToolSchema } from "./mcp.js"
 import { Pipeline } from "./pipeline.js"
+import { ensureRunRepo, sessionRepo, type SessionRepo } from "./repo.js"
 import { FixoraStop, notify, present, tell, type Runtime } from "./progress.js"
 import { renderCrashTable, renderFunnelReport, renderJiraComment, renderRunsTable, renderRunStatus } from "./render.js"
 import { availableSources, listTopCrashes, resolveRef, runIdFor } from "./sources/index.js"
 import { acquireLock, funnel, keys, listCrashIndex, listRuns, loadCrashIndex, loadRun, now, releaseLock, resumePoint, saveCrashIndex, saveRun, TERMINAL } from "./state.js"
 import type { CrashSummary, RunRecord, Source, Step } from "./types.js"
+import { describeError } from "./errors.js"
 
-export const folderFor = (rt: Runtime, runId: string) => join(rt.ctx.location.directory, ".dxcoder", "fixora", runId)
+export const folderFor = (repo: string, runId: string) => join(repo, ".dxcoder", "fixora", runId)
 
-export function newRun(rt: Runtime, o: { runId: string; source: Source; crashId: string; sessionID: string; flags: Flags; refExtra?: Record<string, string>; title?: string }): RunRecord {
+export function newRun(rt: Runtime, o: { runId: string; source: Source; crashId: string; sessionID: string; flags: Flags; refExtra?: Record<string, string>; title?: string; repo: SessionRepo }): RunRecord {
   const at = now()
   return {
     version: 1,
@@ -28,6 +30,8 @@ export function newRun(rt: Runtime, o: { runId: string; source: Source; crashId:
     fingerprint: "",
     title: o.title ?? o.runId,
     originSessionID: o.sessionID,
+    repo: o.repo.repo,
+    projectID: o.repo.projectID,
     createdAt: at,
     updatedAt: at,
     step: "detect",
@@ -41,7 +45,7 @@ export function newRun(rt: Runtime, o: { runId: string; source: Source; crashId:
     pipeline: { analysed: false, ticketed: false, fixed: false, validated: false, reviewed: false, committed: false, pushed: false, mrOpened: false, loopClosed: false },
     timings: {},
     approvals: {},
-    folder: folderFor(rt, o.runId),
+    folder: folderFor(o.repo.repo, o.runId),
     meta: { ...(o.refExtra ? { refExtra: JSON.stringify(o.refExtra) } : {}), ...(o.flags.forceTriage ? { forceTriage: true } : {}), ...(o.flags.tests ? { tests: o.flags.tests } : {}) },
   }
 }
@@ -67,7 +71,7 @@ export async function startPipeline(rt: Runtime, run: RunRecord, o: { from: Step
 
 // ---------- list ----------
 
-export async function runList(rt: Runtime, input: { sessionID: string; top?: number; minUsers?: number; source?: Source }): Promise<{ crashes: CrashSummary[]; markdown: string }> {
+export async function runList(rt: Runtime, input: { sessionID: string; top?: number; minUsers?: number; source?: Source }): Promise<{ crashes: CrashSummary[]; markdown: string; errors: string[] }> {
   await refreshServices(rt)
   const sources = availableSources(rt.services, rt.opts)
   if (sources.length === 0) {
@@ -89,10 +93,11 @@ export async function runList(rt: Runtime, input: { sessionID: string; top?: num
   }
   const table = renderCrashTable(crashes, { states })
   const markdown = [`### Fixora · top crashes (${sources.map((s) => s.id).join(", ")})`, "", table, ...(errors.length ? ["", `Errors: ${errors.join("; ")}`] : [])].join("\n")
-  const file = join(rt.ctx.location.directory, ".dxcoder", "fixora", "crashes.md")
-  await mkdir(join(rt.ctx.location.directory, ".dxcoder", "fixora"), { recursive: true })
+  const where = await sessionRepo(rt.ctx, input.sessionID)
+  const file = join(where.repo, ".dxcoder", "fixora", "crashes.md")
+  await mkdir(join(where.repo, ".dxcoder", "fixora"), { recursive: true })
   await writeFile(file, `${markdown}\n`)
-  return { crashes, markdown }
+  return { crashes, markdown, errors }
 }
 
 export async function presentList(rt: Runtime, sessionID: string, list: { crashes: CrashSummary[]; markdown: string }) {
@@ -141,7 +146,8 @@ export async function prepareRun(rt: Runtime, input: StartInput): Promise<RunRec
     }
     await Pipeline.moveToHistory(existing.folder, input.flags.force ? ["trace.txt"] : ["crash.json", "crash.md", "run.log", "trace.txt"])
   }
-  const run = newRun(rt, { runId, source: resolved.source, crashId: resolved.id, sessionID: input.sessionID, flags: input.flags, refExtra: resolved.extra })
+  const repo = await sessionRepo(rt.ctx, input.sessionID)
+  const run = newRun(rt, { runId, source: resolved.source, crashId: resolved.id, sessionID: input.sessionID, flags: input.flags, refExtra: resolved.extra, repo })
   if (existing?.reopened) run.reopened = existing.reopened
   // A pasted trace lives in the run folder; keep pointing at it when the crash is re-run or restarted.
   if (!resolved.extra && existing?.meta?.refExtra) run.meta = { ...run.meta, refExtra: existing.meta.refExtra }
@@ -159,14 +165,15 @@ export async function runFix(rt: Runtime, input: StartInput): Promise<RunRecord>
 }
 
 export async function runPaste(rt: Runtime, input: { sessionID: string; file: string; title?: string; platform?: string; language?: string; flags: Flags }): Promise<RunRecord> {
-  const path = input.file.startsWith("/") ? input.file : join(rt.ctx.location.directory, input.file)
+  const where = await sessionRepo(rt.ctx, input.sessionID)
+  const path = input.file.startsWith("/") ? input.file : join(where.directory, input.file)
   if (!existsSync(path)) throw new FixoraStop(`File not found: ${path}`)
   const { crashFromText } = await import("./sources/manual.js")
   const text = await Bun.file(path).text()
   const crash = crashFromText({ text, title: input.title, platform: input.platform, language: input.language as never, appPackage: rt.opts.appPackage, inAppPrefixes: rt.opts.inAppPackages })
   if (crash.frames.length === 0) throw new FixoraStop("Could not parse any stack frame from the file. Supported: Dart/Flutter, Kotlin/Java, Swift/Objective-C, JavaScript/TypeScript, Python, Go, .NET, or any lines with path:line.")
   const runId = runIdFor("manual", crash.id)
-  const folder = folderFor(rt, runId)
+  const folder = folderFor(where.repo, runId)
   await mkdir(folder, { recursive: true })
   const copy = join(folder, "trace.txt")
   await copyFile(path, copy)
@@ -198,7 +205,7 @@ export async function runTop(rt: Runtime, input: { sessionID: string; count: num
       const run = await runFix(rt, { sessionID: input.sessionID, ref: `${c.source}:${c.id}`, flags: input.flags })
       started.push(`${run.runId} (${run.status})`)
     } catch (error) {
-      errors.push(`${c.source}:${c.id}: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`)
+      errors.push(`${c.source}:${c.id}: ${describeError(error).split("\n")[0]}`)
     }
   }
   return { started, errors }
@@ -225,12 +232,42 @@ export async function runReport(rt: Runtime, input: { sessionID: string; days: n
   await present(rt.ctx, input.sessionID, `fixora report: ${stats.total} run(s) in ${input.days} days`, renderFunnelReport(stats))
 }
 
-export async function runDoctor(rt: Runtime, input: { sessionID: string }) {
+export async function runDoctor(rt: Runtime, input: { sessionID: string; all?: boolean; probe?: boolean; tool?: string }) {
   await refreshServices(rt)
   const [servers, tools] = await Promise.all([listServers(rt.ctx), rt.ctx.tool.list()])
-  const markdown = renderDoctor({ servers, toolIds: tools.map((t) => t.id), services: rt.services, options: rt.opts })
+  if (input.tool) {
+    const markdown = renderToolSchema(input.tool, tools.find((t) => t.id === input.tool) as never)
+    await tell(rt.ctx, input.sessionID, `fixora doctor --tool ${input.tool}`, markdown)
+    return markdown
+  }
+  let markdown = renderDoctor({ servers, toolIds: tools.map((t) => t.id), services: rt.services, options: rt.opts, all: input.all })
+  if (input.probe) markdown += `\n\n${await probeSources(rt, input.sessionID)}`
   await tell(rt.ctx, input.sessionID, "fixora doctor", markdown)
   return markdown
+}
+
+/** `/fixora doctor --probe`: one real call per crash source and app, raw reply (truncated) or the exact error. */
+export async function probeSources(rt: Runtime, sessionID: string): Promise<string> {
+  const L: string[] = ["### Probe (one live call per source)", ""]
+  const sc = { ctx: rt.ctx, services: rt.services, options: rt.opts, sessionID }
+  const clip = (v: unknown) => {
+    const text = typeof v === "string" ? v : JSON.stringify(v, null, 1)
+    return text.length > 1800 ? `${text.slice(0, 1800)}\n… (${text.length - 1800} more chars)` : text
+  }
+  for (const source of availableSources(rt.services, rt.opts)) {
+    if (!source.probe) continue
+    for (const p of await source.probe(sc)) {
+      L.push(`**${source.id}${p.label ? ` · ${p.label}` : ""}** → \`${p.toolId}\` with input:`, "", "```json", JSON.stringify(p.input), "```")
+      if (p.error) L.push("", `Error: ${p.error}`)
+      else {
+        const summaries = p.parsedCount !== undefined ? ` · mapped to ${p.parsedCount} crash(es)` : ""
+        L.push("", `Reply (${typeof p.raw === "string" ? "text" : "object"}${summaries}):`, "", "```", clip(p.raw), "```")
+      }
+      L.push("")
+    }
+  }
+  if (L.length === 2) L.push("- no crash source is available to probe")
+  return L.join("\n")
 }
 
 export async function runSync(rt: Runtime, input: { sessionID: string }) {
@@ -252,6 +289,7 @@ export async function runSync(rt: Runtime, input: { sessionID: string }) {
 export async function runRetry(rt: Runtime, input: { sessionID: string; runId: string; from?: Step; fresh: boolean; flags: Flags }): Promise<RunRecord> {
   const run = await loadRun(rt.ctx, input.runId)
   if (!run) throw new FixoraStop(`No run ${input.runId}.`)
+  await ensureRunRepo(rt.ctx, run)
   if (rt.inflight.has(run.runId)) throw new FixoraStop(`Run ${run.runId} is still in progress.`)
   await refreshServices(rt)
   run.originSessionID = input.sessionID
@@ -264,7 +302,7 @@ export async function runRetry(rt: Runtime, input: { sessionID: string; runId: s
   if (!input.flags.push) run.flags.push = false
   if (input.flags.auto) run.flags.auto = true
   if (input.fresh && run.worktree) {
-    await rt.ctx.worktree.remove({ projectID: rt.ctx.location.project.id, directory: run.worktree, force: true } as never).catch(() => {})
+    await rt.ctx.worktree.remove({ projectID: run.projectID, directory: run.worktree, force: true } as never).catch(() => {})
     run.worktree = undefined
     run.sessions = {}
   }
@@ -283,6 +321,7 @@ export async function runRetry(rt: Runtime, input: { sessionID: string; runId: s
 export async function runFeedback(rt: Runtime, input: { sessionID: string; runId: string; message: string }): Promise<RunRecord> {
   const run = await loadRun(rt.ctx, input.runId)
   if (!run) throw new FixoraStop(`No run ${input.runId}.`)
+  await ensureRunRepo(rt.ctx, run)
   if (rt.inflight.has(run.runId)) throw new FixoraStop(`Run ${run.runId} is still in progress.`)
   if (!run.worktree || !existsSync(run.worktree)) throw new FixoraStop(`Run ${run.runId} has no worktree any more. \`/fixora retry ${run.runId} --fresh\` to recreate it.`)
   await refreshServices(rt)
@@ -300,7 +339,7 @@ export async function runFeedback(rt: Runtime, input: { sessionID: string; runId
   } catch (error) {
     rt.inflight.delete(run.runId)
     run.status = "failed"
-    run.error = error instanceof Error ? error.message : String(error)
+    run.error = describeError(error)
     await saveRun(rt.ctx, run)
     throw error
   }
@@ -314,6 +353,7 @@ export async function runFeedback(rt: Runtime, input: { sessionID: string; runId
 export async function runRestart(rt: Runtime, input: { sessionID: string; runId: string; flags: Flags }): Promise<RunRecord> {
   const run = await loadRun(rt.ctx, input.runId)
   if (!run) throw new FixoraStop(`No run ${input.runId}.`)
+  await ensureRunRepo(rt.ctx, run)
   await refreshServices(rt)
   const inflight = rt.inflight.get(run.runId)
   if (inflight) {
@@ -328,7 +368,7 @@ export async function runRestart(rt: Runtime, input: { sessionID: string; runId:
     await jira?.port.comment(run.jiraKey, renderJiraComment("restart", run)).catch(() => {})
   }
   if (run.worktree) {
-    await rt.ctx.worktree.remove({ projectID: rt.ctx.location.project.id, directory: run.worktree, force: true } as never).catch(() => {})
+    await rt.ctx.worktree.remove({ projectID: run.projectID, directory: run.worktree, force: true } as never).catch(() => {})
   }
   await Pipeline.moveToHistory(run.folder)
   run.originSessionID = input.sessionID
@@ -363,6 +403,7 @@ export async function runRestart(rt: Runtime, input: { sessionID: string; runId:
 export async function runFixed(rt: Runtime, input: { sessionID: string; runId: string; release: string; platform?: string }) {
   const run = await loadRun(rt.ctx, input.runId)
   if (!run) throw new FixoraStop(`No run ${input.runId}.`)
+  await ensureRunRepo(rt.ctx, run)
   const index = (await loadCrashIndex(rt.ctx, run.fingerprint)) ?? { fingerprint: run.fingerprint, runIds: [run.runId], reopened: { count: 0 } }
   index.fixedIn = { release: input.release, platform: input.platform, markedBy: input.sessionID, at: now(), runId: run.runId }
   index.reopened = { count: 0 }
@@ -380,15 +421,16 @@ export async function runFixed(rt: Runtime, input: { sessionID: string; runId: s
 export async function runClean(rt: Runtime, input: { sessionID: string; runId: string; remote: boolean }) {
   const run = await loadRun(rt.ctx, input.runId)
   if (!run) throw new FixoraStop(`No run ${input.runId}.`)
+  await ensureRunRepo(rt.ctx, run)
   if (rt.inflight.has(run.runId)) throw new FixoraStop(`Run ${run.runId} is in progress; restart or wait first.`)
   const notes: string[] = []
   if (run.worktree) {
-    await rt.ctx.worktree.remove({ projectID: rt.ctx.location.project.id, directory: run.worktree, force: true } as never).then(() => notes.push(`removed worktree ${run.worktree}`), (e: Error) => notes.push(`worktree removal failed: ${e.message}`))
+    await rt.ctx.worktree.remove({ projectID: run.projectID, directory: run.worktree, force: true } as never).then(() => notes.push(`removed worktree ${run.worktree}`), (e: Error) => notes.push(`worktree removal failed: ${e.message}`))
     run.worktree = undefined
   }
   if (input.remote && run.branch && run.pipeline.pushed) {
     await rt.ctx.permission.assert({ sessionID: input.sessionID as never, action: "fixora.delete-branch", resources: [`delete remote branch ${run.base.remote}/${run.branch}`], metadata: { runId: run.runId } })
-    await git.deleteRemoteBranch(rt.ctx.location.directory, run.base.remote, run.branch, run.base.branch).then(() => notes.push(`deleted ${run.base.remote}/${run.branch}`), (e: Error) => notes.push(`remote branch deletion failed: ${e.message}`))
+    await git.deleteRemoteBranch(run.repo, run.base.remote, run.branch, run.base.branch).then(() => notes.push(`deleted ${run.base.remote}/${run.branch}`), (e: Error) => notes.push(`remote branch deletion failed: ${e.message}`))
   }
   run.sessions = {}
   await saveRun(rt.ctx, run)

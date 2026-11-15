@@ -90,7 +90,7 @@ export async function runReview(rt: Runtime, input: ReviewInput): Promise<Review
   const sessionID = (session as { id: string }).id
   run.sessions.reviewer = sessionID
   await saveRun(rt.ctx, run)
-  await saveWorker(rt.ctx, sessionID, { runId: run.runId, role: "reviewer", worktree: input.worktree, phase: "review" })
+  await saveWorker(rt.ctx, sessionID, { runId: run.runId, role: "reviewer", worktree: input.worktree, phase: "review", repo: run.repo })
   const files = ["crash.md", "triage.json", `fix.${latestFixAttempt(run)}.json`, `diff.${attempt}.patch`, `verification.${attempt}.json`, "project.md"].map((name) => ({ uri: pathToFileURL(join(run.folder, name)).href, name }))
   const text = [
     `Review the crash fix for run ${run.runId} (review attempt ${attempt}). Worktree: ${input.worktree}.`,

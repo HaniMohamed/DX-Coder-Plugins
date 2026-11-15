@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { DEFAULTS } from "../src/options.js"
-import { crashlytics, crashlyticsRef, hasIssue, mapCrashlyticsIssue, mapCrashlyticsList, platformOfAppId } from "../src/sources/crashlytics.js"
+import { parseToolText } from "../src/mcp.js"
+import { crashlytics, crashlyticsRef, hasIssue, mapCrashlyticsIssue, mapCrashlyticsList, parseFormattedFrames, platformOfAppId, sampleEventOf } from "../src/sources/crashlytics.js"
 import type { SourceContext } from "../src/sources/types.js"
 import { resolveRef, runIdFor } from "../src/sources/index.js"
 import { crashFromText } from "../src/sources/manual.js"
@@ -19,6 +20,7 @@ describe("resolveRef", () => {
     expect(resolveRef("https://console.firebase.google.com/project/my-proj/crashlytics/app/1:123:android:abc/issues/deadbeef", DEFAULTS)).toMatchObject({ source: "crashlytics", id: "deadbeef", extra: { appId: "1:123:android:abc", project: "my-proj" } })
     expect(resolveRef("crashlytics:deadbeef@1:10866044419:ios:6b0c10a898bd6acdbba836", DEFAULTS)).toEqual({ source: "crashlytics", id: "deadbeef", extra: { appId: "1:10866044419:ios:6b0c10a898bd6acdbba836" } })
     expect(resolveRef("crashlytics:deadbeef", DEFAULTS)).toEqual({ source: "crashlytics", id: "deadbeef", extra: undefined })
+    expect(resolveRef("https://console.firebase.google.com/v1/appid/project/taminaty-2e06a/crashlytics/app/1:10866044419:ios:6b0c10a898bd6acdbba836/issues/88cbff17cf699dfe71d7f529d3f0b704?&time=1793410611000:1794620211000", DEFAULTS)).toMatchObject({ source: "crashlytics", id: "88cbff17cf699dfe71d7f529d3f0b704", extra: { appId: "1:10866044419:ios:6b0c10a898bd6acdbba836", project: "taminaty-2e06a" } })
     expect(crashlyticsRef("deadbeef")).toBe("crashlytics:deadbeef")
     expect(crashlyticsRef("deadbeef", "1:1:ios:a")).toBe("crashlytics:deadbeef@1:1:ios:a")
     expect(resolveRef("manual:abc", DEFAULTS)).toMatchObject({ source: "manual", id: "abc" })
@@ -122,11 +124,12 @@ describe("crashlytics across several apps", () => {
   const IOS = "1:10866044419:ios:6b0c10a898bd6acdbba836"
   function fakeContext(appIds: string[], calls: Array<{ tool: string; input: Record<string, unknown> }>): SourceContext {
     const tools = {
-      firebase_crashlytics_get_report: async (input: Record<string, unknown>) => ({ issues: input.app_id === ANDROID ? [{ id: "a1", title: "NPE", issueStats: { userCount: 10 } }] : [{ id: "i1", title: "EXC_BAD_ACCESS", issueStats: { userCount: 40 } }, { id: "shared", title: "Null check", issueStats: { userCount: 3 } }] }),
-      firebase_crashlytics_get_issue: async (input: Record<string, unknown>) => {
-        if (input.app_id === ANDROID && input.issue_id === "a1") return { id: "a1", title: "NPE" }
-        if (input.app_id === IOS && input.issue_id === "i1") return { id: "i1", title: "EXC_BAD_ACCESS" }
-        if (input.app_id === IOS && input.issue_id === "boom") throw new Error("PERMISSION_DENIED")
+      firebase_crashlytics_get_report: async (input: Record<string, unknown>) => ({ issues: (input.appId ?? input.app_id) === ANDROID ? [{ id: "a1", title: "NPE", issueStats: { userCount: 10 } }] : [{ id: "i1", title: "EXC_BAD_ACCESS", issueStats: { userCount: 40 } }, { id: "shared", title: "Null check", issueStats: { userCount: 3 } }] }),
+      firebase_crashlytics_get_issue: async (raw: Record<string, unknown>) => {
+        const input = { app: raw.appId ?? raw.app_id, issue: raw.issueId ?? raw.issue_id }
+        if (input.app === ANDROID && input.issue === "a1") return { id: "a1", title: "NPE" }
+        if (input.app === IOS && input.issue === "i1") return { id: "i1", title: "EXC_BAD_ACCESS" }
+        if (input.app === IOS && input.issue === "boom") throw new Error("PERMISSION_DENIED")
         return "Issue not found"
       },
     }
@@ -149,7 +152,8 @@ describe("crashlytics across several apps", () => {
   test("list queries every app, tags the platform and builds app-qualified refs", async () => {
     const calls: Array<{ tool: string; input: Record<string, unknown> }> = []
     const list = await crashlytics.list!(fakeContext([ANDROID, IOS], calls), { top: 5 })
-    expect(calls.filter((c) => c.tool === "firebase_crashlytics_get_report").map((c) => c.input.app_id)).toEqual([ANDROID, IOS])
+    expect(calls.filter((c) => c.tool === "firebase_crashlytics_get_report").map((c) => c.input.appId)).toEqual([ANDROID, IOS])
+    expect(calls[0]!.input).toMatchObject({ report: "topIssues", pageSize: 5, filter: { issueErrorTypes: ["FATAL"] } })
     expect(list.map((c) => [c.id, c.platform, c.ref])).toEqual([
       ["i1", "ios", `crashlytics:i1@${IOS}`],
       ["a1", "android", `crashlytics:a1@${ANDROID}`],
@@ -167,11 +171,11 @@ describe("crashlytics across several apps", () => {
     const direct = await crashlytics.get(sc, "i1", { appId: IOS })
     expect(direct.appId).toBe(IOS)
     expect(direct.platform).toBe("ios")
-    expect(calls.map((c) => c.input.app_id)).toEqual([IOS])
+    expect(calls.map((c) => c.input.appId)).toEqual([IOS])
     calls.length = 0
     const probed = await crashlytics.get(sc, "i1")
     expect(probed.appId).toBe(IOS)
-    expect(calls.map((c) => c.input.app_id)).toEqual([ANDROID, IOS])
+    expect(calls.map((c) => c.input.appId)).toEqual([ANDROID, IOS])
     await expect(crashlytics.get(sc, "nope")).rejects.toThrow("not found in any configured app")
     await expect(crashlytics.get(sc, "boom")).rejects.toThrow("PERMISSION_DENIED")
     await expect(crashlytics.get(fakeContext([], []), "a1")).rejects.toThrow("Firebase app id")
@@ -183,5 +187,70 @@ describe("crashlytics across several apps", () => {
     expect(hasIssue("Issue not found")).toBe(false)
     expect(hasIssue({ error: { code: 404 } })).toBe(false)
     expect(hasIssue({})).toBe(false)
+  })
+})
+
+describe("crashlytics via firebase-tools 15 (YAML text, camelCase schema)", () => {
+  const text = (p: string) => readFileSync(join(import.meta.dir, "fixtures", p), "utf8")
+
+  test("top issues report: nested YAML groups, metrics, versions", () => {
+    const list = mapCrashlyticsList(text("crashlytics/get_report.topIssues.v15.yaml"))
+    expect(list.map((c) => [c.id, c.userCount, c.eventCount, c.appVersion])).toEqual([
+      ["0123456789abcdef0123456789abcdef", 612, 1402, "3.1.9"],
+      ["fedcba9876543210fedcba9876543210", 97, 200, "3.1.8"],
+    ])
+    expect(list[0]!.title).toBe("Null check operator used on a null value")
+    expect(list[0]!.url).toContain("/issues/0123456789abcdef0123456789abcdef")
+  })
+
+  test("issue + sample event: text-formatted exceptions become frames with Dart packages", () => {
+    const issue = parseToolText(text("crashlytics/get_issue.v15.yaml"))
+    expect(hasIssue(issue)).toBe(true)
+    expect(sampleEventOf(issue)).toBe("projects/10866044419/apps/1:10866044419:android:6352c04266dbc3babba836/events/evt-1")
+    const events = parseToolText(text("crashlytics/batch_get_events.v15.yaml"))
+    const crash = mapCrashlyticsIssue(issue, events, { id: "0123456789abcdef0123456789abcdef", appId: "1:10866044419:android:6352c04266dbc3babba836", hints: { appPackage: "taminaty", inAppPrefixes: ["gosi_core"] } })
+    expect(crash.language).toBe("dart")
+    expect(crash.platform).toBe("android")
+    expect(crash.exceptionType).toBe("_TypeError")
+    expect(crash.message).toBe("Null check operator used on a null value")
+    expect(crash.appVersion).toBe("3.1.9")
+    expect(crash.buildNumber).toBe("319")
+    expect(crash.frames.map((f) => [f.package, f.file, f.line, f.inApp])).toEqual([
+      ["taminaty", "ui/checkout_page.dart", 301, true],
+      ["taminaty", "ui/checkout_page.dart", 287, true],
+      ["gosi_core", "src/cart_repository.dart", 42, true],
+      ["flutter", "src/widgets/framework.dart", 5080, false],
+      [undefined, "dart:async/zone.dart", 1399, false],
+    ])
+    expect(crash.frames[1]!.function).toBe("_CheckoutPageState._submit(bool)")
+    expect(crash.device).toMatchObject({ model: "SM-G991B", os: "Android 14" })
+    expect(crash.url).toContain("console.firebase.google.com")
+    expect(crash.rawStackTrace).toContain("at _CheckoutPageState.build")
+  })
+
+  test("parseFormattedFrames: caused-by blocks, crashed threads, omitted marker", () => {
+    const { blocks } = parseFormattedFrames("Thread: worker\nat a.b (A.kt:1)\n\nThread: main (crashed)\nat -[ViewController viewDidLoad] (ViewController.m:42)\nat Foo.bar(int)\n... frames omitted ...\n\nCaused by: java.io.IOException: disk full\nat java.io.File.write (File.java:10)")
+    expect(blocks.map((b) => [b.crashed, b.type, b.message, b.frames.length])).toEqual([
+      [false, undefined, undefined, 1],
+      [true, undefined, undefined, 2],
+      [false, "java.io.IOException", "disk full", 1],
+    ])
+    expect(blocks[1]!.frames[0]).toEqual({ symbol: "-[ViewController viewDidLoad]", file: "ViewController.m", line: 42 })
+    expect(blocks[1]!.frames[1]).toEqual({ symbol: "Foo.bar(int)", file: undefined, line: undefined })
+  })
+
+  test("parameter spelling follows the tool schema", async () => {
+    const calls: Array<{ tool: string; input: Record<string, unknown> }> = []
+    const ctx = {
+      tool: {
+        list: async () => [
+          { id: "firebase_crashlytics_get_issue", input: { type: "object", properties: { app_id: { type: "string" }, issue_id: { type: "string" } } }, execute: async (input: Record<string, unknown>) => { calls.push({ tool: "get_issue", input }); return { id: "x", title: "t" } } },
+          { id: "firebase_crashlytics_batch_get_events", input: { type: "object", properties: { app_id: {}, issue_id: {}, page_size: {} } }, execute: async (input: Record<string, unknown>) => { calls.push({ tool: "events", input }); return { events: [] } } },
+        ],
+      },
+    }
+    const sc = { ctx: ctx as never, options: { ...DEFAULTS, crashlytics: { appIds: ["1:1:android:a"] } }, sessionID: "s", services: { crashlytics: { id: "crashlytics", namespace: "firebase", serverName: "firebase", status: "connected", toolIds: [], capabilities: { getIssue: "firebase_crashlytics_get_issue", batchGetEvents: "firebase_crashlytics_batch_get_events" } } } } as never as SourceContext
+    await crashlytics.get(sc, "x")
+    expect(calls[0]!.input).toEqual({ app_id: "1:1:android:a", issue_id: "x" })
   })
 })

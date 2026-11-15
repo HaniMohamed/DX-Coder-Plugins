@@ -25,6 +25,8 @@ export interface RunView {
   startedAt: number
   updatedAt: number
   progress?: string
+  /** Last few progress lines (newest last) for the live log under the stage list. */
+  activity?: string[]
   confidence?: number
   rootCause?: string
   category?: string
@@ -148,6 +150,7 @@ export function applyEvent(state: TuiState, name: string, data: Record<string, u
       run.status = "running"
       run.error = undefined
       run.report = undefined
+      run.activity = []
       run.startedAt = now
       if (run.stages.every((s) => s.status === "ok" || s.status === "skipped")) run.stages = emptyStages()
       break
@@ -181,6 +184,7 @@ export function applyEvent(state: TuiState, name: string, data: Record<string, u
       if (!runId) break
       const run = ensureRun(state, runId, sessionID, undefined, now)
       run.progress = typeof data.message === "string" ? data.message : undefined
+      if (run.progress) run.activity = [...(run.activity ?? []).slice(-4), run.progress]
       break
     }
     case "run.card": {

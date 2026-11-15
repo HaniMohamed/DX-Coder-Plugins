@@ -49,7 +49,7 @@ describe("git end to end", () => {
     expect(await git.lsTree(clone, "origin/main")).toEqual(["README.md", "src/cart/service.test.ts", "src/cart/service.ts"])
     const index = buildIndex(await git.lsTree(clone, "origin/main"), "x")
     expect(mapFrames([{ raw: "", file: "cart/service.ts", line: 2, inApp: true }], index, { language: "js" })[0]!.candidates[0]!.path).toBe("src/cart/service.ts")
-  })
+  }, 180_000)
 
   test("worktree branch, change summary, commit with trailers, push, reuse", async () => {
     wt = join(root, "wt")
@@ -84,7 +84,7 @@ describe("git end to end", () => {
     await git.push(wt, "origin", "fixora/sentry-1-guard", { base: "main" })
     // Pushing to the base branch is refused before git runs.
     await expect(git.push(wt, "origin", "main", { base: "main" })).rejects.toThrow("protected")
-  })
+  }, 180_000)
 
   test("log, blame, commitExists, rename following, numstat", async () => {
     const log = await git.log(wt, { path: "src/cart/service.ts", n: 2, follow: true })
@@ -100,7 +100,7 @@ describe("git end to end", () => {
     expect(await git.fileExistsAt(wt, "HEAD", "src/cart/service.ts")).toBe(false)
     const numstat = await git.numstat(wt, "origin/main")
     expect(numstat.some((n) => n.path.includes("coupon.ts"))).toBe(true)
-  })
+  }, 180_000)
 
   test("statusPorcelain classifies changes; deleteRemoteBranch refuses protected names", async () => {
     await writeFile(join(wt, "untracked.txt"), "x")
@@ -111,5 +111,5 @@ describe("git end to end", () => {
     await expect(git.deleteRemoteBranch(wt, "origin", "main", "main")).rejects.toThrow("protected")
     await git.deleteRemoteBranch(wt, "origin", "fixora/sentry-1-guard", "main")
     expect(await git.remoteBranchSha(clone, "origin", "fixora/sentry-1-guard")).toBeUndefined()
-  })
+  }, 180_000)
 })

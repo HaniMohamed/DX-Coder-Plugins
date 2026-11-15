@@ -37,22 +37,12 @@ if (!result.success) {
 }
 // The TUI entry keeps its JSX (the host transpiles .tsx with its own Solid runtime), so it is
 // bundled as a single .tsx: imports of the shared src modules are inlined, host packages stay external.
-const tui = await Bun.build({
-  entrypoints: [join(root, "tui.tsx")],
-  outdir: dist,
-  target: "bun",
-  format: "esm",
-  external,
-  naming: "tui.js",
-  sourcemap: "none",
-  minify: false,
-  // Keep Solid's JSX transform identical to the host's: use its jsx runtime, not React's.
-  jsx: { runtime: "automatic", importSource: "@opentui/solid" },
-} as never)
-if (!tui.success) {
-  for (const log of tui.logs) console.error(String(log))
-  process.exit(1)
-}
+// The TUI entry must stay SOURCE: the host compiles plugin .tsx files with Solid's own JSX transform
+// (fine-grained reactivity). Pre-bundling it with Bun's JSX runtime would use OpenTUI's non-reactive
+// fallback and render a blank / frozen panel. So tui.tsx and the src/ modules it imports are copied
+// as-is; the host resolves solid-js / @opentui/* itself.
+await cp(join(root, "tui.tsx"), join(dist, "tui.tsx"))
+await cp(join(root, "src"), join(dist, "src"), { recursive: true })
 
 // Skills are read relative to the entry file at startup, so they travel with the bundle.
 await cp(join(root, "skills"), join(dist, "skills"), { recursive: true })
@@ -66,7 +56,7 @@ await writeFile(
       description: pkg.description,
       type: "module",
       private: true,
-      exports: { ".": "./index.js", "./server": "./index.js", "./tui": "./tui.js", "./rpc": "./rpc.js" },
+      exports: { ".": "./index.js", "./server": "./index.js", "./tui": "./tui.tsx", "./rpc": "./rpc.js" },
       peerDependencies: pkg.peerDependencies,
       dxcoder: { bundled: true, builtAt: new Date().toISOString() },
     },

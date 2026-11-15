@@ -16,19 +16,91 @@ export class GitError extends Error {
   }
 }
 
-export async function runGit(cwd: string, args: string[], o: { timeoutMs?: number; allowFail?: boolean; env?: Record<string, string> } = {}): Promise<GitResult> {
-  const proc = Bun.spawn(["git", ...args], {
-    cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", LC_ALL: "C", ...o.env },
-  })
-  const timer = setTimeout(() => proc.kill(), o.timeoutMs ?? 120_000)
+// ---------- login-shell process runner ----------
+// Every external command (git, test runners, glab/gh) runs through the user's login shell so PATH,
+// credential helpers, SSH agent and tool managers (nvm, asdf, fvm…) match what works in a terminal.
+
+const HOME = process.env.HOME ?? ""
+const EXTRA_PATH = [`${HOME}/.bun/bin`, `${HOME}/.local/bin`, `${HOME}/.cargo/bin`, `${HOME}/go/bin`, `${HOME}/.pub-cache/bin`, "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+
+export function loginShell(): string {
+  const shell = process.env.SHELL ?? ""
+  return /\/(zsh|bash|fish)$/.test(shell) ? shell : "/bin/sh"
+}
+
+export const shellQuote = (arg: string) => (/^[A-Za-z0-9_./:@%+=,-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`)
+
+export function shellEnv(extra: Record<string, string> = {}): Record<string, string> {
+  const current = (process.env.PATH ?? "").split(":").filter(Boolean)
+  const path = [...current, ...EXTRA_PATH.filter((p) => !current.includes(p))].join(":")
+  const env: Record<string, string> = {}
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v
+  return { ...env, PATH: path, GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", NO_COLOR: "1", FORCE_COLOR: "0", ...extra }
+}
+
+export interface ShellResult {
+  code: number
+  stdout: string
+  stderr: string
+  timedOut: boolean
+}
+
+/** Runs one shell command line (already quoted) through the login shell with a timeout. */
+export async function spawnShell(command: string, o: { cwd: string; timeoutMs?: number; env?: Record<string, string>; signal?: AbortSignal }): Promise<ShellResult> {
+  const proc = Bun.spawn([loginShell(), "-l", "-c", command], { cwd: o.cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore", env: shellEnv(o.env) })
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    proc.kill()
+  }, o.timeoutMs ?? 120_000)
+  const onAbort = () => proc.kill()
+  o.signal?.addEventListener("abort", onAbort, { once: true })
   const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
   clearTimeout(timer)
-  const result = { code, stdout, stderr }
-  if (code !== 0 && !o.allowFail) throw new GitError(args, result)
+  o.signal?.removeEventListener("abort", onAbort)
+  return { code, stdout, stderr, timedOut }
+}
+
+/** Like spawnShell, but reports every output line as it arrives (for live progress). */
+export async function spawnShellStream(command: string, o: { cwd: string; timeoutMs?: number; env?: Record<string, string>; signal?: AbortSignal; onLine: (line: string, stream: "stdout" | "stderr") => void }): Promise<ShellResult> {
+  const proc = Bun.spawn([loginShell(), "-l", "-c", command], { cwd: o.cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore", env: shellEnv(o.env) })
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    proc.kill()
+  }, o.timeoutMs ?? 120_000)
+  const onAbort = () => proc.kill()
+  o.signal?.addEventListener("abort", onAbort, { once: true })
+  const read = async (stream: ReadableStream<Uint8Array> | null, name: "stdout" | "stderr") => {
+    if (!stream) return ""
+    const decoder = new TextDecoder()
+    let all = ""
+    let pending = ""
+    for await (const chunk of stream as unknown as AsyncIterable<Uint8Array>) {
+      const text = decoder.decode(chunk, { stream: true })
+      all += text
+      pending += text
+      let nl = pending.indexOf("\n")
+      while (nl >= 0) {
+        const line = pending.slice(0, nl).replace(/\r$/, "")
+        pending = pending.slice(nl + 1)
+        if (line.trim()) o.onLine(line, name)
+        nl = pending.indexOf("\n")
+      }
+    }
+    if (pending.trim()) o.onLine(pending.replace(/\r$/, ""), name)
+    return all
+  }
+  const [stdout, stderr, code] = await Promise.all([read(proc.stdout as never, "stdout"), read(proc.stderr as never, "stderr"), proc.exited])
+  clearTimeout(timer)
+  o.signal?.removeEventListener("abort", onAbort)
+  return { code, stdout, stderr, timedOut }
+}
+
+export async function runGit(cwd: string, args: string[], o: { timeoutMs?: number; allowFail?: boolean; env?: Record<string, string> } = {}): Promise<GitResult> {
+  const r = await spawnShell(`git ${args.map(shellQuote).join(" ")}`, { cwd, timeoutMs: o.timeoutMs, env: { LC_ALL: "C", ...o.env } })
+  const result = { code: r.timedOut ? 124 : r.code, stdout: r.stdout, stderr: r.timedOut ? `${r.stderr}\n(timed out after ${Math.round((o.timeoutMs ?? 120_000) / 1000)}s)` : r.stderr }
+  if (result.code !== 0 && !o.allowFail) throw new GitError(args, result)
   return result
 }
 
@@ -116,14 +188,16 @@ export const git = {
     return (await runGit(cwd, args)).stdout
   },
   /** Working tree diff including untracked files (as added), against the index/base. */
-  async fullDiff(cwd: string, base?: string): Promise<string> {
+  async fullDiff(cwd: string, base?: string, paths?: string[]): Promise<string> {
     await runGit(cwd, ["add", "--intent-to-add", "--all"], { allowFail: true })
-    const d = await git.diff(cwd, { base })
+    if (paths && paths.length === 0) return ""
+    const d = await git.diff(cwd, { base, paths })
     return d
   },
-  async numstat(cwd: string, base?: string): Promise<Array<{ path: string; added: number; deleted: number }>> {
+  async numstat(cwd: string, base?: string, paths?: string[]): Promise<Array<{ path: string; added: number; deleted: number }>> {
     await runGit(cwd, ["add", "--intent-to-add", "--all"], { allowFail: true })
-    const out = await git.diff(cwd, { base, stat: true })
+    if (paths && paths.length === 0) return []
+    const out = await git.diff(cwd, { base, stat: true, paths })
     return out
       .split("\n")
       .filter(Boolean)
@@ -177,8 +251,9 @@ export const git = {
     for (let i = renames.length - 1; i >= 0; i--) if (renames[i]!.from === current) current = renames[i]!.to
     return current === oldPath ? undefined : current
   },
-  async isClean(cwd: string) {
-    return (await git.statusPorcelain(cwd)).length === 0
+  /** Clean apart from changes that setup tools generate (lockfiles, caches); `ignore` decides which. */
+  async isClean(cwd: string, ignore?: (path: string) => boolean) {
+    return (await git.statusPorcelain(cwd)).filter((f) => !ignore?.(f.path)).length === 0
   },
   async tagsContaining(cwd: string, sha: string): Promise<string[]> {
     const r = await runGit(cwd, ["tag", "--contains", sha], { allowFail: true })

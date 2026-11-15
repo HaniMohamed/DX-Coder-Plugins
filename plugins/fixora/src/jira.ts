@@ -152,12 +152,38 @@ export function restPort(client: JiraClient): JiraPort {
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v)
 const s = (v: unknown) => (typeof v === "string" ? v : undefined)
 
+/** JSON-schema type of one input parameter of a tool ("string", "object", …), or undefined when unknown. */
+export function schemaParamType(schema: unknown, param: string): string | undefined {
+  if (!isRecord(schema) || !isRecord(schema.properties)) return undefined
+  const prop = schema.properties[param]
+  if (!isRecord(prop)) return undefined
+  const type = prop.type ?? (Array.isArray(prop.anyOf) ? (prop.anyOf as unknown[]).map((x) => (isRecord(x) ? x.type : undefined)).find((t) => t && t !== "null") : undefined)
+  if (typeof type === "string") return type
+  if (Array.isArray(type)) return type.find((t) => t !== "null") as string | undefined
+  return undefined
+}
+
+/**
+ * mcp-atlassian changed `additional_fields` from a JSON string to an object between versions.
+ * Encode according to the server's declared schema; when unknown, send an object and fall back to
+ * a string when the server complains (and the other way round).
+ */
+export function encodeAdditionalFields(value: Record<string, unknown>, declaredType: string | undefined): string | Record<string, unknown> {
+  return declaredType === "string" ? JSON.stringify(value) : value
+}
+
 export function mcpPort(ctx: Plugin.Context, service: DetectedService, o: { sessionID: string; baseUrl?: string }): JiraPort {
   const caps = service.capabilities
   const call = (cap: string, input: Record<string, unknown>) => {
     const tool = caps[cap]
     if (!tool) throw new Error(`the Jira MCP server exposes no ${cap} tool`)
     return callTool(ctx, tool, input, { sessionID: o.sessionID })
+  }
+  const paramType = async (cap: string, param: string) => {
+    const id = caps[cap]
+    if (!id) return undefined
+    const tool = (await ctx.tool.list()).find((t) => t.id === id)
+    return schemaParamType(tool?.input, param)
   }
   const browse = (key: string) => (o.baseUrl ? `${o.baseUrl}/browse/${key}` : undefined)
   const issuesOf = (raw: unknown): JiraIssueRef[] => {
@@ -175,7 +201,21 @@ export function mcpPort(ctx: Plugin.Context, service: DetectedService, o: { sess
     },
     async create(f) {
       // mcp-atlassian takes the parent key in additional_fields (sub-tasks and parent links alike).
-      const raw = await call("createIssue", { project_key: f.project, summary: f.summary.slice(0, 255), issue_type: f.issueType, description: f.description, additional_fields: { labels: f.labels, ...(f.parent ? { parent: f.parent } : {}) } })
+      const additional = { labels: f.labels, ...(f.parent ? { parent: f.parent } : {}) }
+      const base = { project_key: f.project, summary: f.summary.slice(0, 255), issue_type: f.issueType, description: f.description }
+      const declared = await paramType("createIssue", "additional_fields").catch(() => undefined)
+      let encoded = encodeAdditionalFields(additional, declared)
+      let raw: unknown
+      try {
+        raw = await call("createIssue", { ...base, additional_fields: encoded })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        // Older / newer mcp-atlassian disagree on the type; retry once with the other encoding.
+        if (/valid string/i.test(message) && typeof encoded !== "string") encoded = JSON.stringify(additional)
+        else if (/valid dict|valid object|dictionary/i.test(message) && typeof encoded === "string") encoded = additional
+        else throw error
+        raw = await call("createIssue", { ...base, additional_fields: encoded })
+      }
       const r = isRecord(raw) && isRecord(raw.issue) ? raw.issue : isRecord(raw) ? raw : {}
       const key = s(r.key) ?? /\b[A-Z][A-Z0-9_]+-\d+\b/.exec(typeof raw === "string" ? raw : JSON.stringify(raw))?.[0]
       if (!key) throw new Error(`jira_create_issue returned no issue key: ${JSON.stringify(raw).slice(0, 300)}`)

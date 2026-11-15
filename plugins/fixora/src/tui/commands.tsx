@@ -4,6 +4,7 @@
 import type { Fixora } from "./components.js"
 import type { CrashRow } from "./store.js"
 import { relTime, truncate } from "./store.js"
+import { describeError } from "../errors.js"
 
 type PickValue = { kind: "crash"; ref: string; title: string } | { kind: "paste" } | { kind: "source"; id: string }
 
@@ -32,7 +33,7 @@ export async function ensureSession(fx: Fixora): Promise<string | undefined> {
     await new Promise((resolve) => setTimeout(resolve, 150))
     return created.id
   } catch (error) {
-    fx.context.ui.toast.show({ title: "Fixora", message: `Could not create a session: ${error instanceof Error ? error.message : String(error)}`, variant: "error" })
+    fx.context.ui.toast.show({ title: "Fixora", message: `Could not create a session: ${describeError(error)}`, variant: "error" })
     return undefined
   }
 }
@@ -68,7 +69,7 @@ export async function pickCrash(fx: Fixora, rpc: ReturnType<Fixora["context"]["c
     crashes = list.crashes
     errors = list.errors
   } catch (error) {
-    errors.push(error instanceof Error ? error.message : String(error))
+    errors.push(describeError(error))
   } finally {
     clearTimeout(loading)
   }
@@ -137,7 +138,7 @@ export async function startRuns(fx: Fixora, rpc: Record<string, (input: unknown)
       fx.context.ui.toast.show({ message: `Fixora started ${res.runId}`, variant: "info", sessionID })
     } catch (error) {
       const e = error as { type?: string; message?: string; data?: { ref?: string; runId?: string } }
-      fx.context.ui.toast.show({ title: "Fixora", message: e.type === "busy" ? `${e.data?.runId ?? ref} is already in progress` : (e.data?.ref ?? e.message ?? String(error)).slice(0, 200), variant: "warning" })
+      fx.context.ui.toast.show({ title: "Fixora", message: e.type === "busy" ? `${e.data?.runId ?? ref} is already in progress` : (e.data?.ref ?? describeError(error)).slice(0, 200), variant: "warning" })
     }
   }
   setTimeout(() => fx.context.ui.panel.open("fixora"), 300)

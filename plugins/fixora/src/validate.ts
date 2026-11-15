@@ -4,10 +4,10 @@
 import { createHash } from "node:crypto"
 import { mkdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
-import { git, type ChangedFile } from "./git.js"
-import { forbiddenReason } from "./permissions.js"
+import { git, spawnShellStream, type ChangedFile } from "./git.js"
+import { forbiddenReason, isGeneratedChange } from "./permissions.js"
 import { parseCheckOutput } from "./toolchain.js"
-import type { CheckCommand, CheckResult, TestReport } from "./types.js"
+import type { CheckCommand, CheckKind, CheckResult, TestReport } from "./types.js"
 
 export interface ChangeSummary {
   files: ChangedFile[]
@@ -19,9 +19,11 @@ export interface ChangeSummary {
 }
 
 export async function summarizeChanges(worktree: string, base: string): Promise<ChangeSummary> {
-  const files = (await git.statusPorcelain(worktree)).filter((f) => f.path && !f.path.endsWith("/"))
-  const numstat = await git.numstat(worktree, base)
-  const diff = await git.fullDiff(worktree, base)
+  // Lockfiles and tool caches rewritten by the bootstrap are not part of the fix.
+  const files = (await git.statusPorcelain(worktree)).filter((f) => f.path && !f.path.endsWith("/") && !isGeneratedChange(f.path))
+  const paths = files.map((f) => f.path)
+  const numstat = await git.numstat(worktree, base, paths)
+  const diff = await git.fullDiff(worktree, base, paths)
   return {
     files,
     paths: files.map((f) => f.path),
@@ -50,6 +52,19 @@ export function checkChangedFiles(summary: Pick<ChangeSummary, "paths" | "added"
   return problems
 }
 
+export interface CheckProgress {
+  index: number
+  total: number
+  kind: CheckKind
+  command: string
+  elapsedMs: number
+  passed?: number
+  failed?: number
+  /** Last meaningful output line (ANSI stripped, trimmed). */
+  lastLine?: string
+  lines: number
+}
+
 export interface RunChecksOptions {
   cwd: string
   logDir?: string
@@ -57,7 +72,14 @@ export interface RunChecksOptions {
   log?: (line: string) => void
   signal?: AbortSignal
   env?: Record<string, string>
+  /** Called on every output line (at most a few times per second is enough for the caller). */
+  onProgress?: (p: CheckProgress) => void
+  total?: number
 }
+
+const ANSI = /\u001B\[[0-9;]*[A-Za-z]/g
+const NOISE = /^(\s*[-=_~]{3,}\s*|\s*\d+%\s*|\s*)$/
+export const cleanLine = (line: string) => line.replace(ANSI, "").replace(/\s+/g, " ").trim().slice(0, 160)
 
 const TAIL_BYTES = 20 * 1024
 
@@ -65,23 +87,46 @@ export async function runCheck(cmd: CheckCommand, o: RunChecksOptions, index: nu
   const cwd = cmd.cwd ? join(o.cwd, cmd.cwd) : o.cwd
   const started = Date.now()
   o.log?.(`$ ${cmd.command}  (${cmd.kind}${cmd.cwd ? `, in ${cmd.cwd}` : ""})`)
-  const proc = Bun.spawn(["sh", "-lc", cmd.command], {
+  let lines = 0
+  let lastLine: string | undefined
+  let recent = ""
+  let lastTick = 0
+  let repeats = 0
+  let abortedFor: string | undefined
+  const local = new AbortController()
+  o.signal?.addEventListener("abort", () => local.abort(), { once: true })
+  const tick = (force = false) => {
+    if (!o.onProgress) return
+    const now = Date.now()
+    if (!force && now - lastTick < 500) return
+    lastTick = now
+    const parsed = parseCheckOutput(cmd.kind, recent, "")
+    o.onProgress({ index, total: o.total ?? index + 1, kind: cmd.kind, command: cmd.command, elapsedMs: now - started, passed: parsed.passed, failed: parsed.failed, lastLine, lines })
+  }
+  tick(true)
+  const r = await spawnShellStream(cmd.command, {
     cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
-    env: { ...process.env, CI: "1", FORCE_COLOR: "0", NO_COLOR: "1", GIT_TERMINAL_PROMPT: "0", ...o.env },
+    timeoutMs: cmd.timeoutMs,
+    env: { CI: "1", ...o.env },
+    signal: local.signal,
+    onLine: (line) => {
+      lines++
+      const clean = cleanLine(line)
+      if (clean && !NOISE.test(clean)) {
+        repeats = clean === lastLine ? repeats + 1 : 0
+        lastLine = clean
+        // A runner that prints the same error for every file (unresolved package, missing SDK) will not recover.
+        if (repeats >= 300 && /error|exception|couldn't|cannot|failed/i.test(clean) && !abortedFor) {
+          abortedFor = clean
+          local.abort()
+        }
+      }
+      recent = `${recent}\n${line}`.slice(-8000)
+      tick()
+    },
   })
-  let timedOut = false
-  const timer = setTimeout(() => {
-    timedOut = true
-    proc.kill()
-  }, cmd.timeoutMs)
-  const onAbort = () => proc.kill()
-  o.signal?.addEventListener("abort", onAbort, { once: true })
-  const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
-  clearTimeout(timer)
-  o.signal?.removeEventListener("abort", onAbort)
+  const { stdout, stderr, timedOut } = r
+  const exitCode = r.code
   const durationMs = Date.now() - started
   const combined = `${stdout}${stderr ? `\n--- stderr ---\n${stderr}` : ""}`
   if (o.logDir) {
@@ -99,8 +144,9 @@ export async function runCheck(cmd: CheckCommand, o: RunChecksOptions, index: nu
     durationMs,
     outputTail: combined.length > TAIL_BYTES ? `…\n${combined.slice(-TAIL_BYTES)}` : combined,
     timedOut: timedOut || undefined,
-    summary: timedOut ? `timed out after ${Math.round(cmd.timeoutMs / 1000)}s` : parsed.summary,
+    summary: timedOut ? `timed out after ${Math.round(cmd.timeoutMs / 1000)}s` : abortedFor ? `stopped early: ${abortedFor}` : parsed.summary,
   }
+  if (abortedFor && result.exitCode === 0) result.exitCode = 1
   o.log?.(`  → exit ${result.exitCode} in ${durationMs} ms${result.summary ? `: ${result.summary}` : ""}`)
   return result
 }
@@ -109,7 +155,7 @@ export async function runChecks(commands: CheckCommand[], o: RunChecksOptions & 
   const results: CheckResult[] = []
   for (const [i, cmd] of commands.entries()) {
     if (o.signal?.aborted) break
-    results.push(await runCheck(cmd, o, i))
+    results.push(await runCheck(cmd, { ...o, total: commands.length }, i))
   }
   const allPassed = results.every((r) => r.exitCode === 0 || commands.find((c) => c.command === r.command)?.optional === true && isToolMissing(r))
   return { diffHash: o.diffHash, commands: results, allPassed }

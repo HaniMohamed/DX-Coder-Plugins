@@ -11,6 +11,7 @@ export const sampleRun = (over: Partial<RunRecord> = {}): RunRecord => ({
   fingerprint: "abcdef0123456789abcdef0123456789",
   title: "TypeError: Cannot read properties of undefined (reading 'id')",
   originSessionID: "ses_1",
+  repo: "/repo",
   createdAt: "2026-11-14T10:00:00.000Z",
   updatedAt: "2026-11-14T10:07:00.000Z",
   step: "done",

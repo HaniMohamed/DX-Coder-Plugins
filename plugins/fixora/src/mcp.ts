@@ -2,7 +2,11 @@
 // their tools directly from plugin code. Namespaces are discovered, never hard-coded.
 
 import type { Plugin } from "@opencode/plugin"
+import yaml from "js-yaml"
 import type { DetectedService, ServiceId, Services } from "./types.js"
+import { describeError } from "./errors.js"
+
+const loadYaml = (text: string): unknown => ((yaml as { safeLoad?: typeof yaml.load }).safeLoad ?? yaml.load)(text, { json: true })
 
 /** Mirrors `namespace()` in the host (`packages/core/src/tool/mcp.ts`). */
 export const mcpNamespace = (server: string) => server.replace(/[^a-zA-Z0-9_-]/g, "_")
@@ -52,6 +56,7 @@ export const PROBES: Record<ServiceId, Record<string, RegExp>> = {
     listTopIssues: /(^|_)crashlytics_list_top_issues$/,
     batchGetEvents: /(^|_)crashlytics_batch_get_events$/,
     getSampleCrash: /(^|_)crashlytics_get_sample_crash(_for_issue)?$/,
+    listEvents: /(^|_)crashlytics_list_events$/,
     createNote: /(^|_)crashlytics_create_note$/,
     updateIssue: /(^|_)crashlytics_update_issue$/,
   },
@@ -65,10 +70,10 @@ export const PROBES: Record<ServiceId, Record<string, RegExp>> = {
     updateIssue: /(^|_)jira_update_issue$/,
   },
   gitlab: {
-    createMr: /(^|_)create_merge_request$/,
-    getMr: /(^|_)get_merge_request$/,
-    updateMr: /(^|_)update_merge_request$/,
-    listMrs: /(^|_)list_merge_requests$/,
+    createMr: /(^|_)create_(merge_request|mr)$/,
+    getMr: /(^|_)get_(merge_request|mr)$/,
+    updateMr: /(^|_)update_(merge_request|mr)$/,
+    listMrs: /(^|_)list_(merge_requests|mrs)$/,
   },
   github: {
     createPr: /(^|_)create_pull_request$/,
@@ -115,7 +120,11 @@ export function matchServices(toolIds: string[], servers: ServerInfo[], configs?
       const hit = toolIds.find((t) => t.startsWith(prefix) && probe.test(t) && namespaceFor(t, probe) === namespace)
       if (hit) capabilities[cap] = hit
     }
-    const server = servers.find((s) => mcpNamespace(s.name) === namespace)
+    // Exact namespace first; else the server whose namespace prefixes it (tools named `gitlab_create_mr`
+    // on a server called "gitlab" give the id `gitlab_gitlab_create_mr`).
+    const server =
+      servers.find((s) => mcpNamespace(s.name) === namespace) ??
+      servers.filter((s) => namespace.startsWith(`${mcpNamespace(s.name)}_`)).sort((a, b) => b.name.length - a.name.length)[0]
     out[id] = {
       id,
       namespace,
@@ -188,7 +197,7 @@ export async function callTool(ctx: Plugin.Context, toolId: string, input: Recor
     })
     return normalizeToolOutput(result)
   } catch (error) {
-    throw new ToolCallError(toolId, error instanceof Error ? error.message : String(error))
+    throw new ToolCallError(toolId, describeError(error))
   } finally {
     clearTimeout(timer)
     pendingCalls.delete(key)
@@ -213,6 +222,95 @@ export function normalizeToolOutput(result: unknown): unknown {
   return result
 }
 
+/** Text values an MCP server pre-formats for humans (stack traces, logs): never re-parsed as YAML. */
+const TEXT_KEYS = new Set(["exceptions", "threads", "errors", "logs", "breadcrumbs", "stackTrace", "stacktrace", "text", "content", "usage", "description"])
+
+/**
+ * Parses a tool's text output: JSON, else YAML (firebase-tools 15 dumps every result as YAML, and
+ * nests YAML documents as strings under each key), else the text itself. Nested YAML strings are
+ * parsed too (two levels), scalars are trimmed.
+ */
+export function parseToolText(raw: unknown): unknown {
+  if (typeof raw !== "string") return deepParse(raw, 0)
+  return deepParse(tryJson(raw), 0)
+}
+
+function deepParse(value: unknown, depth: number, key?: string): unknown {
+  if (value instanceof Date) return value.toISOString() // js-yaml turns unquoted timestamps into Dates
+  if (typeof value === "string") {
+    if (depth === 0 || (key && TEXT_KEYS.has(key))) return value
+    const t = value.trim()
+    if (!t) return t
+    const looksStructured = t.includes("\n") ? /^(-\s|[\w.-]+:\s|[\w.-]+:$)/.test(t) : /^[{[]/.test(t)
+    if (!looksStructured) return t
+    try {
+      const parsed = loadYaml(t)
+      if (parsed && typeof parsed === "object") return deepParse(parsed, depth + 1)
+      return typeof parsed === "string" ? parsed.trim() : t
+    } catch {
+      return t
+    }
+  }
+  if (Array.isArray(value)) return value.map((v) => deepParse(v, depth, key))
+  if (value && typeof value === "object") {
+    if (depth > 3) return value
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = typeof v === "string" && depth === 0 ? deepParse(v, 1, k) : deepParse(v, depth === 0 ? 1 : depth, k)
+    return out
+  }
+  return value
+}
+
+/**
+ * Which spelling a tool's input schema uses: firebase-tools ≥ 15 declares `appId` / `issueId` /
+ * `pageSize`, older releases `app_id` / `issue_id` / `page_size`. Unknown schema → camelCase.
+ */
+/** A tool's declared input properties (JSON schema), empty when unknown. */
+export async function toolInputProps(ctx: Plugin.Context, toolId: string): Promise<Record<string, unknown>> {
+  const tools = await ctx.tool.list()
+  const tool = tools.find((t) => t.id === toolId) as { input?: { properties?: Record<string, unknown> } } | undefined
+  return tool?.input?.properties ?? {}
+}
+
+/**
+ * Renames the keys of a tool input to the spelling its schema declares: exact match first, then the
+ * camelCase form, then known aliases. Keys the schema does not know are dropped when the schema lists
+ * any property at all (strict servers reject unknown fields); with an empty schema the input is kept.
+ */
+export function adaptInput(input: Record<string, unknown>, props: Record<string, unknown>, aliases: Record<string, string[]> = {}): Record<string, unknown> {
+  const known = new Set(Object.keys(props))
+  if (known.size === 0) return input
+  const camel = (k: string) => k.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase())
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(input)) {
+    if (value === undefined) continue
+    const target = [key, camel(key), ...(aliases[key] ?? []), ...(aliases[key] ?? []).map(camel)].find((k) => known.has(k))
+    if (target) out[target] = value
+  }
+  return out
+}
+
+/** `/fixora doctor --tool <id>`: a tool's input schema, property by property. */
+export function renderToolSchema(toolId: string, tool: { description?: string; input?: { properties?: Record<string, unknown>; required?: string[] } } | undefined): string {
+  if (!tool) return `### Tool \`${toolId}\`\n\nnot found (run \`/fixora doctor --all\` for the ids)`
+  const props = tool.input?.properties ?? {}
+  const required = new Set(tool.input?.required ?? [])
+  const L = [`### Tool \`${toolId}\``, "", tool.description ? `${tool.description.slice(0, 400)}` : "", "", "| Property | Type | Required | Description |", "|---|---|---|---|"]
+  for (const [name, schema] of Object.entries(props)) {
+    const s = (schema ?? {}) as { type?: string | string[]; enum?: unknown[]; description?: string; items?: { type?: string } }
+    const type = Array.isArray(s.type) ? s.type.join("|") : (s.type ?? (s.enum ? "enum" : "?")) + (s.items?.type ? `<${s.items.type}>` : "") + (s.enum ? ` (${s.enum.map(String).join(", ").slice(0, 80)})` : "")
+    L.push(`| \`${name}\` | ${type} | ${required.has(name) ? "yes" : ""} | ${(s.description ?? "").replace(/\|/g, "\\|").replace(/\s+/g, " ").slice(0, 160)} |`)
+  }
+  if (Object.keys(props).length === 0) L.push("| (no properties declared) | | | |")
+  return L.join("\n")
+}
+
+export async function paramStyle(ctx: Plugin.Context, toolId: string): Promise<"camel" | "snake"> {
+  const keys = Object.keys(await toolInputProps(ctx, toolId))
+  if (keys.some((k) => /^(app_id|issue_id|page_size)$/.test(k))) return "snake"
+  return "camel"
+}
+
 function tryJson(text: string): unknown {
   const t = text.trim()
   if (t.startsWith("{") || t.startsWith("[")) {
@@ -220,6 +318,14 @@ function tryJson(text: string): unknown {
       return JSON.parse(t)
     } catch {
       // fall through
+    }
+  }
+  if (/^[\w.-]+:(\s|$)|^-\s/m.test(t) && !/^(at |Error|Exception)/.test(t)) {
+    try {
+      const parsed = loadYaml(t)
+      if (parsed && typeof parsed === "object") return parsed
+    } catch {
+      // not YAML
     }
   }
   return text
@@ -251,15 +357,16 @@ export const notConnectedInstructions = (s: DetectedService) =>
  * exposed" (e.g. the Firebase MCP server hides its crashlytics_* tools unless started with
  * `--only crashlytics` or inside a folder with a Crashlytics app), or a naming mismatch.
  */
-export function renderDoctor(o: { servers: ServerInfo[]; toolIds: string[]; services: Services; options: { sources: string[]; crashlytics: { appIds: string[] }; jira: { project?: string; parent?: string; issueType: string } } }): string {
+export function renderDoctor(o: { servers: ServerInfo[]; toolIds: string[]; services: Services; options: { sources: string[]; crashlytics: { appIds: string[] }; jira: { project?: string; parent?: string; issueType: string } }; all?: boolean }): string {
   const L: string[] = ["## Fixora doctor", ""]
   L.push("### MCP servers", "")
   if (o.servers.length === 0) L.push("- none configured (`opencode.jsonc` → `mcp.servers`)")
   for (const s of o.servers) {
     const ns = mcpNamespace(s.name)
     const tools = o.toolIds.filter((t) => t.startsWith(`${ns}_`))
-    const interesting = tools.filter((t) => /crashlytics|issue|merge_request|pull_request|jira/i.test(t))
-    L.push(`- **${s.name}** (${statusOf(s)}) — ${tools.length} tool(s)${interesting.length ? `: ${interesting.slice(0, 12).map((t) => `\`${t}\``).join(", ")}${interesting.length > 12 ? ", …" : ""}` : tools.length ? " (none look like crash / ticket / MR tools)" : ""}`)
+    const interesting = o.all ? tools : tools.filter((t) => /crashlytics|issue|merge|_mr|pull|jira|sentry/i.test(t))
+    const limit = o.all ? tools.length : 16
+    L.push(`- **${s.name}** (${statusOf(s)}) — ${tools.length} tool(s)${interesting.length ? `: ${interesting.slice(0, limit).map((t) => `\`${t}\``).join(", ")}${interesting.length > limit ? `, … (${interesting.length - limit} more; \`/fixora doctor --all\` lists everything)` : ""}` : tools.length ? " (none look like crash / ticket / MR tools)" : ""}`)
   }
   L.push("", "### Services Fixora recognised", "")
   const ids = ["sentry", "crashlytics", "jira", "gitlab", "github"] as const

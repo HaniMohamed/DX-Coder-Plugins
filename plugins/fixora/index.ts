@@ -7,13 +7,14 @@ import { prepareRun, presentList, refreshServices, runClean, runFeedback, runFix
 import { ackGate, decideGate } from "./src/gate.js"
 import { decideAutoAllow, pendingCalls } from "./src/mcp.js"
 import { DEFAULTS, readOptions, type FixoraOptions } from "./src/options.js"
-import { guardWorkerShell, guardWorkerWrite, SHELL_TOOLS, WRITE_TOOLS } from "./src/permissions.js"
-import { FixoraStop, notify, tell, type Runtime } from "./src/progress.js"
-import { FixoraRpc } from "./src/rpc.js"
+import { guardWorkerShell, guardWorkerWrite, PATH_TOOLS, remapToWorktree, SHELL_TOOLS, WRITE_TOOLS } from "./src/permissions.js"
+import { describeToolCall, FixoraStop, notify, progress, tell, type Runtime } from "./src/progress.js"
+import { FixoraRpc, prunedHandlers } from "./src/rpc.js"
 import { funnel, listCrashIndex, listRuns, loadRun, loadWorker } from "./src/state.js"
 import { registerPluginTools } from "./src/tools.js"
 import { detectEcosystems } from "./src/toolchain.js"
 import type { RunRecord } from "./src/types.js"
+import { describeError } from "./src/errors.js"
 
 export { parseCommand }
 
@@ -81,7 +82,9 @@ export default Plugin.define({
 
     // RPC contract for a TUI (pass 2). Events are emitted from progress.ts through rt.emit.
     try {
-      const reg = await ctx.rpc.register(FixoraRpc, {
+      // Every reply is pruned of undefined keys: the host validates outputs in-process and rejects them.
+      const register: typeof ctx.rpc.register = (definition, handlers) => ctx.rpc.register(definition, prunedHandlers(handlers as never) as never)
+      const reg = await register(FixoraRpc, {
         "sources.list": async () => {
           await refreshServices(rt)
           return { sources: Object.values(rt.services).filter(Boolean).map((s) => ({ id: s!.id, status: s!.status, serverName: s!.serverName })) }
@@ -90,9 +93,9 @@ export default Plugin.define({
           const i = input as { source?: string; top?: number; minUsers?: number; sessionID?: string }
           try {
             const list = await runList(rt, { sessionID: i.sessionID ?? "", top: i.top, minUsers: i.minUsers, source: i.source as never })
-            return { crashes: list.crashes, errors: [] }
+            return { crashes: list.crashes, errors: list.errors }
           } catch (error) {
-            return { crashes: [], errors: [error instanceof Error ? error.message : String(error)] }
+            return { crashes: [], errors: [describeError(error)] }
           }
         },
         "runs.list": async (input) => {
@@ -115,7 +118,7 @@ export default Plugin.define({
             return { runId: run.runId }
           } catch (error) {
             if (error instanceof FixoraStop && /already in progress/.test(error.message)) return c.error("busy", "run already in progress", { runId: i.ref })
-            return c.error("invalid_ref", "invalid crash reference", { ref: `${i.ref}: ${error instanceof Error ? error.message : String(error)}` })
+            return c.error("invalid_ref", "invalid crash reference", { ref: `${i.ref}: ${describeError(error)}` })
           }
         },
         "run.retry": async (input, c) => {
@@ -216,7 +219,7 @@ export default Plugin.define({
             started.push(run.runId)
             void startPipeline(rt, run, { from: "detect" }).catch(() => {})
           } catch (error) {
-            errors.push(`${ref}: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`)
+            errors.push(`${ref}: ${describeError(error).split("\n")[0]}`)
           }
         }
         return { started, errors }
@@ -235,15 +238,43 @@ export default Plugin.define({
       return w
     }
     await ctx.tool.hook("execute.before", async (event) => {
-      if (!WRITE_TOOLS.has(event.tool) && !SHELL_TOOLS.has(event.tool)) return
+      if (!WRITE_TOOLS.has(event.tool) && !SHELL_TOOLS.has(event.tool) && !PATH_TOOLS.has(event.tool)) return
       // Phase changes are frequent; re-read the worker record for writes so the triage phase stays read-only.
       const w = WRITE_TOOLS.has(event.tool) ? ((await loadWorker(ctx, event.sessionID)) ?? null) : await workerOf(event.sessionID)
       if (!w) return
+      // Absolute paths into the original checkout (from local-build stack traces) are redirected to the worktree.
+      if (PATH_TOOLS.has(event.tool)) {
+        const remapped = remapToWorktree(event.input, { repo: w.repo, worktree: w.worktree })
+        if (remapped !== event.input) event.input = remapped
+      }
+      if (!WRITE_TOOLS.has(event.tool) && !SHELL_TOOLS.has(event.tool)) return
       const problem = WRITE_TOOLS.has(event.tool)
         ? guardWorkerWrite({ tool: event.tool, input: event.input, worktree: w.worktree, directory: w.worktree, phase: w.phase, extraDeny: rt.opts.validate.denyPaths })
         : guardWorkerShell({ tool: event.tool, input: event.input, worktree: w.worktree, role: w.role })
       if (problem) throw new Error(problem)
     })
+
+    // Live worker activity: every tool call a Fixora worker session makes becomes a progress line
+    // ("reading lib/cart/service.dart", "$ flutter test …") so long analyse/fix/review phases are not silent.
+    void (async () => {
+      const lastAt = new Map<string, number>()
+      try {
+        for await (const event of await ctx.event.subscribe()) {
+          const e = event as { type?: string; data?: { sessionID?: string; input?: Record<string, unknown> } }
+          if (e.type !== "session.tool.called" || !e.data?.sessionID) continue
+          const w = await workerOf(e.data.sessionID)
+          if (!w) continue
+          const now = Date.now()
+          if (now - (lastAt.get(w.runId) ?? 0) < 700) continue
+          lastAt.set(w.runId, now)
+          const run = await loadRun(ctx, w.runId)
+          if (!run || (run.status !== "running" && run.status !== "awaiting-approval")) continue
+          await progress(rt, run, `${w.role === "reviewer" ? "reviewer" : "worker"}: ${describeToolCall(e.data.input)}`, { quiet: true })
+        }
+      } catch {
+        // event stream unavailable on this host: the panel still shows stage-level progress
+      }
+    })()
 
     // Plugin-originated MCP calls (crash fetch, Jira, MR) are pre-registered in `pendingCalls` and
     // allowed here; everything else keeps the session's rules.
@@ -314,7 +345,7 @@ export default Plugin.define({
                 await runSync(rt, { sessionID })
                 break
               case "doctor":
-                await runDoctor(rt, { sessionID })
+                await runDoctor(rt, { sessionID, all: parsed.all, probe: parsed.probe, tool: parsed.tool })
                 break
             }
           } catch (error) {
@@ -322,7 +353,7 @@ export default Plugin.define({
               await tell(ctx, sessionID, `fixora stopped: ${error.message.split("\n")[0]!.slice(0, 140)}`, error.message)
               return
             }
-            const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+            const message = error instanceof Error ? `${error.name}: ${error.message}` : describeError(error)
             await tell(ctx, sessionID, `fixora failed: ${message.slice(0, 140)}`, `The command failed:\n\n\`\`\`\n${message}\n\`\`\``)
           }
         },

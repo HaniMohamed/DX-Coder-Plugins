@@ -25,7 +25,7 @@ Kotlin/Java, Swift, JavaScript/TypeScript, Python, Go, .NET, Rust.
 | `/fixora fixed <runId> --release <X> [--platform android\|ios\|web]` | Release tracking: if the same crash fingerprint shows up later, it is flagged as reopened with a likely reason. |
 | `/fixora report [--days 30]` | Funnel (detected → analysed → fixed → validated → reviewed → pushed → MR → merged), timings, MR status, reopen rate, top platforms/versions. |
 | `/fixora sync` | Refresh MR statuses (merged / closed). |
-| `/fixora doctor` | Show the MCP servers and tools Fixora detects, which services it recognised, and the likely fix when a crash source is missing. |
+| `/fixora doctor [--all] [--probe] [--tool <id>]` | Show the MCP servers and tools Fixora detects, which services it recognised, and the likely fix when a crash source is missing. `--all` lists every tool id of every server; `--probe` makes one real call per crash source and app and prints the raw reply or the exact error; `--tool <id>` prints a tool's input schema. |
 | `/fixora clean <runId> [--remote]` | Remove the worktree (and, after approval, the remote branch). |
 
 Flags: `--dry-run` (stop before commit; writes the MR body and commit message to the run folder),
@@ -37,7 +37,7 @@ symbolication is missing), `--test-first`, `--base <branch>`, `--model <provider
 ## Flow
 
 1. **detect** — git repository, remote, connected MCP servers (Sentry, Firebase, Jira, GitLab, GitHub). Nothing is registered by the plugin; it only detects what you configured.
-2. **fetch** — crash → normalised model (frames innermost first, in-app flags, fingerprint, symbolication check). Crash data is written to `.dxcoder/fixora/<runId>/crash.md` inside "untrusted" banners. Same fingerprint across sources or a crash marked fixed earlier is detected here (dedupe, reopen).
+2. **fetch** — crash → normalised model. Firebase MCP (firebase-tools ≥ 15: camelCase inputs, YAML answers, text-formatted stack frames) and older releases (snake_case, JSON) are both understood; the spelling is read from the tool schema. (frames innermost first, in-app flags, fingerprint, symbolication check). Crash data is written to `.dxcoder/fixora/<runId>/crash.md` inside "untrusted" banners. Same fingerprint across sources or a crash marked fixed earlier is detected here (dedupe, reopen).
 3. **map** — `git fetch` of the base branch, frame → file candidates from `git ls-tree` with path-suffix scoring, early stop for crashes with no in-app frames or missing symbols.
 4. **branch** — a fresh worktree from `<remote>/<base>` (via the host's worktree API) and branch `fixora/<runId>-<slug>`.
 5. **analyse** — a worker session (the host's coding agent, `worker.agent`) runs the `fixora-triage` skill read-only in the worktree and submits a structured root cause through the `fixora_submit_triage` tool (classification, mapped frames with evidence, suspect commits, confidence, strategy, alternatives). Low confidence or non-fixable classifications stop here with a report.
@@ -47,7 +47,7 @@ symbolication is missing), `--test-first`, `--base <branch>`, `--model <provider
 9. **review** — a fresh, read-only reviewer session runs the `fixora-review` skill (or a one-shot model call in `quick` mode). A rejection goes back to the worker with the findings, up to `maxReviewRounds`.
 10. **commit** — secret scan of the added lines, conventional commit (`fix(<scope>): …` with `Fixora-Run` / `Fixora-Fingerprint` trailers). Hooks run; never `--no-verify`.
 11. **push** — one approval dialog (`fixora.publish`) showing branch, files, checks, review and the MR body; then `git push -u` (never force, never the base branch).
-12. **mr** — draft MR via the GitLab/GitHub MCP server, else the `glab` / `gh` CLI, else a compare URL to open by hand. The MR body explains what broke, the root cause with evidence, what changed, how it was verified, the review verdict and the rollback.
+12. **mr** — draft MR via the GitLab/GitHub MCP server (tools named `create_merge_request` or `create_mr`; inputs are renamed to the spelling the tool schema declares), else the `glab` / `gh` CLI, else a compare URL to open by hand. The MR body explains what broke, the root cause with evidence, what changed, how it was verified, the review verdict and the rollback.
 13. **close-loop** — Jira comment with the MR link and transition, optional note on the crash source.
 
 Every step is persisted; `/fixora retry` resumes where a run stopped. Worker sessions are confined

@@ -138,3 +138,27 @@ export interface GatePreview {
   previewPath?: string
   crashUrl?: string
 }
+
+/**
+ * RPC replies are validated in-process against the output schema, where a key that is present with
+ * the value `undefined` fails as "Expected string". Drop such keys (recursively) and turn Dates into
+ * ISO strings before a reply leaves a handler.
+ */
+export function pruneUndefined<T>(value: T): T {
+  if (value instanceof Date) return value.toISOString() as unknown as T
+  if (Array.isArray(value)) return value.map(pruneUndefined) as unknown as T
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) if (v !== undefined) out[k] = pruneUndefined(v)
+    return out as T
+  }
+  return value
+}
+
+/** Wraps every RPC handler so its reply goes through `pruneUndefined`. */
+// biome-ignore lint/suspicious/noExplicitAny: handler arity and types come from the RPC definition
+export function prunedHandlers<H extends Record<string, (...args: any[]) => unknown>>(handlers: H): H {
+  const out: Record<string, (...args: unknown[]) => Promise<unknown>> = {}
+  for (const [name, handler] of Object.entries(handlers)) out[name] = async (...args: unknown[]) => pruneUndefined(await handler(...args))
+  return out as unknown as H
+}

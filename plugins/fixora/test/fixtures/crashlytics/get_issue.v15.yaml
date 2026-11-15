@@ -1,0 +1,14 @@
+name: projects/10866044419/apps/1:10866044419:android:6352c04266dbc3babba836/issues/0123456789abcdef0123456789abcdef
+id: 0123456789abcdef0123456789abcdef
+title: Null check operator used on a null value
+subtitle: checkout_page.dart - _CheckoutPageState.build
+errorType: FATAL
+state: OPEN
+sampleEvent: projects/10866044419/apps/1:10866044419:android:6352c04266dbc3babba836/events/evt-1
+firstSeenVersion:
+  displayVersion: 3.1.0
+  buildVersion: '310'
+lastSeenVersion:
+  displayVersion: 3.1.9
+  buildVersion: '319'
+uri: https://console.firebase.google.com/project/taminaty/crashlytics/app/1:10866044419:android:6352c04266dbc3babba836/issues/0123456789abcdef0123456789abcdef

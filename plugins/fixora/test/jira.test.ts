@@ -64,3 +64,20 @@ describe("REST port against a mock Jira", () => {
     await expect(bad.search("x")).rejects.toThrow("401")
   })
 })
+
+describe("mcp-atlassian additional_fields encoding", () => {
+  test("follows the declared schema type and defaults to an object", async () => {
+    const { schemaParamType, encodeAdditionalFields } = await import("../src/jira.js")
+    const stringSchema = { type: "object", properties: { additional_fields: { type: "string", description: "JSON" } } }
+    const objectSchema = { type: "object", properties: { additional_fields: { type: "object" } } }
+    const nullable = { type: "object", properties: { additional_fields: { anyOf: [{ type: "string" }, { type: "null" }] } } }
+    expect(schemaParamType(stringSchema, "additional_fields")).toBe("string")
+    expect(schemaParamType(objectSchema, "additional_fields")).toBe("object")
+    expect(schemaParamType(nullable, "additional_fields")).toBe("string")
+    expect(schemaParamType({}, "additional_fields")).toBeUndefined()
+    const value = { labels: ["fixora"], parent: "DE-62556" }
+    expect(encodeAdditionalFields(value, "string")).toBe('{"labels":["fixora"],"parent":"DE-62556"}')
+    expect(encodeAdditionalFields(value, "object")).toEqual(value)
+    expect(encodeAdditionalFields(value, undefined)).toEqual(value)
+  })
+})

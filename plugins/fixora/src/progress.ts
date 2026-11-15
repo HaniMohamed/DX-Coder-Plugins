@@ -67,9 +67,38 @@ export async function stageEnd(rt: Runtime, run: RunRecord, step: Step, status: 
   await notify(rt.ctx, run.originSessionID, `fixora ${run.runId} · ${GLYPH[status]} ${step}${t?.durationMs !== undefined ? ` (${Math.round(t.durationMs / 1000)}s)` : ""}${detail ? ` — ${detail}` : ""}${error ? ` — ${error.slice(0, 120)}` : ""}`)
 }
 
-export async function progress(rt: Runtime, run: RunRecord, message: string) {
+const lastRow = new Map<string, number>()
+
+/**
+ * Live progress. The RPC event feeds the panel on every call; the chat row is rate-limited
+ * (`quiet`: at most one row per 15 s per run) so frequent updates do not flood the session.
+ */
+export async function progress(rt: Runtime, run: RunRecord, message: string, o: { quiet?: boolean } = {}) {
   await rt.emit("run.progress", { runId: run.runId, sessionID: run.originSessionID, step: run.step, message })
+  const now = Date.now()
+  if (o.quiet && now - (lastRow.get(run.runId) ?? 0) < 15_000) return
+  lastRow.set(run.runId, now)
   await notify(rt.ctx, run.originSessionID, `fixora ${run.runId} · ${message}`)
+}
+
+/** Human label for a worker tool call, from its input shape (the host event carries no tool name). */
+export function describeToolCall(input: Record<string, unknown> | undefined): string {
+  if (!input) return "working"
+  const str = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : undefined)
+  const file = str("filePath") ?? str("path") ?? str("file_path") ?? str("file")
+  const base = file ? file.split("/").slice(-2).join("/") : undefined
+  if (str("command")) return `$ ${str("command")!.replace(/\s+/g, " ").slice(0, 80)}`
+  if (file && (input.oldString !== undefined || input.old_string !== undefined || input.edits !== undefined)) return `editing ${base}`
+  if (file && (input.content !== undefined || input.contents !== undefined)) return `writing ${base}`
+  if (file && input.offset === undefined && input.limit === undefined && Object.keys(input).length === 1) return `reading ${base}`
+  if (file) return `reading ${base}`
+  if (str("pattern")) return `searching ${str("pattern")!.slice(0, 60)}`
+  if (str("query")) return `looking up ${str("query")!.slice(0, 60)}`
+  if (input.runId !== undefined && input.classification !== undefined) return "submitting the root cause"
+  if (input.runId !== undefined && input.filesChanged !== undefined) return "submitting the fix report"
+  if (input.runId !== undefined && input.verdict !== undefined) return "submitting the review"
+  if (str("question")) return "asking you a question"
+  return "working"
 }
 
 export async function appendLog(folder: string, line: string) {

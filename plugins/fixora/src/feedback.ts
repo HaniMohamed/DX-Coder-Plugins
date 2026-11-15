@@ -28,7 +28,7 @@ export const FixoraFeedback = {
       sessionID = (session as { id: string }).id
       run.sessions.fixer = sessionID
     }
-    await saveWorker(rt.ctx, sessionID, { runId: run.runId, role: "fixer", worktree, phase: "feedback" })
+    await saveWorker(rt.ctx, sessionID, { runId: run.runId, role: "fixer", worktree, phase: "feedback", repo: run.repo })
     const attempt = run.counters.fixRounds + run.counters.reviewRounds + run.counters.feedback + 1
     const before = (await git.statusPorcelain(worktree)).length
     run.step = "fix"

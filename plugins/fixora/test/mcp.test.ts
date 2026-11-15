@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { decideAutoAllow, matchServices, mcpNamespace, normalizeToolOutput, pendingKey, renderDoctor } from "../src/mcp.js"
+import { decideAutoAllow, matchServices, mcpNamespace, normalizeToolOutput, adaptInput, pendingKey, parseToolText, renderDoctor, renderToolSchema } from "../src/mcp.js"
+import { pruneUndefined, prunedHandlers } from "../src/rpc.js"
 
 describe("matchServices", () => {
   test("detects each service from tool ids, including odd server names", () => {
@@ -83,5 +84,64 @@ describe("renderDoctor", () => {
     const out = renderDoctor({ servers, toolIds, services: matchServices(toolIds, servers), options: { sources: ["crashlytics"], crashlytics: { appIds: [] }, jira: { issueType: "Bug" } } })
     expect(out).toContain('crashlytics: server "firebase" (connected)')
     expect(out).not.toContain("Likely fix")
+  })
+})
+
+describe("parseToolText", () => {
+  test("JSON, YAML with nested YAML strings, scalars trimmed, text blocks kept", () => {
+    expect(parseToolText('{"a":1}')).toEqual({ a: 1 })
+    const parsed = parseToolText("name: x\nversion: |\n  3.1.9\nissue: |\n  id: abc\n  title: T\nexceptions: |-\n  _TypeError: boom\n  at a.b (c.dart:1)\n") as Record<string, unknown>
+    expect(parsed.name).toBe("x")
+    expect(parsed.version).toBe("3.1.9")
+    expect(parsed.issue).toEqual({ id: "abc", title: "T" })
+    expect(parsed.exceptions).toBe("_TypeError: boom\nat a.b (c.dart:1)")
+    expect(parseToolText("- id: 1\n- id: 2\n")).toEqual([{ id: 1 }, { id: 2 }])
+    expect(parseToolText("Issue not found")).toBe("Issue not found")
+    expect(parseToolText({ events: ["a: 1"] })).toEqual({ events: ["a: 1"] })
+  })
+})
+
+describe("describeError", () => {
+  test("Error, strings, host-style tagged objects, nested causes", async () => {
+    const { describeError } = await import("../src/errors.js")
+    expect(describeError(new Error("boom"))).toBe("boom")
+    expect(describeError(Object.assign(new Error("outer"), { cause: new Error("inner") }))).toBe("outer (cause: inner)")
+    expect(describeError("plain")).toBe("plain")
+    expect(describeError({ _tag: "PermissionDenied", message: "tool not allowed" })).toBe("tool not allowed [PermissionDenied]")
+    expect(describeError({ type: "ToolFailure", error: { message: "Must specify 'appId' parameter" } })).toBe("Must specify 'appId' parameter")
+    expect(describeError({ foo: 1 })).toBe('{"foo":1}')
+    expect(describeError({})).toBe("unknown error")
+  })
+})
+
+describe("gitlab tool aliases + adaptInput", () => {
+  test("create_mr / get_mr style servers are recognised", () => {
+    const servers = [{ name: "gitlab", status: "connected" }]
+    const ids = ["gitlab_gitlab_create_mr", "gitlab_gitlab_get_mr", "gitlab_gitlab_update_mr", "gitlab_gitlab_list_mrs", "gitlab_gitlab_create_issue"]
+    expect(matchServices(ids, servers).gitlab).toMatchObject({ namespace: "gitlab_gitlab", serverName: "gitlab", status: "connected", capabilities: { createMr: "gitlab_gitlab_create_mr", getMr: "gitlab_gitlab_get_mr", updateMr: "gitlab_gitlab_update_mr", listMrs: "gitlab_gitlab_list_mrs" } })
+  })
+  test("adaptInput renames to the schema's spelling and drops unknown keys", () => {
+    const aliases = { project_id: ["projectId", "project"], merge_request_iid: ["mrIid", "iid"], description: ["body"] }
+    expect(adaptInput({ project_id: "a/b", source_branch: "x", description: "d", merge_request_iid: 3, extra: 1 }, { projectId: {}, sourceBranch: {}, body: {}, iid: {} }, aliases)).toEqual({ projectId: "a/b", sourceBranch: "x", body: "d", iid: 3 })
+    expect(adaptInput({ project_id: "a/b", draft: true }, { project_id: {}, draft: {} })).toEqual({ project_id: "a/b", draft: true })
+    expect(adaptInput({ project_id: "a/b" }, {})).toEqual({ project_id: "a/b" })
+  })
+  test("renderToolSchema", () => {
+    const out = renderToolSchema("gitlab_gitlab_create_mr", { description: "Create MR", input: { properties: { projectId: { type: "string", description: "Project" }, draft: { type: "boolean" } }, required: ["projectId"] } })
+    expect(out).toContain("| `projectId` | string | yes | Project |")
+    expect(out).toContain("| `draft` | boolean |  |  |")
+    expect(renderToolSchema("nope", undefined)).toContain("not found")
+  })
+})
+
+describe("rpc reply pruning", () => {
+  test("drops undefined keys recursively and stringifies dates", async () => {
+    expect(pruneUndefined<unknown>({ a: 1, b: undefined, c: [{ d: undefined, e: "x" }], f: new Date("2026-11-13T21:14:02.000Z") })).toEqual({ a: 1, c: [{ e: "x" }], f: "2026-11-13T21:14:02.000Z" })
+    const h = prunedHandlers({ "x.y": async (input: { n: number }) => ({ crashes: [{ id: "1", lastSeen: undefined }], n: input.n }) })
+    expect((await h["x.y"]({ n: 2 })) as unknown).toEqual({ crashes: [{ id: "1" }], n: 2 })
+  })
+  test("YAML timestamps become ISO strings", () => {
+    const parsed = parseToolText("issue:\n  lastSeenTime: 2026-11-13T21:14:02Z\n  id: a\n") as { issue: { lastSeenTime: unknown } }
+    expect(parsed.issue.lastSeenTime).toBe("2026-11-13T21:14:02.000Z")
   })
 })

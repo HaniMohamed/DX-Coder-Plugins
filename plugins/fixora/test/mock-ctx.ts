@@ -120,8 +120,9 @@ export function mockCtx(o: { directory: string; options?: Record<string, unknown
       transform: async (cb: (editor: { add: (t: Omit<RegisteredTool, "id">) => void; list: () => RegisteredTool[] }) => void) => {
         cb({
           add: (t) => {
-            const id = t.options?.namespace ? `${t.options.namespace}_${t.name}`.replace(/^fixora_fixora_/, "fixora_") : t.name
-            tools.set(id, { ...t, id: t.name.startsWith("fixora_") ? t.name : id })
+            // Mirrors the host: a namespaced tool's effective id is `<namespace>_<name>`.
+            const id = t.options?.namespace ? `${t.options.namespace}_${t.name}` : t.name
+            tools.set(id, { ...t, id })
           },
           list: () => [...tools.values()],
         })

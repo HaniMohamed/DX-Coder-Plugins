@@ -1,8 +1,8 @@
 // Merge request / pull request creation: GitLab or GitHub MCP → glab / gh CLI → compare URL.
 
 import type { Plugin } from "@opencode/plugin"
-import { compareUrl, type ParsedRemote } from "./git.js"
-import { callTool } from "./mcp.js"
+import { compareUrl, shellQuote, spawnShell, type ParsedRemote } from "./git.js"
+import { adaptInput, callTool, toolInputProps } from "./mcp.js"
 import type { FixoraOptions } from "./options.js"
 import type { DetectedService, Services } from "./types.js"
 
@@ -26,8 +26,7 @@ const str = (v: unknown) => (typeof v === "string" ? v : typeof v === "number" ?
 
 export async function cliAvailable(bin: string): Promise<boolean> {
   try {
-    const proc = Bun.spawn([bin, "--version"], { stdout: "ignore", stderr: "ignore", stdin: "ignore" })
-    return (await proc.exited) === 0
+    return (await spawnShell(`command -v ${shellQuote(bin)} >/dev/null 2>&1 && ${shellQuote(bin)} --version >/dev/null 2>&1`, { cwd: process.env.HOME ?? "/", timeoutMs: 20_000 })).code === 0
   } catch {
     return false
   }
@@ -66,11 +65,21 @@ export async function pickMrProvider(services: Services, remote: ParsedRemote, o
 }
 
 async function run(cmd: string[], cwd: string, timeoutMs = 120_000): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore", env: { ...process.env, GIT_TERMINAL_PROMPT: "0", NO_COLOR: "1" } })
-  const timer = setTimeout(() => proc.kill(), timeoutMs)
-  const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
-  clearTimeout(timer)
-  return { code, stdout, stderr }
+  const r = await spawnShell(cmd.map(shellQuote).join(" "), { cwd, timeoutMs })
+  return { code: r.timedOut ? 124 : r.code, stdout: r.stdout, stderr: r.stderr }
+}
+
+/** Spellings GitLab MCP servers use for the same fields (zereight: snake_case; others: `projectId`, `mrIid`, `body`…). */
+export const GITLAB_ALIASES: Record<string, string[]> = {
+  project_id: ["projectId", "project", "project_path", "projectPath", "id"],
+  source_branch: ["sourceBranch", "source", "branch", "head"],
+  target_branch: ["targetBranch", "target", "base"],
+  description: ["body", "desc"],
+  merge_request_iid: ["mergeRequestIid", "mr_iid", "mrIid", "iid", "merge_request_id", "mergeRequestId", "mr_id", "mrId"],
+  remove_source_branch: ["removeSourceBranch", "delete_source_branch", "deleteSourceBranch"],
+  state_event: ["stateEvent", "state"],
+  labels: ["label"],
+  reviewer_ids: ["reviewerIds", "reviewers"],
 }
 
 export function gitlabCreateInput(t: MrTarget, mr: { title: string; body: string; draft: boolean; labels: string[]; reviewers: string[] }): Record<string, unknown> {
@@ -107,7 +116,8 @@ export async function createMr(ctx: Plugin.Context, o: { provider: MrProvider; t
   const t = o.target
   switch (o.provider) {
     case "gitlab-mcp": {
-      const raw = await callTool(ctx, o.services.gitlab!.capabilities.createMr!, gitlabCreateInput(t, o), { sessionID: o.sessionID })
+      const tool = o.services.gitlab!.capabilities.createMr!
+      const raw = await callTool(ctx, tool, adaptInput(gitlabCreateInput(t, o), await toolInputProps(ctx, tool), GITLAB_ALIASES), { sessionID: o.sessionID })
       const { url, id } = urlFromResult(raw)
       if (!url) throw new Error(`create_merge_request returned no URL: ${JSON.stringify(raw).slice(0, 300)}`)
       return { url, id, provider: "gitlab-mcp", status: o.draft ? "draft" : "open" }
@@ -148,7 +158,7 @@ export async function updateMr(ctx: Plugin.Context, o: { provider: MrProvider; t
     case "gitlab-mcp": {
       const tool = o.services.gitlab?.capabilities.updateMr
       if (!tool || !o.id) return
-      await callTool(ctx, tool, { project_id: `${o.target.remote.owner}/${o.target.remote.repo}`, merge_request_iid: Number(o.id), ...(o.title ? { title: o.title } : {}), ...(o.body ? { description: o.body } : {}), ...(o.close ? { state_event: "close" } : {}) }, { sessionID: o.sessionID })
+      await callTool(ctx, tool, adaptInput({ project_id: `${o.target.remote.owner}/${o.target.remote.repo}`, merge_request_iid: Number(o.id), ...(o.title ? { title: o.title } : {}), ...(o.body ? { description: o.body } : {}), ...(o.close ? { state_event: "close" } : {}) }, await toolInputProps(ctx, tool), GITLAB_ALIASES), { sessionID: o.sessionID })
       return
     }
     case "github-mcp": {
@@ -190,7 +200,7 @@ export async function syncMrStatus(ctx: Plugin.Context, o: { provider: MrProvide
       case "gitlab-mcp": {
         const tool = o.services.gitlab?.capabilities.getMr
         if (!tool || !o.id) return undefined
-        return statusFromResult(await callTool(ctx, tool, { project_id: `${o.target.remote.owner}/${o.target.remote.repo}`, merge_request_iid: Number(o.id) }, { sessionID: o.sessionID }))
+        return statusFromResult(await callTool(ctx, tool, adaptInput({ project_id: `${o.target.remote.owner}/${o.target.remote.repo}`, merge_request_iid: Number(o.id) }, await toolInputProps(ctx, tool), GITLAB_ALIASES), { sessionID: o.sessionID }))
       }
       case "github-mcp": {
         const tool = o.services.github?.capabilities.getPr

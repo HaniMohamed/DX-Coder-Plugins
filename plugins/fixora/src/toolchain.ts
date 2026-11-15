@@ -14,6 +14,8 @@ export interface Ecosystem {
   /** Repo-relative directory ("" = root). */
   root: string
   checks: CheckCommand[]
+  /** Commands a fresh worktree needs before any check can run (dependency resolution); never capped away. */
+  bootstrap: CheckCommand[]
   /** Builds a test command limited to the given test files (repo-relative). */
   subset?: (files: string[]) => string | undefined
   testFilePatterns: RegExp[]
@@ -42,10 +44,14 @@ export async function detectEcosystems(repoRoot: string, timeoutMs = DEFAULT_TIM
     if (has("pubspec.yaml")) {
       const pubspec = await readFile(join(dir, "pubspec.yaml"), "utf8").catch(() => "")
       const flutter = /^\s*flutter:\s*$/m.test(pubspec) || /sdk:\s*flutter/.test(pubspec)
-      const bin = flutter ? "flutter" : "dart"
+      // Projects pinned through fvm must use its Flutter, not whatever `flutter` is on PATH.
+      const fvm = [dir, repoRoot].some((d) => existsSync(join(d, ".fvmrc")) || existsSync(join(d, ".fvm")))
+      const bin = flutter ? (fvm ? "fvm flutter" : "flutter") : fvm ? "fvm dart" : "dart"
+      const resolved = existsSync(join(dir, ".dart_tool", "package_config.json"))
       out.push({
         id: flutter ? "flutter" : "dart",
         root: rel,
+        bootstrap: resolved ? [] : [cmd("setup", `${bin} pub get`)],
         checks: [cmd("lint", `${bin} analyze`), cmd("unit", `${bin} test`), ...(has("integration_test") && flutter ? [cmd("integration", "flutter test integration_test", true)] : [])],
         subset: (files) => (files.length ? `${bin} test ${files.map(q).join(" ")}` : undefined),
         testFilePatterns: [/_test\.dart$/],
@@ -57,6 +63,9 @@ export async function detectEcosystems(repoRoot: string, timeoutMs = DEFAULT_TIM
       const scripts = (pkg.scripts ?? {}) as Record<string, string>
       const runner = has("bun.lock") || has("bun.lockb") ? "bun" : has("pnpm-lock.yaml") ? "pnpm" : has("yarn.lock") ? "yarn" : "npm"
       const run = (script: string) => (runner === "npm" ? `npm run ${script}` : `${runner} run ${script}`)
+      const install = runner === "bun" ? "bun install" : runner === "pnpm" ? "pnpm install --frozen-lockfile" : runner === "yarn" ? "yarn install --frozen-lockfile" : has("package-lock.json") ? "npm ci" : "npm install"
+      const declared = Object.keys({ ...((pkg.dependencies as object) ?? {}), ...((pkg.devDependencies as object) ?? {}) }).length
+      const bootstrap: CheckCommand[] = has("node_modules") || declared === 0 ? [] : [cmd("setup", install)]
       const checks: CheckCommand[] = []
       if (scripts.lint) checks.push(cmd("lint", run("lint")))
       if (scripts.typecheck) checks.push(cmd("typecheck", run("typecheck")))
@@ -72,13 +81,14 @@ export async function detectEcosystems(repoRoot: string, timeoutMs = DEFAULT_TIM
         if (runner === "bun" || /bun test/.test(testCmd)) return `bun test ${files.map(q).join(" ")}`
         return undefined
       }
-      out.push({ id: "node", root: rel, checks, subset, testFilePatterns: [/\.(test|spec)\.[cm]?[jt]sx?$/, /(^|\/)__tests__\//], testDirs: ["test", "tests", "__tests__", "spec"] })
+      out.push({ id: "node", root: rel, bootstrap, checks, subset, testFilePatterns: [/\.(test|spec)\.[cm]?[jt]sx?$/, /(^|\/)__tests__\//], testDirs: ["test", "tests", "__tests__", "spec"] })
     }
     if (has("gradlew") || has("build.gradle") || has("build.gradle.kts")) {
       const gw = has("gradlew") ? "./gradlew" : "gradle"
       out.push({
         id: "gradle",
         root: rel,
+        bootstrap: [],
         checks: [cmd("build", `${gw} compileDebugKotlin compileDebugJavaWithJavac --quiet`, true), cmd("unit", `${gw} testDebugUnitTest --quiet`), cmd("lint", `${gw} lintDebug --quiet`, true)],
         subset: (files) => {
           const classes = files.map((f) => /([A-Za-z0-9_]+)\.(kt|java)$/.exec(f)?.[1]).filter(Boolean)
@@ -88,14 +98,14 @@ export async function detectEcosystems(repoRoot: string, timeoutMs = DEFAULT_TIM
         testDirs: ["src/test", "src/androidTest"],
       })
     } else if (has("pom.xml")) {
-      out.push({ id: "maven", root: rel, checks: [cmd("build", "mvn -q -DskipTests compile"), cmd("unit", "mvn -q test")], testFilePatterns: [/Test\.java$/], testDirs: ["src/test"] })
+      out.push({ id: "maven", root: rel, bootstrap: [], checks: [cmd("build", "mvn -q -DskipTests compile"), cmd("unit", "mvn -q test")], testFilePatterns: [/Test\.java$/], testDirs: ["src/test"] })
     }
     const xcodeproj = (await readdir(dir).catch(() => [])).filter((f) => /\.(xcworkspace|xcodeproj)$/.test(f))
     if (xcodeproj.length > 0 && !has("Package.swift")) {
-      out.push({ id: "xcode", root: rel, checks: [cmd("build", "xcodebuild build -quiet CODE_SIGNING_ALLOWED=NO", true)], testFilePatterns: [/Tests?\.swift$/, /(^|\/)\w+Tests\//], testDirs: [] })
+      out.push({ id: "xcode", root: rel, bootstrap: [], checks: [cmd("build", "xcodebuild build -quiet CODE_SIGNING_ALLOWED=NO", true)], testFilePatterns: [/Tests?\.swift$/, /(^|\/)\w+Tests\//], testDirs: [] })
     }
     if (has("Package.swift")) {
-      out.push({ id: "spm", root: rel, checks: [cmd("build", "swift build"), cmd("unit", "swift test")], subset: (files) => (files.length ? `swift test --filter ${files.map((f) => /([A-Za-z0-9_]+)\.swift$/.exec(f)?.[1]).filter(Boolean).join("|")}` : undefined), testFilePatterns: [/Tests?\.swift$/], testDirs: ["Tests"] })
+      out.push({ id: "spm", root: rel, bootstrap: [], checks: [cmd("build", "swift build"), cmd("unit", "swift test")], subset: (files) => (files.length ? `swift test --filter ${files.map((f) => /([A-Za-z0-9_]+)\.swift$/.exec(f)?.[1]).filter(Boolean).join("|")}` : undefined), testFilePatterns: [/Tests?\.swift$/], testDirs: ["Tests"] })
     }
     if (has("pyproject.toml") || has("setup.py") || has("pytest.ini") || has("requirements.txt")) {
       const py = await readFile(join(dir, "pyproject.toml"), "utf8").catch(() => "")
@@ -103,17 +113,17 @@ export async function detectEcosystems(repoRoot: string, timeoutMs = DEFAULT_TIM
       if (/\[tool\.ruff\]/.test(py) || has("ruff.toml") || has(".ruff.toml")) checks.push(cmd("lint", "ruff check ."))
       if (/\[tool\.mypy\]/.test(py) || has("mypy.ini")) checks.push(cmd("typecheck", "mypy .", true))
       checks.push(cmd("unit", "pytest -q"))
-      out.push({ id: "python", root: rel, checks, subset: (files) => (files.length ? `pytest -q ${files.map(q).join(" ")}` : undefined), testFilePatterns: [/(^|\/)test_[^/]+\.py$/, /_test\.py$/, /(^|\/)tests?\//], testDirs: ["tests", "test"] })
+      out.push({ id: "python", root: rel, bootstrap: [], checks, subset: (files) => (files.length ? `pytest -q ${files.map(q).join(" ")}` : undefined), testFilePatterns: [/(^|\/)test_[^/]+\.py$/, /_test\.py$/, /(^|\/)tests?\//], testDirs: ["tests", "test"] })
     }
     if (has("go.mod")) {
-      out.push({ id: "go", root: rel, checks: [cmd("typecheck", "go vet ./..."), cmd("unit", "go test ./...")], subset: (files) => {
+      out.push({ id: "go", root: rel, bootstrap: [], checks: [cmd("typecheck", "go vet ./..."), cmd("unit", "go test ./...")], subset: (files) => {
         const dirs = [...new Set(files.map((f) => dirname(f)).map((d) => (d === "." || d === "" ? "." : `./${d}`)))]
         return dirs.length ? `go test ${dirs.map((d) => `${d}/...`).join(" ")}` : undefined
       }, testFilePatterns: [/_test\.go$/], testDirs: [] })
     }
     const dotnet = (await readdir(dir).catch(() => [])).some((f) => /\.(sln|csproj|fsproj)$/.test(f))
-    if (dotnet) out.push({ id: "dotnet", root: rel, checks: [cmd("build", "dotnet build --nologo -v q"), cmd("unit", "dotnet test --nologo -v q --no-build")], testFilePatterns: [/Tests?\.cs$/, /(^|\/)\w+\.Tests\//], testDirs: [] })
-    if (has("Cargo.toml")) out.push({ id: "rust", root: rel, checks: [cmd("typecheck", "cargo check --quiet"), cmd("unit", "cargo test --quiet")], testFilePatterns: [/(^|\/)tests\//, /_test\.rs$/], testDirs: ["tests"] })
+    if (dotnet) out.push({ id: "dotnet", root: rel, bootstrap: [], checks: [cmd("build", "dotnet build --nologo -v q"), cmd("unit", "dotnet test --nologo -v q --no-build")], testFilePatterns: [/Tests?\.cs$/, /(^|\/)\w+\.Tests\//], testDirs: [] })
+    if (has("Cargo.toml")) out.push({ id: "rust", root: rel, bootstrap: [], checks: [cmd("typecheck", "cargo check --quiet"), cmd("unit", "cargo test --quiet")], testFilePatterns: [/(^|\/)tests\//, /_test\.rs$/], testDirs: ["tests"] })
   }
   return dedupe(out)
 }
@@ -151,17 +161,92 @@ async function candidateRoots(repoRoot: string): Promise<string[]> {
 
 /** Picks the ecosystem whose root is the nearest ancestor of the given repo-relative paths. */
 export function nearestEcosystems(ecosystems: Ecosystem[], paths: string[]): Ecosystem[] {
-  if (ecosystems.length <= 1 || paths.length === 0) return ecosystems
+  if (ecosystems.length <= 1) return ecosystems
   const picked = new Set<Ecosystem>()
   for (const p of paths) {
-    let best: Ecosystem | undefined
+    // All ecosystems sharing the deepest root that contains the path (e.g. flutter + node at "").
+    let depth = -1
+    let best: Ecosystem[] = []
     for (const e of ecosystems) {
       const root = e.root ? `${e.root}/` : ""
-      if (p.startsWith(root) && (!best || root.length > (best.root ? best.root.length + 1 : 0))) best = e
+      if (!p.startsWith(root)) continue
+      const d = root.length
+      if (d > depth) {
+        depth = d
+        best = [e]
+      } else if (d === depth) best.push(e)
     }
-    if (best) picked.add(best)
+    for (const e of best) picked.add(e)
   }
-  return picked.size > 0 ? [...picked] : ecosystems
+  if (picked.size > 0) return ecosystems.filter((e) => picked.has(e))
+  // Nothing matched (or no paths): only the repository-level ecosystems, never every nested package.
+  const atRoot = ecosystems.filter((e) => !e.root)
+  if (atRoot.length > 0) return atRoot
+  const shallowest = Math.min(...ecosystems.map((e) => e.root.split("/").length))
+  return ecosystems.filter((e) => e.root.split("/").length === shallowest).slice(0, 2)
+}
+
+export const MAX_CHECKS = 8
+const KIND_PRIORITY: Record<CheckKind, number> = { setup: -1, lint: 0, typecheck: 1, syntax: 2, unit: 3, integration: 4, build: 5 }
+
+export interface CheckPlanInput {
+  ecosystems: Ecosystem[]
+  overrides: FixoraOptions["testCommands"]
+  /** Repo-relative paths changed in the worktree; the plan is scoped to the packages they live in. */
+  changedPaths: string[]
+  scope: "mapped" | "full" | "skip"
+  timeoutMs: number
+  fullSuiteMaxMinutes: number
+  max?: number
+}
+
+/**
+ * The checks to run for a change set: only the ecosystems owning the changed files, test subset
+ * first (when test files changed) then the full suite within the time budget, deduplicated and
+ * capped by priority (lint, typecheck, syntax, unit, integration, build; optional ones go first).
+ */
+export function buildCheckPlan(input: CheckPlanInput): CheckCommand[] {
+  const relevant = nearestEcosystems(input.ecosystems, input.changedPaths)
+  const base = mergeOverrides(relevant, input.overrides, input.timeoutMs)
+  if (input.scope === "skip") return dedupeChecks(base.filter((c) => c.kind !== "unit" && c.kind !== "integration"))
+  const setupCount = base.filter((c) => c.kind === "setup").length
+  const out: CheckCommand[] = []
+  const testFiles = input.changedPaths.filter((p) => isTestFile(p, relevant))
+  for (const c of base) {
+    if (c.kind !== "unit") {
+      out.push(c)
+      continue
+    }
+    const eco = relevant.find((e) => (e.root || "") === (c.cwd || "") && e.subset)
+    const rel = testFiles.map((p) => (eco?.root ? relative(eco.root, p) : p)).filter((p) => !p.startsWith(".."))
+    const subset = rel.length > 0 && input.scope !== "full" ? eco?.subset?.(rel) : undefined
+    if (subset) out.push({ ...c, command: subset })
+    if (!subset || input.scope === "full" || input.fullSuiteMaxMinutes > 0) out.push({ ...c, timeoutMs: Math.min(c.timeoutMs, Math.max(60_000, input.fullSuiteMaxMinutes * 60_000)) })
+  }
+  return capChecks(dedupeChecks(out), (input.max ?? MAX_CHECKS) + setupCount)
+}
+
+export function dedupeChecks(list: CheckCommand[]): CheckCommand[] {
+  const seen = new Set<string>()
+  return list.filter((c) => {
+    const key = `${c.cwd ?? ""}|${c.command}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+/** Keeps at most `max` checks: optional ones are dropped first, then the lowest-priority kinds. */
+export function capChecks(list: CheckCommand[], max: number): CheckCommand[] {
+  if (list.length <= max) return list
+  const ranked = list.map((c, i) => ({ c, i, score: (c.optional ? 100 : 0) + KIND_PRIORITY[c.kind] * 10 }))
+  const keep = new Set(
+    [...ranked]
+      .sort((a, b) => a.score - b.score || a.i - b.i)
+      .slice(0, max)
+      .map((r) => r.i),
+  )
+  return list.filter((_, i) => keep.has(i))
 }
 
 /** Applies option overrides (null = keep detected, "" = disable kind, string = replace). */
@@ -177,8 +262,11 @@ export function mergeOverrides(detected: Ecosystem[], overrides: FixoraOptions["
   add("typecheck", overrides.typecheck)
   add("unit", overrides.unit)
   add("integration", overrides.integration)
+  // Bootstraps (dependency resolution) come first; a fresh worktree has no packages resolved yet.
+  const setup: CheckCommand[] = []
+  for (const e of detected) for (const c of e.bootstrap ?? []) setup.push({ ...c, timeoutMs: Math.max(timeoutMs, 15 * 60_000) })
   for (const e of detected) for (const c of e.checks) if (!overridden.has(c.kind)) out.push({ ...c, timeoutMs })
-  return out
+  return [...setup, ...out]
 }
 
 export function isTestFile(path: string, ecosystems: Ecosystem[]): boolean {

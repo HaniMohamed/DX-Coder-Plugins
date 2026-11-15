@@ -4,6 +4,7 @@ import { crashlytics } from "./crashlytics.js"
 import { manual } from "./manual.js"
 import { sentry } from "./sentry.js"
 import type { CrashSource, ListQuery, SourceContext } from "./types.js"
+import { describeError } from "../errors.js"
 
 export const SOURCES: CrashSource[] = [sentry, crashlytics, manual]
 
@@ -38,7 +39,8 @@ export async function listTopCrashes(sc: SourceContext, q: ListQuery & { source?
     try {
       out.push(...(await s.list(sc, q)))
     } catch (error) {
-      errors.push(`${s.id}: ${error instanceof Error ? error.message : String(error)}`)
+      errors.push(`${s.id}: ${describeError(error)}`)
+      console.error(`[fixora] ${s.id} list failed:`, error)
     }
   }
   out.sort((a, b) => (b.userCount ?? 0) - (a.userCount ?? 0) || (b.eventCount ?? 0) - (a.eventCount ?? 0))

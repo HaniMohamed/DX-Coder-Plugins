@@ -129,7 +129,7 @@ export interface ReviewVerdict {
   summary: string
 }
 
-export type CheckKind = "syntax" | "lint" | "typecheck" | "unit" | "integration" | "build"
+export type CheckKind = "setup" | "syntax" | "lint" | "typecheck" | "unit" | "integration" | "build"
 
 export interface CheckCommand {
   kind: CheckKind
@@ -193,6 +193,10 @@ export interface RunRecord {
   fingerprint: string
   title: string
   originSessionID: string
+  /** Repository root the run works in (the originating session's project, not the plugin's location). */
+  repo: string
+  /** Host project id of that repository, used for worktree calls. */
+  projectID?: string
   createdAt: string
   updatedAt: string
   step: Step
@@ -252,6 +256,8 @@ export interface WorkerInfo {
   role: "fixer" | "reviewer"
   worktree: string
   phase: "triage" | "fix" | "review" | "feedback"
+  /** The original checkout; paths pointing into it are remapped onto the worktree by the tool hook. */
+  repo?: string
 }
 
 export type ServiceId = "sentry" | "crashlytics" | "jira" | "gitlab" | "github"

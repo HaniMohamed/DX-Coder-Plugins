@@ -167,6 +167,46 @@ export function resolveInside(candidate: string, directory: string): string {
   return normalizePath(isAbsolutePath(candidate) ? candidate : `${directory.replace(/[\\/]+$/, "")}/${candidate}`)
 }
 
+/** Tools whose input names a file or directory the worker is working on. */
+export const PATH_TOOLS = new Set(["read", "write", "edit", "multiedit", "glob", "grep", "list", "ls"])
+const PATH_KEYS = ["path", "filePath", "file_path", "file", "cwd", "directory", "dir"]
+
+/**
+ * Crash traces from local builds carry absolute paths of the ORIGINAL checkout; the worker then reads
+ * or edits there instead of the worktree. Rewrite any such path onto the same relative path inside
+ * the worktree. Returns the same object when nothing changes.
+ */
+export function remapToWorktree(input: unknown, o: { repo?: string; worktree: string }): unknown {
+  if (!o.repo || !input || typeof input !== "object" || Array.isArray(input)) return input
+  const repo = normalizePath(o.repo)
+  const worktree = normalizePath(o.worktree)
+  if (repo === worktree) return input
+  let out: Record<string, unknown> | undefined
+  for (const key of PATH_KEYS) {
+    const value = (input as Record<string, unknown>)[key]
+    if (typeof value !== "string" || !isAbsolutePath(value)) continue
+    const abs = normalizePath(value)
+    if (abs !== repo && !abs.startsWith(`${repo}/`)) continue
+    const rel = abs === repo ? "" : abs.slice(repo.length + 1)
+    out ??= { ...(input as Record<string, unknown>) }
+    out[key] = rel ? `${worktree}/${rel}` : worktree
+  }
+  return out ?? input
+}
+
+/**
+ * Changes that dependency resolution / tool caches produce on their own (lockfiles, .dart_tool,
+ * node_modules…). They are never part of the fix: ignored in the change set, the diff, the commit
+ * and the dirty-worktree check. A fix that genuinely needs a lockfile change is still refused by
+ * FORBIDDEN_GLOBS, by design.
+ */
+export const GENERATED_CHANGE_GLOBS = ["**/*.lock", "package-lock.json", "**/package-lock.json", "yarn.lock", "**/yarn.lock", "pnpm-lock.yaml", "**/pnpm-lock.yaml", "bun.lock*", "**/bun.lock*", "Podfile.lock", "**/Podfile.lock", "pubspec.lock", "**/pubspec.lock", "Cargo.lock", "go.sum", ".dart_tool/**", "**/.dart_tool/**", "**/.flutter-plugins*", "**/.packages", "node_modules/**", "**/node_modules/**", "build/**", "**/build/**", "**/.pub-cache/**", "**/.gradle/**", "**/Pods/**", "**/.dxcoder/**"]
+const GENERATED = GENERATED_CHANGE_GLOBS.map(globToRegExp)
+export const isGeneratedChange = (path: string) => {
+  const p = path.replace(/\\/g, "/").replace(/^\.\//, "")
+  return GENERATED.some((re) => re.test(p))
+}
+
 export interface WriteGuardInput {
   tool: string
   input: unknown

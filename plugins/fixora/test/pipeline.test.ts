@@ -120,7 +120,7 @@ beforeAll(async () => {
     isWorkerSession: async (id) => mock.sessions.has(id),
     start: async () => ({ started: [], errors: [] }),
   })
-})
+}, 180_000)
 afterAll(() => rm(root, { recursive: true, force: true }))
 
 describe("pipeline end to end", () => {
@@ -169,14 +169,14 @@ describe("pipeline end to end", () => {
     // The main checkout was never touched.
     expect(await git.isClean(repo)).toBe(true)
     expect(await git.currentBranch(repo)).toBe("main")
-  })
+  }, 180_000)
 
   test("re-running the same crash is refused; status renders; retry of a done run is refused", async () => {
     await expect(runFix(rt, { sessionID: "origin", ref: `manual:${runId.replace("manual-", "")}`, flags: { dryRun: false, ticket: true, mr: true, push: true, auto: false, force: false, forceTriage: false } })).rejects.toThrow("already")
     await runStatus(rt, { sessionID: "origin", runId })
     expect(mock.synthetics.pop()!.text).toContain("| analyse | ok |")
     await expect(runRetry(rt, { sessionID: "origin", runId, fresh: false, flags: { dryRun: false, ticket: true, mr: true, push: true, auto: false, force: false, forceTriage: false } })).rejects.toThrow("already done")
-  })
+  }, 180_000)
 
   test("feedback: a question gets an answer without changes; a change request re-runs validate → push", async () => {
     mock.synthetics.length = 0
@@ -190,7 +190,7 @@ describe("pipeline end to end", () => {
     expect(changed.reviews).toHaveLength(2)
     expect(await git.remoteBranchSha(repo, "origin", changed.branch!)).toBe(changed.commitShas[1])
     expect(readFileSync(join(changed.worktree!, "src", "cart", "service.ts"), "utf8")).toContain("c == null")
-  })
+  }, 180_000)
 
   test("a rejected publish approval stops cleanly and can be retried from push", async () => {
     mock.rejectPermissions.add("fixora.publish")
@@ -203,7 +203,7 @@ describe("pipeline end to end", () => {
     const retried = await runRetry(rt, { sessionID: "origin", runId, from: "push", fresh: false, flags: { dryRun: false, ticket: true, mr: true, push: true, auto: false, force: false, forceTriage: false } })
     expect(retried.status).toBe("done")
     expect(retried.pipeline.pushed).toBe(true)
-  })
+  }, 180_000)
 
   test("restart creates a new branch and a fresh cycle", async () => {
     const restarted = await runRestart(rt, { sessionID: "origin", runId, flags: { dryRun: false, ticket: true, mr: true, push: true, auto: false, force: false, forceTriage: false } })
@@ -211,7 +211,7 @@ describe("pipeline end to end", () => {
     expect(restarted.counters.restarts).toBeGreaterThanOrEqual(1)
     expect(/-r\d+$/.test(restarted.branch!)).toBe(true)
     expect(await git.remoteBranchSha(repo, "origin", restarted.branch!)).toBe(restarted.commitShas[0])
-  })
+  }, 180_000)
 
   test("dry run stops before commit and writes the MR body", async () => {
     const run = await startPipeline(rt, { ...(await loadRun(mock.ctx, runId))!, flags: { dryRun: true, ticket: false, mr: true, push: true, auto: false, force: true, testFirst: false }, status: "running", commitShas: [], pipeline: { analysed: false, ticketed: false, fixed: false, validated: false, reviewed: false, committed: false, pushed: false, mrOpened: false, loopClosed: false }, timings: {}, branch: undefined, worktree: undefined, sessions: {}, reviews: [], fix: undefined, tests: undefined, triage: undefined, counters: { fixRounds: 0, reviewRounds: 0, feedback: 0, restarts: 5, workerPrompts: 0 } }, { from: "detect" })
@@ -219,5 +219,5 @@ describe("pipeline end to end", () => {
     expect(run.commitShas).toHaveLength(0)
     expect(existsSync(join(run.folder, "mr.md"))).toBe(true)
     expect(readFileSync(join(run.folder, "mr.md"), "utf8")).toContain("## Root cause")
-  })
+  }, 180_000)
 })

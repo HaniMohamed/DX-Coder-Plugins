@@ -8,7 +8,7 @@ import { join } from "node:path"
 import { validateFix, validateReview, validateTriage } from "./contracts.js"
 import { git } from "./git.js"
 import type { FixoraOptions } from "./options.js"
-import { forbiddenReason } from "./permissions.js"
+import { forbiddenReason, isGeneratedChange } from "./permissions.js"
 import { loadRun, loadWorker, saveRun } from "./state.js"
 import { isTestFile, type Ecosystem } from "./toolchain.js"
 import type { FixReport, ReviewVerdict, Triage, Validation, WorkerInfo } from "./types.js"
@@ -107,7 +107,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
 
   await ctx.tool.transform((editor) => {
     editor.add({
-      name: "fixora_submit_triage",
+      name: "submit_triage",
       description: "Fixora worker (triage phase): submit the root-cause analysis for the current run. Validated on receipt; errors are returned so you can correct and resubmit.",
       input: TRIAGE_SCHEMA,
       options: { namespace: "fixora", codemode: false },
@@ -127,7 +127,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
     })
 
     editor.add({
-      name: "fixora_submit_fix",
+      name: "submit_fix",
       description: "Fixora worker (fix phase): submit the fix report after changing code and running the project's checks. Validated against git status, forbidden paths and limits; errors are returned so you can correct and resubmit.",
       input: FIX_SCHEMA,
       options: { namespace: "fixora", codemode: false },
@@ -137,7 +137,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         const run = await loadRun(ctx, w.info.runId)
         if (!run) return failure([`run ${w.info.runId} not found`], "fix report")
         const opts = deps.options()
-        const changed = (await git.statusPorcelain(w.info.worktree)).map((f) => f.path)
+        const changed = (await git.statusPorcelain(w.info.worktree)).map((f) => f.path).filter((p) => !isGeneratedChange(p))
         const ecosystems = await deps.ecosystems(run.runId)
         const attempt = run.counters.fixRounds + run.counters.reviewRounds + run.counters.feedback + 1
         const result: Validation<FixReport> = validateFix(input, {
@@ -161,7 +161,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
     })
 
     editor.add({
-      name: "fixora_submit_review",
+      name: "submit_review",
       description: "Fixora reviewer: submit the review verdict for the current diff. Any blocker finding makes the verdict a rejection.",
       input: REVIEW_SCHEMA,
       options: { namespace: "fixora", codemode: false },
@@ -182,7 +182,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
     })
 
     editor.add({
-      name: "fixora_start",
+      name: "start",
       description: "Start Fixora runs for one or more crash references (e.g. \"sentry:12345\", \"crashlytics:abc\", or a crash URL). Use after the user picked crashes from the /fixora list. Not available inside Fixora worker sessions.",
       input: START_SCHEMA,
       options: { namespace: "fixora", codemode: false },

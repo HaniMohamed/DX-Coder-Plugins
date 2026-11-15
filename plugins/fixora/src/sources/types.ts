@@ -23,6 +23,8 @@ export interface CrashSource {
   parseRef(input: string, options: FixoraOptions): { id: string; extra?: Record<string, string> } | undefined
   list?(sc: SourceContext, q: ListQuery): Promise<CrashSummary[]>
   get(sc: SourceContext, id: string, extra?: Record<string, string>): Promise<Crash>
+  /** Diagnostic: one real list call per app with the raw reply (optional). */
+  probe?(sc: SourceContext): Promise<Array<{ label?: string; toolId: string; input: Record<string, unknown>; raw?: unknown; parsedCount?: number; error?: string }>>
   /** Posts a note / link back to the source (optional). */
   annotate?(sc: SourceContext, id: string, note: { text: string; mrUrl?: string; jiraKey?: string }, extra?: Record<string, string>): Promise<void>
 }

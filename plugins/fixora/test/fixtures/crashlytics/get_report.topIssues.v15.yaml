@@ -1,0 +1,43 @@
+name: projects/10866044419/apps/1:10866044419:android:6352c04266dbc3babba836/reports/topIssues
+filters: |
+  issueErrorTypes:
+    - FATAL
+  intervalStartTime: '2026-10-31T00:00:00.000Z'
+  intervalEndTime: '2026-11-14T00:00:00.000Z'
+groups: |
+  - issue:
+      name: projects/10866044419/apps/1:10866044419:android:6352c04266dbc3babba836/issues/0123456789abcdef0123456789abcdef
+      id: 0123456789abcdef0123456789abcdef
+      title: Null check operator used on a null value
+      subtitle: checkout_page.dart - _CheckoutPageState.build
+      errorType: FATAL
+      sampleEvent: projects/10866044419/apps/1:10866044419:android:6352c04266dbc3babba836/events/evt-1
+      firstSeenVersion:
+        displayVersion: 3.1.0
+        buildVersion: '310'
+      lastSeenVersion:
+        displayVersion: 3.1.9
+        buildVersion: '319'
+      uri: https://console.firebase.google.com/project/taminaty/crashlytics/app/1:10866044419:android:6352c04266dbc3babba836/issues/0123456789abcdef0123456789abcdef
+    metrics:
+      - startTime: '2026-10-31T00:00:00.000Z'
+        endTime: '2026-11-14T00:00:00.000Z'
+        eventsCount: '1402'
+        impactedUsersCount: '612'
+        sessionsCount: '1300'
+        crashFreeUsersPercentage: 45.2448
+  - issue:
+      name: projects/10866044419/apps/1:10866044419:android:6352c04266dbc3babba836/issues/fedcba9876543210fedcba9876543210
+      id: fedcba9876543210fedcba9876543210
+      title: 'java.lang.IllegalStateException: Fragment not attached'
+      subtitle: LoginFragment.kt - LoginFragment.onResume
+      errorType: FATAL
+      lastSeenVersion:
+        displayVersion: 3.1.8
+        buildVersion: '318'
+    metrics:
+      - startTime: '2026-10-31T00:00:00.000Z'
+        endTime: '2026-11-14T00:00:00.000Z'
+        eventsCount: '200'
+        impactedUsersCount: '97'
+usage: ''
