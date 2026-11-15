@@ -546,6 +546,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
           case "sync": {
             const s = typeof o.results.status === "string" ? o.results.status : undefined
             if (s === "draft" || s === "open" || s === "merged" || s === "closed") run.mrStatus = s
+            if (s === "merged" && typeof run.meta?.mergedAt !== "string") run.meta = { ...run.meta, mergedAt: at }
             break
           }
           default:

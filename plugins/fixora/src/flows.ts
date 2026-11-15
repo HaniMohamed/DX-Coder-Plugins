@@ -7,6 +7,7 @@ import { copyFile, mkdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import type { Flags } from "./command.js"
 import { describeError } from "./errors.js"
+import { crashFixOf, describeTally, isFixCandidate, tallyFixes } from "./crashstate.js"
 import { parseRemote, shellQuote } from "./git.js"
 import { jiraCommentInput } from "./jira.js"
 import { connected, detectServices, INSTALL_SOURCES, listServers, renderDoctor, renderToolSchema, toolSchemas } from "./mcp.js"
@@ -175,20 +176,9 @@ export async function runList(rt: Runtime, input: ListInput): Promise<{ crashes:
     }
     if (!record.result) throw new FixoraStop(outcome === "timeout" ? `Listing crashes exceeded ${rt.opts.worker.maxPhaseMinutes.list} minutes. See the lister session ${sessionID} and try again.` : `The lister session ${sessionID} did not report the crash list. See that session, then run /fixora again.`)
   }
-  const crashes = record.result!.crashes.map((c) => ({ ...c }))
+  const crashes = await annotateFixes(rt, record.result!.crashes.map((c) => ({ ...c })))
   const errors = [...record.result!.errors]
-  const states = new Map<string, { state: string; runId?: string; mrUrl?: string }>()
-  for (const c of crashes) {
-    const run = await loadRun(rt.ctx, runIdFor(c.source, c.id))
-    if (run) {
-      c.runId = run.runId
-      c.state = run.mrStatus === "merged" ? "merged" : run.mrUrl ? "mr_open" : run.status === "running" ? "in_progress" : run.status === "awaiting-approval" ? "awaiting" : run.status === "done" ? "fixed" : run.status === "skipped" ? "skipped" : run.reopened ? "reopened" : "failed"
-      c.fingerprint = run.fingerprint
-      states.set(run.fingerprint || run.runId, { state: c.state, runId: run.runId, mrUrl: run.mrUrl })
-      if (!run.fingerprint) states.set(run.runId, { state: c.state, runId: run.runId, mrUrl: run.mrUrl })
-    }
-  }
-  const table = renderCrashTable(crashes, { states })
+  const table = renderCrashTable(crashes)
   const hint = errors.length && crashes.length === 0 ? "\n\nEvery source call failed. HTML / 5xx / \"Unable to parse JSON\" errors are usually transient on the Google side or a proxy: run `/fixora` again, or `/fixora doctor --probe` to see the raw replies. 401 / 403 mean the MCP server's account cannot read this project." : ""
   const markdown = [`### Fixora · top crashes (${sources.map((s) => s.id).join(", ")})`, "", table, ...(errors.length ? ["", `Errors: ${errors.join("; ")}${hint}`] : [])].join("\n")
   const file = join(where.repo, ".dxcoder", "fixora", "crashes.md")
@@ -197,17 +187,38 @@ export async function runList(rt: Runtime, input: ListInput): Promise<{ crashes:
   return { crashes, markdown, errors, record }
 }
 
+/**
+ * Marks every listed crash Fixora already worked on: state, label, Jira / MR links, release and
+ * reopen history (`crash.fix`), derived from the run record and the crash index. Runs in flight in
+ * this process are reported as such even when storage lags behind.
+ */
+export async function annotateFixes(rt: Runtime, crashes: CrashSummary[], now = new Date().toISOString()): Promise<CrashSummary[]> {
+  for (const c of crashes) {
+    const run = await loadRun(rt.ctx, runIdFor(c.source, c.id))
+    if (!run) continue
+    const index = run.fingerprint ? await loadCrashIndex(rt.ctx, run.fingerprint) : undefined
+    const fix = crashFixOf(run, { index, crash: c, inflight: rt.inflight.has(run.runId), now })
+    c.runId = run.runId
+    c.state = fix.state
+    c.fix = fix
+    if (run.fingerprint) c.fingerprint = run.fingerprint
+  }
+  return crashes
+}
+
 export async function presentList(rt: Runtime, sessionID: string, list: { crashes: CrashSummary[]; markdown: string }) {
-  const refs = list.crashes.slice(0, 10).map((c) => c.ref ?? `${c.source}:${c.id}`)
+  const ref = (c: CrashSummary) => c.ref ?? `${c.source}:${c.id}`
+  const candidates = list.crashes.filter((c) => isFixCandidate(c.state)).slice(0, 10)
+  const tally = tallyFixes(list.crashes)
+  const fixed = list.crashes.filter((c) => c.fix && !isFixCandidate(c.state))
+  const ask = candidates.length
+    ? `Then, if the \`question\` tool is available, ask ONE multiple-choice question "Which crash should Fixora fix?" with these options (label = the ref, description = title and users): ${candidates.map(ref).join(", ")}, plus the option "Fix the top ${Math.min(3, candidates.length)}", plus "None for now". When the user answers, call the \`fixora_start\` tool with the chosen refs (for "Fix the top N" pass the first ${Math.min(3, candidates.length)} of these refs). If the question tool is not available, tell the user to run \`/fixora fix <ref>\`.`
+    : "Every listed crash already has a Fixora run (see the table); do not offer to start one. Point the user at the links and the commands under the table instead."
+  const skip = fixed.length ? `Do NOT offer these ${fixed.length} crash(es), they already have a Fixora run: ${fixed.map((c) => `${ref(c)} = ${c.fix!.label}`).join("; ")}. If the user asks about one of them, show its Jira / MR links from the table and suggest the command listed under "Already handled by Fixora".` : ""
   await rt.ctx.session.synthetic({
     sessionID: sessionID as never,
-    description: `fixora: ${list.crashes.length} crash(es) listed`,
-    text: [
-      "[fixora] Present the following table to the user verbatim as markdown.",
-      `Then, if the \`question\` tool is available, ask ONE multiple-choice question "Which crash should Fixora fix?" with these options (label = the ref, description = title and users): ${refs.join(", ")}, plus the option "Fix the top 3", plus "None for now". When the user answers, call the \`fixora_start\` tool with the chosen refs (for "Fix the top 3" pass the first three refs). If the question tool is not available, tell the user to run \`/fixora fix <ref>\`.`,
-      "",
-      list.markdown,
-    ].join("\n"),
+    description: `fixora: ${list.crashes.length} crash(es) listed, ${tally.fixed} already fixed`,
+    text: ["[fixora] Present the following table to the user verbatim as markdown (keep the links).", ask, skip, "", list.markdown].filter(Boolean).join("\n"),
     resume: true,
   })
 }
@@ -288,8 +299,8 @@ export async function runPaste(rt: Runtime, input: { sessionID: string; file: st
 
 export async function runTop(rt: Runtime, input: { sessionID: string; count: number; minUsers?: number; source?: Source; maxMinutes?: number; flags: Flags }): Promise<{ started: string[]; errors: string[] }> {
   const list = await runList(rt, { sessionID: input.sessionID, top: input.count * 3, minUsers: input.minUsers, source: input.source })
-  const candidates = list.crashes.filter((c) => !c.state || c.state === "new" || c.state === "failed" || c.state === "reopened").slice(0, input.count)
-  if (candidates.length === 0) throw new FixoraStop("No new crashes to fix (every listed crash already has a run). Use `/fixora` to see them.")
+  const candidates = list.crashes.filter((c) => isFixCandidate(c.state)).slice(0, input.count)
+  if (candidates.length === 0) throw new FixoraStop(`No new crashes to fix: ${describeTally(tallyFixes(list.crashes))}. Run \`/fixora\` to see the links, or \`/fixora fix <ref> --force\` to fix one again.`)
   await notify(rt.ctx, input.sessionID, `fixora: fixing ${candidates.length} crash(es) one after the other: ${candidates.map((c) => c.ref ?? `${c.source}:${c.id}`).join(", ")}`)
   const deadline = input.maxMinutes ? Date.now() + input.maxMinutes * 60_000 : undefined
   const started: string[] = []

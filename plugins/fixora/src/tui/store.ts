@@ -1,6 +1,6 @@
 // TUI state and pure reducers over the server's RPC events (no Solid imports, so bun:test can run it).
 
-import { STEPS, type RunRecord, type Step } from "../types.js"
+import { STEPS, type CrashFix, type RunRecord, type Step } from "../types.js"
 import type { GatePreview, RunSummary } from "../rpc.js"
 import type { FunnelStats } from "../state.js"
 
@@ -74,6 +74,7 @@ export interface CrashRow {
   fingerprint?: string
   state?: string
   runId?: string
+  fix?: CrashFix
   ref?: string
   platform?: string
   appId?: string

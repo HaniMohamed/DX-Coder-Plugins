@@ -35,7 +35,10 @@ export const RunSummarySchema = obj(
   ["runId", "source", "crashId", "title", "step", "status", "createdAt", "updatedAt"],
 )
 
-export const CrashSummarySchema = obj({ source: S, id: S, title: S, userCount: N, eventCount: N, lastSeen: S, appVersion: S, url: S, fingerprint: S, state: S, runId: S, ref: S, platform: S, appId: S }, ["source", "id", "title"])
+/** What Fixora already did about a listed crash (see crashstate.ts). */
+export const CrashFixSchema = obj({ runId: S, state: S, label: S, note: S, step: S, jiraKey: S, jiraUrl: S, mrUrl: S, mrId: S, mrStatus: S, mrRef: S, branch: S, release: S, at: S, attempts: N, stillSeen: B, reopened: N }, ["runId", "state", "label", "at"])
+
+export const CrashSummarySchema = obj({ source: S, id: S, title: S, userCount: N, eventCount: N, lastSeen: S, appVersion: S, url: S, fingerprint: S, state: S, runId: S, fix: CrashFixSchema, ref: S, platform: S, appId: S }, ["source", "id", "title"])
 
 /** What the TUI needs to render an approval dialog without reading the run folder. */
 export const GatePreviewSchema = obj({

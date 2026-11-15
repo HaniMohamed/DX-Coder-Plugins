@@ -7,12 +7,12 @@ import { existsSync, readFileSync } from "node:fs"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { runFix, runList } from "../src/flows.js"
+import { presentList, runFix, runList, runTop } from "../src/flows.js"
 import { slug } from "../src/git.js"
 import { readOptions } from "../src/options.js"
 import type { Runtime } from "../src/progress.js"
 import { registerPluginTools, type CrashListRecord } from "../src/tools.js"
-import type { Crash, WorkerInfo } from "../src/types.js"
+import type { Crash, RunRecord, WorkerInfo } from "../src/types.js"
 import { fakeMcpTool, mockCtx, toolCtx, type MockCtx, type Worker } from "./mock-ctx.js"
 
 const fixture = (p: string) => JSON.parse(readFileSync(join(import.meta.dir, "fixtures", p), "utf8")) as unknown
@@ -200,5 +200,44 @@ describe("crash fetch through the fixer session", () => {
       mock.mcpTools.push(...saved.tools)
       mock.mcpServers.pop()
     }
+  })
+})
+
+describe("the crash list marks what Fixora already did", () => {
+  test("runs from earlier fixes are shown with state, label and links; the picker only offers the rest", async () => {
+    // The fetch tests above left three blocked runs (base branch missing); pretend one of them went all the way.
+    const sentry = mock.storage.get("fixora/run/sentry-4523123") as RunRecord
+    sentry.status = "done"
+    sentry.step = "done"
+    sentry.jiraKey = "DE-100"
+    sentry.jiraUrl = "https://jira.example.com/browse/DE-100"
+    sentry.mrUrl = "https://gitlab.example.com/acme/shop/-/merge_requests/7"
+    sentry.mrId = "7"
+    sentry.mrProvider = "gitlab-mcp"
+    sentry.mrStatus = "merged"
+    sentry.meta = { ...sentry.meta, mergedAt: "2026-11-01T00:00:00.000Z" }
+    mock.storage.set("fixora/run/sentry-4523123", sentry)
+
+    const list = await runList(rt, { sessionID: "origin", top: 5, refresh: true })
+    const byId = Object.fromEntries(list.crashes.map((c) => [c.id, c]))
+    expect(byId["4523123"]).toMatchObject({ state: "merged", runId: "sentry-4523123", fix: { label: "fixed · MR !7 merged", jiraKey: "DE-100", mrRef: "MR !7", mrStatus: "merged", stillSeen: true } })
+    expect(byId["0123456789abcdef0123456789abcdef"]).toMatchObject({ state: "failed", fix: { label: "blocked at prepare (base-missing)" } })
+    expect(byId["fedcba9876543210fedcba9876543210"]).toMatchObject({ state: "failed", fix: { jiraKey: "DE-456", jiraUrl: "https://jira.example.com/browse/DE-456" } })
+    expect(list.markdown).toContain("1 of 3 already fixed by Fixora (1 merged) · 2 failed.")
+    expect(list.markdown).toContain("[DE-100](https://jira.example.com/browse/DE-100) · [MR !7 merged](https://gitlab.example.com/acme/shop/-/merge_requests/7)")
+    expect(list.markdown).toContain("**Already handled by Fixora**")
+    expect(list.markdown).toContain("⚠ still seen")
+
+    await presentList(rt, "origin", list)
+    const text = mock.synthetics.at(-1)!.text
+    expect(text).toContain("Which crash should Fixora fix?")
+    expect(text).toContain(`crashlytics:0123456789abcdef0123456789abcdef@${ANDROID}`)
+    expect(text).toContain("Do NOT offer these 1 crash(es)")
+    expect(text).toContain("sentry:4523123 = fixed · MR !7 merged")
+    expect(text).toContain("Fix the top 2")
+
+    // `/fixora top` skips the fixed one and takes the failed ones (retryable) in order.
+    const top = await runTop(rt, { sessionID: "origin", count: 5, flags: { dryRun: true, ticket: false, mr: false, push: false, auto: false, force: false, forceTriage: false } }).catch((e: Error) => e.message)
+    expect(typeof top === "string" ? top : JSON.stringify(top)).not.toContain("sentry:4523123")
   })
 })

@@ -43,7 +43,41 @@ export interface Crash {
   appId?: string
 }
 
-export type CrashState = "new" | "in_progress" | "awaiting" | "mr_open" | "merged" | "fixed" | "reopened" | "failed" | "skipped"
+/**
+ * What Fixora did about a crash: `mr_open` / `merged` / `released` (marked fixed in a release) /
+ * `fixed` (finished without an MR) all count as fixed; `reopened` = seen again after a release fix;
+ * `mr_closed` = the MR was closed without merging (restart or --force to try again).
+ */
+export type CrashState = "new" | "in_progress" | "awaiting" | "mr_open" | "mr_closed" | "merged" | "released" | "fixed" | "reopened" | "failed" | "skipped"
+
+/** The fix Fixora already produced for a listed crash (derived, see crashstate.ts). */
+export interface CrashFix {
+  runId: string
+  state: CrashState
+  /** Short label for tables and pickers, e.g. "fixed · MR !418 merged", "fixing". */
+  label: string
+  /** One extra fact worth knowing: reopen history, "still seen", the failure reason. */
+  note?: string
+  step?: Step
+  jiraKey?: string
+  jiraUrl?: string
+  mrUrl?: string
+  mrId?: string
+  mrStatus?: "draft" | "open" | "merged" | "closed"
+  /** "MR !418" / "PR #12" / "MR", from the provider and id. */
+  mrRef?: string
+  branch?: string
+  /** Release the fix was marked shipped in (`/fixora fixed`). */
+  release?: string
+  /** When the fix reached its state (MR opened, merged, marked fixed, or the last update). */
+  at: string
+  /** Fix cycles so far (restarts + 1). */
+  attempts?: number
+  /** The source still reports the crash after the fix landed. */
+  stillSeen?: boolean
+  /** How often the crash came back after being marked fixed. */
+  reopened?: number
+}
 
 export interface CrashSummary {
   source: Source
@@ -57,6 +91,8 @@ export interface CrashSummary {
   fingerprint?: string
   state?: CrashState
   runId?: string
+  /** Present when Fixora already has a run for this crash: links, label, history. */
+  fix?: CrashFix
   /** Full reference to start a run with (`source:id`, plus the app for multi-app Crashlytics). */
   ref?: string
   platform?: string

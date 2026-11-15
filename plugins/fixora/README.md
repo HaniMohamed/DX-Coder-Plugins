@@ -17,7 +17,7 @@ Works on any codebase: Flutter/Dart, Kotlin/Java, Swift, JavaScript/TypeScript, 
 
 | Command | What it does |
 |---|---|
-| `/fixora` (or `/fixora:list`) | List the top crashes from every connected source (an agent session makes the MCP calls). The agent then asks which to fix and starts the runs. |
+| `/fixora` (or `/fixora:list`) | List the top crashes from every connected source (an agent session makes the MCP calls). Crashes Fixora already worked on are marked in the list with their state and their Jira / MR links (see below); the agent then asks which of the remaining ones to fix and starts the runs. |
 | `/fixora:fix <source>:<id> \| <crash url>` | Fix one crash, e.g. `sentry:4523123`, `crashlytics:deadbeef`, a Sentry issue URL or a Firebase console issue URL. With several Firebase apps, `crashlytics:deadbeef@1:123:ios:abc` names the app (the picker and `/fixora` list print this form). `/fixora sentry:123` is a shortcut. |
 | `/fixora:paste <file> [--title ".."] [--platform ..] [--language ..]` | Fix a stack trace saved in a file. No MCP server needed. |
 | `/fixora:top [N]` | Fix the top N new crashes (default 1), one after the other (one checkout, one run at a time). |
@@ -34,6 +34,32 @@ Works on any codebase: Flutter/Dart, Kotlin/Java, Swift, JavaScript/TypeScript, 
 | `/fixora:clean <runId> [--remote]` | Restore the checkout if a run left it on its branch, delete the local branch (and, after approval, the remote branch). |
 
 Every verb is registered as its own command so the command palette lists them (`/fixora:status`, `/fixora:fix`, …); the long form `/fixora <verb> …` does the same thing.
+
+### What the list says about crashes Fixora already handled
+
+Every listed crash is matched against Fixora's run records and crash index, so the same crash is never
+fixed twice by accident and the ticket and merge request are one click away. The markdown list (and
+`<repo>/.dxcoder/fixora/crashes.md`) opens with a tally line such as *"3 of 10 already fixed by
+Fixora (1 merged · 2 MR open) · 1 came back · 6 new"*, the **Fixora** column carries a badge and the
+links, and an **Already handled by Fixora** block under the table lists, per crash, the run id, the
+branch, `[DE-456](…) · [MR !418 merged](…)`, the release, the attempt number, when that happened,
+and the command that makes sense next. The TUI picker shows the same badge, links and note on each row;
+choosing a handled crash opens its links instead of starting a run, with a "Fix again" (`--force`) option.
+
+| Badge | Meaning | Offered by the picker / `top`? | Next |
+|---|---|---|---|
+| ✓ fixed · MR !n open / draft | A reviewed fix is waiting in a merge request. | no | `/fixora feedback <runId> "…"`, then `/fixora fixed … --release X` once shipped |
+| ✓ fixed · MR !n merged | The MR was merged (`/fixora sync` keeps this current). ⚠ *still seen* appears when the source reported the crash after the merge: it is not released yet, or the fix is incomplete. | no | `/fixora fixed <runId> --release X` |
+| ✓ fixed in X | Marked shipped in release X and quiet since. | no | — |
+| ✓ fixed on the branch / pushed, no MR / dry run | The run finished without an MR (`--no-mr`, `--no-push`, `--dry-run`). | no | `/fixora feedback`, `/fixora fixed` |
+| ↻ came back after the fix in X | Marked fixed in X, but the source saw it again afterwards (the note says *seen in 2.3.0, fix shipped in 2.3.1* = fix not shipped, or *seen again in 2.3.2* = incomplete fix). Also set when an earlier fetch recorded the reopen. | yes | `/fixora restart <runId>` |
+| ✗ MR !n closed without merging | The MR was closed, the fix was not taken. | no | `/fixora restart <runId>` or `/fixora fix <ref> --force` |
+| ✗ failed / blocked / timeout at *step* | The run stopped; the note quotes the reason. | yes | `/fixora retry <runId>` |
+| – skipped: reason | The agent classified it as not fixable here (third-party, needs symbolication, …). | no | `/fixora retry <runId>`, `/fixora status <runId>` |
+| ◐ *stage* / ⏸ waiting for your approval | In progress right now. | no (greyed out) | `/fixora status <runId>` |
+
+A reopen history ("reopened ×2, was fixed in 2.3.0") and the attempt number travel with every state,
+so a crash that keeps coming back is visible at a glance.
 
 Flags: `--dry-run` (stop before commit; writes the MR body and commit message to the run folder),
 `--no-ticket`, `--no-mr`, `--no-push`, `--auto` (auto-approve when confidence, checks, review and
@@ -83,8 +109,11 @@ The package also ships a TUI entry (`./tui`, loaded automatically by DXcoder nex
 entry). With it:
 
 - **`/fixora`** opens a searchable picker of the top crashes grouped by source (users affected,
-  version, age, NEW / REOPENED / MR badges), with `ctrl+t` "fix top 3" and `ctrl+r` refresh, plus a
-  "paste a stack trace" entry. Picking a crash shows a one-line confirmation, then starts the run.
+  version, age, and for crashes Fixora already handled the ✓ / ↻ / ✗ badge with the Jira key, the MR
+  and its status, the release and any note), with `ctrl+t` "fix top 3" (new crashes only) and
+  `ctrl+r` refresh, plus a "paste a stack trace" entry. Picking a new crash shows a one-line
+  confirmation, then starts the run; picking a handled one shows its links and the next command, with
+  "Fix again" to start over with `--force`.
 - A **live pipeline panel** opens in the session (`/fixora panel` or the palette toggles it): stage
   checklist with spinner and timings (including the restore of your checkout), retry counters, the
   root-cause card with a confidence meter and "introduced by" line, the diff / checks / review
