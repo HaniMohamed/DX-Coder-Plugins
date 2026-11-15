@@ -350,7 +350,7 @@ export function checkoutLine(run: RunRecord): string {
 export function manualRestoreText(run: RunRecord): string {
   const c = run.checkout
   const L = [`git checkout ${c.previousBranch ?? c.previousHeadSha ?? "<your branch>"}`]
-  if (c.stashRef) L.push(`git stash list   # find "fixora/${run.runId}"`, `git stash pop ${c.stashRef}   # or stash@{n} from the list`)
+  if (c.stashRef) L.push(`git stash list   # find "fixora/${run.runId}"`, `git stash pop ${c.stashRef}   # or stash@{n} from the list`, `# on a conflict the entry stays in the list: resolve it, or restore single files with \`git checkout ${c.stashRef.slice(0, 10)} -- <file>\`; never \`git stash drop\` before your changes are back`)
   return L.join("\n")
 }
 

@@ -56,7 +56,7 @@ const TRIAGE_SCHEMA = schema(
     category: { type: "string", enum: ["null-deref", "race", "state", "api-contract", "parsing", "config", "ui-lifecycle", "resource", "other"] },
     confidence: { type: "number", minimum: 0, maximum: 1 },
     confidenceReasons: A(S),
-    suspectCommits: A(schema({ sha: S, subject: S, date: S, why: S }, ["sha", "subject", "why"])),
+    suspectCommits: { description: "Commits that `git log` / `git blame` show introduced the defect. [] when history does not identify one — never a placeholder sha such as \"unknown\".", ...A(schema({ sha: { type: "string", description: "hex commit id (7..40 chars) from git log/blame" }, subject: S, date: S, why: S }, ["sha", "subject", "why"])) },
     introducedInRelease: { type: ["string", "null"] },
     fixStrategy: S,
     alternatives: A(schema({ strategy: S, rejectedBecause: S }, ["strategy", "rejectedBecause"])),

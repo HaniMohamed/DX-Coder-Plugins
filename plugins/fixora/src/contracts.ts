@@ -17,6 +17,8 @@ export const VERDICTS: Verdict[] = ["approve", "approve_with_nits", "reject"]
 export const FINDING_CATEGORIES: FindingCategory[] = ["correctness", "scope", "risk", "tests", "style", "security"]
 export const SEVERITIES: Severity[] = ["blocker", "major", "minor"]
 const MAX_TEXT = 4000
+/** The first 7..40-char hex token in a string: a commit id on its own or wrapped in prose; undefined for placeholders. */
+const commitIdIn = (text: string): string | undefined => text.match(/(?<![0-9a-z])[0-9a-f]{7,40}(?![0-9a-z])/i)?.[0]
 
 class Check {
   readonly errors: string[] = []
@@ -154,11 +156,13 @@ export function validateTriage(input: unknown, ctx: TriageContext): Validation<T
   const suspect: Triage["suspectCommits"] = []
   for (const [i, s] of c.objs("suspectCommits", { max: 10 }).entries()) {
     const sc = new Check(s)
-    const sha = sc.str("sha", { max: 64 })
+    // A suspect commit is a hint, not a gate: a placeholder sha ("unknown", "n/a", "HEAD") drops the
+    // entry instead of refusing the whole report, and a sha wrapped in prose ("commit 3f2a1c9 …") is unwrapped.
+    const shaRaw = sc.str("sha", { required: false, max: 300 })
+    const sha = shaRaw ? commitIdIn(shaRaw) : undefined
     const subject = sc.str("subject", { max: 300 })
     const date = sc.str("date", { required: false, max: 40 })
     const why = sc.str("why", { min: 5 })
-    if (sha && !/^[0-9a-f]{7,40}$/i.test(sha)) sc.errors.push("sha must be a hex commit id")
     c.errors.push(...sc.errors.map((e) => `suspectCommits[${i}].${e}`))
     if (sc.errors.length === 0 && sha && subject && why) suspect.push({ sha, subject, date, why })
   }

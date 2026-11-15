@@ -40,6 +40,34 @@ describe("validateTriage", () => {
     const r = validateTriage({ version: 1, runId: "sentry-4523123", classification: "third_party_only", mappedFrames: [], rootCause: "all frames are in UIKit", category: "other", confidence: 0.7, confidenceReasons: [], suspectCommits: [], introducedInRelease: null, fixStrategy: "", alternatives: [], risk: { level: "low", notes: [] }, suggestedTests: [], relatedCrashes: [], flaggedContent: [] }, triageCtx)
     expect(r.ok).toBe(true)
   })
+
+  test("a placeholder suspect-commit sha drops the entry instead of refusing the report", () => {
+    const base = example("fixora-triage") as Record<string, unknown>
+    const r = validateTriage(
+      {
+        ...base,
+        suspectCommits: [
+          { sha: "unknown", subject: "n/a", why: "no single commit stands out in git blame" },
+          { sha: "HEAD", subject: "current tip", why: "the unchecked access has been there since the file was created" },
+          { sha: "commit 3f2a1c9d (feat(cart): coupon expiry)", subject: "feat(cart): coupon expiry", why: "removed the null check" },
+          { sha: "3f2a1c9", subject: "feat(cart): coupon expiry", date: "2026-11-02", why: "removed the null check" },
+        ],
+      },
+      triageCtx,
+    )
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.suspectCommits.map((c) => c.sha)).toEqual(["3f2a1c9d", "3f2a1c9"])
+  })
+
+  test("a suspect commit still needs subject and why", () => {
+    const base = example("fixora-triage") as Record<string, unknown>
+    const r = validateTriage({ ...base, suspectCommits: [{ sha: "3f2a1c9", why: "" }] }, triageCtx)
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.errors.join("\n")).toContain("suspectCommits[0].subject is required")
+    expect(r.errors.join("\n")).toContain("suspectCommits[0].why must be at least 5 characters")
+  })
 })
 
 const fixCtx = {
