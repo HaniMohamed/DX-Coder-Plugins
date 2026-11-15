@@ -80,7 +80,7 @@ export interface CrashRow {
   appId?: string
 }
 
-export type PanelView = "run" | "runs" | "report"
+export type PanelView = "crashes" | "run" | "runs" | "report"
 
 export interface TuiState {
   runs: Record<string, RunView>
@@ -94,6 +94,13 @@ export interface TuiState {
   view: PanelView
   /** Selected row in the runs view. */
   cursor: number
+  /** Selected row in the crashes view (index into the flattened, grouped list). */
+  crashCursor: number
+  crashSort: "state" | "source"
+  crashesLoading: boolean
+  crashesError?: string
+  /** Show every stage of a running pipeline instead of folding the finished ones. */
+  expandStages: boolean
   /** Run pinned to the panel by `/fixora status <runId>`; otherwise the session's latest run. */
   pinned?: string
   report?: FunnelStats
@@ -114,7 +121,7 @@ export const STAGE_TITLES: Record<Step, string> = {
   done: "Done",
 }
 
-export const initialState = (): TuiState => ({ runs: {}, order: [], gates: {}, crashes: [], sources: [], now: Date.now(), view: "run", cursor: 0 })
+export const initialState = (): TuiState => ({ runs: {}, order: [], gates: {}, crashes: [], sources: [], now: Date.now(), view: "run", cursor: 0, crashCursor: 0, crashSort: "state", crashesLoading: false, expandStages: false })
 
 export const emptyStages = (): StageView[] => STEPS.filter((s) => s !== "done").map((step) => ({ step, status: "pending" }))
 
@@ -341,31 +348,7 @@ export const panelRun = (state: TuiState, sessionID: string): RunView | undefine
 export const STATUS_GLYPH: Record<StageStatus, string> = { pending: "○", running: "◐", ok: "✓", failed: "✗", skipped: "–" }
 export const SPINNER = ["◐", "◓", "◑", "◒"]
 
-export const fmtClock = (ms: number) => {
-  const s = Math.max(0, Math.floor(ms / 1000))
-  const m = Math.floor(s / 60)
-  return `${String(m).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`
-}
-export const fmtShort = (ms: number | undefined) => {
-  if (ms === undefined) return ""
-  if (ms < 1000) return `${ms}ms`
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
-  return fmtClock(ms)
-}
-export const truncate = (text: string | undefined, width: number) => {
-  const t = (text ?? "").replace(/\s+/g, " ").trim()
-  return t.length <= width ? t : `${t.slice(0, Math.max(0, width - 1))}…`
-}
-export const relTime = (ms: number) => {
-  const d = Date.now() - ms
-  const m = Math.round(d / 60000)
-  if (m < 1) return "now"
-  if (m < 60) return `${m}m ago`
-  const h = Math.round(m / 60)
-  if (h < 48) return `${h}h ago`
-  return `${Math.round(h / 24)}d ago`
-}
-export const meter = (value: number, width = 10) => {
-  const filled = Math.round(Math.max(0, Math.min(1, value)) * width)
-  return { filled: "█".repeat(filled), empty: "░".repeat(width - filled) }
-}
+export const clampCursor = (cursor: number, length: number) => Math.max(0, Math.min(Math.max(0, length - 1), cursor))
+
+// Formatting helpers live in format.ts (pure); re-exported so existing imports keep working.
+export { fmtClock, fmtShort, meter, relTime, truncate } from "./format.js"

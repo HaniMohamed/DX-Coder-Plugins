@@ -33,6 +33,16 @@ describe("checkout", () => {
     expect(run.checkout.stashRef).toBeDefined()
   })
 
+  test("keepFix: the plan stops at the status check when the fix is still uncommitted", () => {
+    const run = sampleRun({ checkout: { active: true, previousBranch: "feature/x", previousHeadSha: "9fceb02a1b2c3d4e5f60718293a4b5c6d7e8f901", stashRef: "5745a5000000000000000000000000000000abcd" } })
+    const plan = restorePlan(run, { keepFix: true })
+    expect(plan[0]).toContain("STOP HERE")
+    expect(plan[0]).toContain(`branch: "${run.branch}"`)
+    expect(plan[0]).toContain("kept: true")
+    expect(plan[1]).toBe("git checkout feature/x")
+    expect(restorePlan(run)[0]).not.toContain("kept")
+  })
+
   test("a detached HEAD restores to the commit; no stash → no stash steps", () => {
     const run = sampleRun({ checkout: { active: true, previousBranch: "HEAD", previousHeadSha: "9fceb02a1b2c3d4e5f60718293a4b5c6d7e8f901" } })
     const plan = restorePlan(run)

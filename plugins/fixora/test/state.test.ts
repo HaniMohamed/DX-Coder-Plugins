@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { renderCommitMessage, renderCrashMarkdown, renderFinalReport, renderFunnelReport, renderMr, renderRunStatus, renderTriageCard } from "../src/render.js"
-import { beginStep, endStep, funnel, nextStep, resumePoint } from "../src/state.js"
+import { beginStep, endStep, fixInProgress, funnel, nextStep, resumePoint } from "../src/state.js"
 import type { Crash, CrashIndexEntry, RunRecord } from "../src/types.js"
 
 export const sampleRun = (over: Partial<RunRecord> = {}): RunRecord => ({
@@ -94,6 +94,16 @@ const crash: Crash = {
 }
 
 describe("state", () => {
+  test("fixInProgress: only while the change set is uncommitted on the fix branch", () => {
+    const base = sampleRun()
+    expect(fixInProgress({ ...base, step: "fix", pipeline: { ...base.pipeline, committed: false } })).toBe(true)
+    expect(fixInProgress({ ...base, step: "review", pipeline: { ...base.pipeline, committed: false } })).toBe(true)
+    expect(fixInProgress({ ...base, step: "validate", pipeline: { ...base.pipeline, committed: true } })).toBe(false)
+    expect(fixInProgress({ ...base, step: "analyse", pipeline: { ...base.pipeline, committed: false } })).toBe(false)
+    expect(fixInProgress({ ...base, step: "publish", pipeline: { ...base.pipeline, committed: false } })).toBe(false)
+    expect(fixInProgress({ ...base, step: "fix", pipeline: { ...base.pipeline, committed: false }, fix: { ...base.fix!, changesMade: false } })).toBe(false)
+  })
+
   test("nextStep / resumePoint / step timings", () => {
     expect(nextStep("detect")).toBe("fetch")
     expect(nextStep("done")).toBeUndefined()

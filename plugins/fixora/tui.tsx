@@ -2,15 +2,15 @@
 // Fixora TUI entry: a thin, reactive view over the server plugin's state that lives entirely inside
 // DXcoder's session view. The server is the source of truth; this entry subscribes to its RPC
 // events, renders the docked panel (run / runs / report views), the crash picker, the approval
-// dialog and small status surfaces. No full-screen pages.
+// dialog and small status surfaces. No full-screen pages. Panel views: crashes / run / runs / report.
 
 import { Plugin } from "@opencode/plugin/tui"
 import { Show } from "solid-js"
 import { ComposerStrip, FixoraPanel, FooterChip, GateDialog, SidebarBadge, type Fixora } from "./src/tui/components.js"
-import { currentSession, ensureSession, parseSlash, pickCrash, startRuns } from "./src/tui/commands.js"
+import { currentSession, ensureSession, fixTop, loadCrashes, parseSlash, pickCrash, startCrash, startRuns } from "./src/tui/commands.js"
 import { FixoraRpc, type RunSummary } from "./src/rpc.js"
 import type { FunnelStats } from "./src/state.js"
-import { applyEvent, applyRecord, applySummary, awaitingGates, initialState, type GateView, type PanelView, type TuiState } from "./src/tui/store.js"
+import { activeRuns, applyEvent, applyRecord, applySummary, awaitingGates, initialState, type GateView, type PanelView, type TuiState } from "./src/tui/store.js"
 import { isFixCandidate } from "./src/crashstate.js"
 import type { RunRecord } from "./src/types.js"
 
@@ -65,11 +65,28 @@ export default Plugin.define({
             d.view = view
             if (view === "run") d.pinned = runId
             if (view === "runs") d.cursor = 0
+            if (view === "crashes") d.crashCursor = 0
           })
           if (view === "runs") void fx.actions.hydrate()
           if (view === "report") void fx.actions.loadReport()
           if (view === "run" && runId) void fx.actions.hydrate(runId)
+          if (view === "crashes" && (state.crashes.length === 0 || Date.now() - (state.crashesAt ?? 0) > 5 * 60_000)) void fx.actions.loadCrashes()
           void openPanel()
+        },
+        async loadCrashes(o) {
+          const sessionID = currentSession(fx) ?? (await ensureSession(fx))
+          if (!sessionID) return
+          await loadCrashes(fx, rpc, sessionID, o)
+        },
+        async startCrash(row, o) {
+          const sessionID = currentSession(fx) ?? (await ensureSession(fx))
+          if (!sessionID) return
+          await startCrash(fx, rpc, sessionID, row, o)
+        },
+        async fixTop(n) {
+          const sessionID = currentSession(fx) ?? (await ensureSession(fx))
+          if (!sessionID) return
+          await fixTop(fx, rpc, sessionID, state.crashes, n)
         },
         async openGate(gate) {
           try {
@@ -202,7 +219,13 @@ export default Plugin.define({
     })
     on("crash.reopened", (data) => toast.show({ title: "Fixora · reopened crash", message: `${data.runId}: seen again after the fix (${data.reason ?? "unknown reason"})`, variant: "warning", duration: 8000 }))
 
-    const ticker = setInterval(() => mutate((d) => void (d.now = Date.now())), 1000)
+    // The clock drives spinners and live timers: 4 fps while a run is active, 1 fps otherwise.
+    let ticker: ReturnType<typeof setTimeout> | undefined
+    const tick = () => {
+      mutate((d) => void (d.now = Date.now()))
+      ticker = setTimeout(tick, activeRuns(state).length > 0 ? 250 : 1000)
+    }
+    ticker = setTimeout(tick, 1000)
     void fx.actions.hydrate()
 
     // ---------- surfaces (all inside the session view) ----------
@@ -253,6 +276,8 @@ export default Plugin.define({
                 return context.ui.panel.current()?.name === PANEL ? context.ui.panel.close() : showView(state.view)
               case "report":
                 return showView("report")
+              case "crashes":
+                return showView("crashes")
               case "feedback": {
                 const [runId, ...words] = rest.split(/\s+/)
                 if (!runId) return toast.show({ message: "Usage: /fixora feedback <runId> <message>", variant: "warning" })
@@ -284,6 +309,7 @@ export default Plugin.define({
         },
         { id: "fixora.top", title: "Fixora: fix the top crash now", group: "Fixora", palette: true, run: () => context.keymap.dispatch("fixora.open", "top 1") },
         { id: "fixora.panel", title: "Fixora: toggle panel", group: "Fixora", palette: true, run: () => context.keymap.dispatch("fixora.open", "panel") },
+        { id: "fixora.crashes", title: "Fixora: crash list", group: "Fixora", palette: true, run: () => showView("crashes") },
         { id: "fixora.runs", title: "Fixora: all runs", group: "Fixora", palette: true, run: () => showView("runs") },
         { id: "fixora.report", title: "Fixora: report", group: "Fixora", palette: true, run: () => showView("report") },
         {
@@ -302,7 +328,7 @@ export default Plugin.define({
     }))
 
     return () => {
-      clearInterval(ticker)
+      if (ticker) clearTimeout(ticker)
       for (const u of unsubscribe) u()
     }
   },

@@ -12,7 +12,8 @@ import { runFeedback, runFix, runPaste, runReset, runRestart, runRetry, runStatu
 import { slug } from "../src/git.js"
 import { readOptions } from "../src/options.js"
 import type { Runtime } from "../src/progress.js"
-import { loadRun } from "../src/state.js"
+import { renderRunStatus } from "../src/render.js"
+import { loadRun, saveRun } from "../src/state.js"
 import { eventEmitter } from "../src/rpc.js"
 import { registerPluginTools } from "../src/tools.js"
 import type { RunRecord, WorkerInfo } from "../src/types.js"
@@ -32,7 +33,7 @@ let commits = 0
 const FLAGS = { dryRun: false, ticket: true, mr: true, push: true, auto: false, force: false, forceTriage: false }
 
 /** Knobs the tests turn. */
-const state = { dirty: false, holdTriage: undefined as Promise<void> | undefined, cancelInFix: false, restorePrompts: [] as string[], publishPrompts: [] as string[], workPrompts: [] as string[] }
+const state = { dirty: false, holdTriage: undefined as Promise<void> | undefined, cancelInFix: false, keptFix: false, restorePrompts: [] as string[], publishPrompts: [] as string[], workPrompts: [] as string[] }
 
 const STATUS = " M src/cart/service.ts\n?? src/cart/guard.test.ts\n"
 const DIFF = [
@@ -153,6 +154,8 @@ const stage = async (prompt: { text: string }, session: { id: string }, tool: To
     }
     case "restore": {
       state.restorePrompts.push(prompt.text)
+      // The agent found the fix uncommitted and the prompt said to keep it: the branch stays checked out.
+      if (state.keptFix && /kept: true/.test(prompt.text)) return call("fixora_submit_ops", { version: 1, runId, op: "restore", ok: true, results: { branch: w.branch, stashPopped: false, kept: true }, errors: [] })
       return call("fixora_submit_ops", { version: 1, runId, op: "restore", ok: true, results: { branch: "main", stashPopped: /stash pop/.test(prompt.text) }, errors: [] })
     }
     case "clean":
@@ -387,6 +390,53 @@ describe("cancellation and the repository lock", () => {
     expect(run.status).toBe("cancelled")
     expect(run.checkout.active).toBe(false)
     expect(state.restorePrompts).toHaveLength(1)
+  })
+
+  test("a run that stops mid-fix keeps the uncommitted fix on its branch; the retry continues there without a stash dialog", async () => {
+    state.cancelInFix = true
+    state.keptFix = true
+    state.restorePrompts.length = 0
+    state.workPrompts.length = 0
+    const stashesBefore = mock.permissionRequests.filter((p) => p.action === "fixora.stash").length
+    const run = await runPaste(rt, { sessionID: "origin", file: join(root, "trace.txt"), flags: { ...FLAGS, force: true } })
+    expect(run.status).toBe("cancelled")
+    expect(run.step).toBe("fix")
+    expect(state.restorePrompts).toHaveLength(1)
+    expect(state.restorePrompts[0]).toContain("STOP HERE")
+    expect(run.checkout.active).toBe(true)
+    expect(run.meta?.restoreKept).toBe(true)
+    expect(run.timings.restore?.status).toBe("ok")
+    expect(renderRunStatus(run)).toContain("kept on purpose")
+    expect(mock.synthetics.some((x) => x.text.includes(`The fix is still uncommitted on \`${run.branch}\``) && x.text.includes(`/fixora retry ${run.runId} --from fix`))).toBe(true)
+    // Retry: prepare re-verifies the branch (re-entry rules, no stash), then the fix stage completes the run.
+    state.cancelInFix = false
+    state.keptFix = false
+    const retried = await runRetry(rt, { sessionID: "origin", runId: run.runId, from: "fix", fresh: false, flags: FLAGS })
+    if (retried.status !== "done") throw new Error(`${retried.status} at ${retried.step}: ${retried.error}`)
+    expect(retried.branch).toBe(run.branch)
+    expect(state.workPrompts.at(-1)).toContain("Re-entry rules")
+    expect(state.workPrompts.at(-1)).toContain(`git checkout ${run.branch}`)
+    expect(mock.permissionRequests.filter((p) => p.action === "fixora.stash").length).toBe(stashesBefore)
+    expect(retried.checkout.active).toBe(false)
+    expect(retried.meta?.restoreKept).toBeFalsy()
+  })
+
+  test("a retry after a fix-stage timeout runs only the mapped tests", async () => {
+    state.workPrompts.length = 0
+    const run = await runPaste(rt, { sessionID: "origin", file: join(root, "trace2.txt"), flags: { ...FLAGS, force: true } })
+    if (run.status !== "done") throw new Error(`${run.status} at ${run.step}: ${run.error}`)
+    // Pretend the fix stage was interrupted before fixora_submit_fix (the worker timed out).
+    const interrupted = (r: RunRecord): RunRecord => ({ ...r, status: "timeout", step: "fix", error: "the fix stage exceeded 20 minutes", fix: undefined, change: undefined, tests: undefined, reviews: [], commitShas: [], checkout: { ...r.checkout, active: false }, timings: { ...r.timings, fix: { ...r.timings.fix!, status: "failed" } }, pipeline: { ...r.pipeline, fixed: false, validated: false, reviewed: false, committed: false, pushed: false }, meta: { ...r.meta, tests: null } })
+    await saveRun(mock.ctx, interrupted(run))
+    const retried = await runRetry(rt, { sessionID: "origin", runId: run.runId, fresh: false, flags: FLAGS })
+    if (retried.status !== "done") throw new Error(`${retried.status} at ${retried.step}: ${retried.error}`)
+    expect(retried.meta?.tests).toBe("mapped")
+    expect(state.workPrompts.at(-1)).toContain("--tests mapped")
+    expect(mock.synthetics.some((s) => /runs only the mapped tests/.test(s.text))).toBe(true)
+    // An explicit --tests wins.
+    await saveRun(mock.ctx, interrupted(retried))
+    const full = await runRetry(rt, { sessionID: "origin", runId: run.runId, fresh: false, flags: { ...FLAGS, tests: "full" } })
+    expect(full.meta?.tests).toBe("full")
   })
 
   test("two runs on the same checkout run one after the other", async () => {

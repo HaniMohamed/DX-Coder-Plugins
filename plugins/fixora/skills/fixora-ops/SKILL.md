@@ -18,9 +18,15 @@ MCP tool calls (Jira, GitLab, GitHub, crash sources) go through the `execute` to
 - **restore** — put the user's checkout back: `git checkout <previous branch or commit>`, then, when a
   stash is named, `git stash list` to find the entry whose message is `fixora/<runId>` and
   `git stash pop stash@{n}`. If the pop conflicts, leave the stash in place, do not resolve anything,
-  and report `ok: false` with the conflicting files in `errors[]`. If the fix branch still has
-  uncommitted changes, do not discard them: report them in `errors[]` and still check the previous
-  branch out when git allows it (`git checkout` refuses when they would be lost — report that too).
+  and report `ok: false` with the conflicting files in `errors[]`.
+  When the prompt says to keep an uncommitted fix (its first step says so and the report has a `kept`
+  field): if `git status` lists anything outside `.dxcoder/` and generated paths, stop right there,
+  leave the fix branch checked out and the stash untouched, and report `ok: true` with
+  `{ "branch": "<fix branch>", "stashPopped": false, "kept": true }`; a clean status continues with
+  the checkout and the pop and reports `kept: false`.
+  Otherwise (a `clean` or `restart`), if the fix branch still has uncommitted changes, do not discard
+  them: report them in `errors[]` and still check the previous branch out when git allows it
+  (`git checkout` refuses when they would be lost — report that too).
   Results: `{ "branch": "<branch now checked out>", "stashPopped": true|false }`.
 - **close-loop** — Jira comment with the MR link, optional transition, optional note on the crash
   source. For the transition: call the "get transitions" tool, pick the one whose name matches the

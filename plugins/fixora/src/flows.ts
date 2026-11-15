@@ -453,12 +453,15 @@ export async function runRetry(rt: Runtime, input: { sessionID: string; runId: s
   if (run.status === "skipped" && !input.from) from = run.triage ? "analyse" : "fetch"
   if (run.status === "blocked" && !input.from) from = run.blockedReason === "dirty-worktree" || run.blockedReason === "not-a-repo" || run.blockedReason === "base-missing" ? "prepare" : "fix"
   if (input.fresh) from = "detect"
-  // A branch left checked out by a dead host is verified again by the prepare phase (same branch, recorded previous branch / stash).
+  // The fix stage ran out of time (usually the full test suite): the retry runs only the mapped tests unless --tests says otherwise.
+  const narrowTests = !input.flags.tests && from === "fix" && run.status === "timeout" && run.step === "fix" && run.meta?.tests !== "skip"
+  if (narrowTests) run.meta = { ...run.meta, tests: "mapped" }
+  // A branch left checked out by a dead host (or kept on purpose with an uncommitted fix) is verified again by the prepare phase (same branch, recorded previous branch / stash).
   if (run.checkout?.active) run.checkout = { ...run.checkout, active: false }
   run.error = undefined
   run.blockedReason = undefined
   run.skipReason = undefined
-  await notify(rt.ctx, input.sessionID, `fixora ${run.runId}: retrying from ${from}`)
+  await notify(rt.ctx, input.sessionID, `fixora ${run.runId}: retrying from ${from}${narrowTests ? " — the fix stage timed out last time, so this attempt runs only the mapped tests (--tests full to override)" : ""}`)
   return startPipeline(rt, run, { from })
 }
 

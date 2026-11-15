@@ -41,6 +41,20 @@ describe("prompts", () => {
     expect(resumed.skills).toEqual(["fixora-prepare"])
     expect(resumed.text).toContain("fixora/sentry-4523123-typeerror")
     expect(resumed.text).toContain("feature/x")
+    // Re-entry: the uncommitted fix is carried onto the branch, never stashed or reported dirty.
+    expect(resumed.text).toContain("Re-entry rules")
+    expect(resumed.text).toContain("git checkout fixora/sentry-4523123-typeerror")
+    expect(resumed.text).toContain("never report the checkout as dirty")
+    expect(resumed.text).not.toContain("Fixora asks the user first")
+    expect(resumed.text).toContain('stashRef "deadbeefdeadbeef"')
+    // The fix stage budgets its tests: auto → time-boxed, mapped / full / skip → explicit.
+    const auto = workPrompt(sampleRun(), DEFAULTS, { stages: ["fix"], fallbackBranch: "fixora/x", attempt: 2, checks })
+    expect(auto.text).toContain(`within ${DEFAULTS.testCommands.fullSuiteMaxMinutes} minutes`)
+    expect(auto.text).toContain(`${DEFAULTS.worker.maxPhaseMinutes.fix} minutes in total`)
+    const mapped = workPrompt(sampleRun({ meta: { tests: "mapped" } }), DEFAULTS, { stages: ["fix"], fallbackBranch: "fixora/x", attempt: 2, checks })
+    expect(mapped.text).toContain("--tests mapped")
+    expect(mapped.text).toContain("do not run the full unit suite")
+    expect(workPrompt(sampleRun({ meta: { tests: "skip" } }), DEFAULTS, { stages: ["fix"], fallbackBranch: "fixora/x", attempt: 2, checks }).text).toContain("do not run the unit suite")
     // A configured naming convention: exact name, the ticket step first, the fallback id when no ticket.
     const naming = { ...DEFAULTS, branchNaming: { template: "{type}/{ticket}-{slug}", type: "fix", example: "fix/DE-456-fix-crash-on-startup" } }
     const ticket = { namespace: "jira_jira", searchTool: "jira_jira_search", searchInput: { jql: "x" }, createTool: "jira_jira_create_issue", createInput: { project_key: "DE" }, browseBase: "https://jira.example.com" }

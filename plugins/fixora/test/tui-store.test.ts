@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { activeRuns, applyEvent, applyRecord, applySummary, awaitingGates, fmtClock, fmtShort, initialState, meter, panelRun, truncate } from "../src/tui/store.js"
+import { activeRuns, applyEvent, applyRecord, applySummary, awaitingGates, clampCursor, fmtClock, fmtShort, initialState, meter, panelRun, truncate } from "../src/tui/store.js"
 import { sampleRun } from "./state.test.js"
 
 const T0 = Date.parse("2026-11-14T10:00:00.000Z")
@@ -79,5 +79,14 @@ describe("tui store reducers", () => {
     expect(fmtShort(125_000)).toBe("02:05")
     expect(truncate("a very long title indeed", 10)).toBe("a very lo…")
     expect(meter(0.82)).toEqual({ filled: "████████", empty: "░░" })
+  })
+
+  test("initial state and the list cursors", () => {
+    const s = initialState()
+    expect(s).toMatchObject({ view: "run", cursor: 0, crashCursor: 0, crashSort: "state", crashesLoading: false, expandStages: false, crashes: [] })
+    expect(clampCursor(5, 3)).toBe(2)
+    expect(clampCursor(-1, 3)).toBe(0)
+    expect(clampCursor(0, 0)).toBe(0)
+    expect(clampCursor(1, 3)).toBe(1)
   })
 })

@@ -34,6 +34,13 @@ export function nextStep(step: Step): Step | undefined {
 export const stepIndex = (step: Step) => STEPS.indexOf(step)
 
 /** Where a retry re-enters: an explicit `--from`, else the recorded step (the one that did not finish). */
+/** True while the run's change set can only live uncommitted on the fix branch (fix, validate, review). */
+export function fixInProgress(run: RunRecord): boolean {
+  if (run.pipeline?.committed) return false
+  if (run.fix && !run.fix.changesMade) return false
+  return run.step === "fix" || run.step === "validate" || run.step === "review"
+}
+
 export function resumePoint(run: RunRecord, from?: Step): Step {
   if (from) return from
   if (run.status === "done") return "done"

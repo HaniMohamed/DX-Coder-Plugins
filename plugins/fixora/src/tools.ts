@@ -302,7 +302,8 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         // Take it as the inspect report so the user is asked before anything is stashed.
         const stashApproved = run.approvals.stash === "approved" || run.approvals.stash === "auto"
         const rawP = input as { stage?: unknown; dirty?: unknown; stashRef?: unknown; status?: unknown }
-        const demoted = rawP.stage === "ready" && rawP.dirty === true && !rawP.stashRef && !stashApproved
+        // On a re-entry (the run already has its branch) uncommitted changes are the fix in progress: carried, never stashed.
+        const demoted = rawP.stage === "ready" && rawP.dirty === true && !rawP.stashRef && !stashApproved && !run.branch
         const result = validatePrepare(demoted ? { ...(input as Record<string, unknown>), stage: "inspect" } : input, { runId: run.runId, branchPrefix: rt.opts.branchPrefix, baseBranch: run.base.branch, existingBranch: run.branch, expectedBranch: plannedBranch(run) })
         if (!result.ok) return rejected(run, "prepare report", demoted ? [...result.errors, "the checkout is dirty and stashing was not approved yet: this report is taken as stage \"inspect\""] : result.errors)
         const p = result.value
@@ -330,7 +331,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         run.meta = { ...run.meta, prepareStage: "ready", prepareNotes: p.notes.join("; ").slice(0, 2000) }
         await mkdir(run.folder, { recursive: true })
         await persist(run.folder, "project.md", `${renderProject({ toolchain: run.toolchain, forbidden: [...FORBIDDEN_GLOBS, ...rt.opts.validate.denyPaths], limits: rt.opts.validate })}\n`)
-        await persist(run.folder, "limits.json", { maxFilesChanged: rt.opts.validate.maxFilesChanged, maxDiffLines: rt.opts.validate.maxDiffLines, testTimeoutSec: rt.opts.testCommands.timeoutSec, mode: run.flags.testFirst ? "test-first" : "fix", maxFixRounds: rt.opts.maxFixRounds })
+        await persist(run.folder, "limits.json", { maxFilesChanged: rt.opts.validate.maxFilesChanged, maxDiffLines: rt.opts.validate.maxDiffLines, testTimeoutSec: rt.opts.testCommands.timeoutSec, fullSuiteMaxMinutes: rt.opts.testCommands.fullSuiteMaxMinutes, tests: run.meta?.tests ?? "auto", fixMinutes: rt.opts.worker.maxPhaseMinutes.fix, mode: run.flags.testFirst ? "test-first" : "fix", maxFixRounds: rt.opts.maxFixRounds })
         await stageEnd(rt, run, "prepare", "ok", `${run.branch} from ${run.base.remote}/${run.base.branch}${run.base.sha ? `@${run.base.sha.slice(0, 8)}` : ""}${run.checkout.stashRef ? " · changes stashed" : ""}`)
         const stages = plannedStages(run)
         let next: string | undefined
@@ -534,7 +535,11 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         if (!run) return failure([`run ${info.runId} not found`], "ops report")
         switch (o.op) {
           case "restore":
-            if (o.ok) markRestored(run, at)
+            if (o.ok && o.results.kept === true && run.checkout.active) run.meta = { ...run.meta, restoreKept: true }
+            else if (o.ok) {
+              markRestored(run, at)
+              run.meta = { ...run.meta, restoreKept: null }
+            }
             break
           case "close-loop":
             run.pipeline.loopClosed = true

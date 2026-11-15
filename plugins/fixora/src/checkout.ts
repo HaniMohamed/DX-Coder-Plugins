@@ -32,11 +32,13 @@ export function markRestored(run: RunRecord, at = new Date().toISOString()): Run
 }
 
 /** The exact commands the restore phase runs, in order. */
-export function restorePlan(run: RunRecord): string[] {
+export function restorePlan(run: RunRecord, o: { keepFix?: boolean } = {}): string[] {
   const c = run.checkout
   const target = c.previousBranch && c.previousBranch !== "HEAD" ? c.previousBranch : c.previousHeadSha
   const out: string[] = []
-  out.push(`git status --porcelain=v1 --untracked-files=all   # anything left behind by the run? report it, never discard it`)
+  if (o.keepFix) {
+    out.push(`git status --porcelain=v1 --untracked-files=all   # entries outside .dxcoder/ and generated paths (lockfiles, node_modules, .dart_tool, build outputs) are the uncommitted fix of this run: then STOP HERE — do not check out, do not pop — and report ok:true with results { branch: "${run.branch ?? "<fix branch>"}", stashPopped: false, kept: true }`)
+  } else out.push(`git status --porcelain=v1 --untracked-files=all   # anything left behind by the run? report it, never discard it`)
   out.push(`git checkout ${shellQuote(target ?? "-")}`)
   if (c.stashRef) {
     out.push(`git stash list   # find the entry whose message is "fixora/${run.runId}" (commit ${c.stashRef.slice(0, 10)})`)

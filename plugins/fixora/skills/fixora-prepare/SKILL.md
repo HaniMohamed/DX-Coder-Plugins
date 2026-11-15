@@ -32,6 +32,20 @@ lockfiles, `node_modules/`, `.dart_tool/`, `build/`, `dist/`, `Pods/` and simila
 When the prompt carries recorded values from a previous attempt (previousBranch, stashRef) and the
 checkout is already on the fix branch, report those recorded values again and do not stash twice.
 
+### Re-entry (the prompt says the run already has its branch)
+
+A retry or feedback round comes back to a branch that exists, often with the fix of this run still
+uncommitted on it (Fixora keeps that branch checked out when a run stops mid-fix). Those changes are
+the fix in progress, not a dirty checkout:
+
+- never stash them, never report `dirty: true` for them, never discard or reset anything;
+- already on the fix branch → nothing to switch; otherwise `git checkout <branch>` carries them along;
+- git refuses the checkout because of them → `fixora_submit_prepare` with `stage: "inspect"`,
+  `dirty: true`, the porcelain text in `status` and git's error in `notes`, then stop (Fixora tells the
+  user what to do; it never stashes a fix in progress);
+- then the fetch (a failure is a note), the toolchain scan, and `stage: "ready"` with `dirty: false`,
+  `created: false`, the recorded `previousBranch` / `previousHeadSha` / `stashRef`.
+
 ## Step 2 — base and branch
 
 1. `git fetch <remote> <base>` (no `--prune`). If the base branch exists neither on the remote nor

@@ -385,6 +385,7 @@ export function renderRunStatus(run: RunRecord): string {
 export function checkoutLine(run: RunRecord): string {
   const c = run.checkout
   if (!c) return "untouched"
+  if (c.active && run.meta?.restoreKept === true) return `on \`${run.branch ?? "the fix branch"}\` with the uncommitted fix (kept on purpose)${c.previousBranch ? `; your branch \`${c.previousBranch}\` is not checked out` : ""}${c.stashRef ? `; your changes are in stash \`${c.stashRef.slice(0, 10)}\`` : ""}`
   if (c.active) return `⚠ still on \`${run.branch ?? "the fix branch"}\`${c.previousBranch ? `; your branch \`${c.previousBranch}\` is not checked out yet` : ""}${c.stashRef ? `; your changes are in stash \`${c.stashRef.slice(0, 10)}\`` : ""}`
   if (c.restoredAt) return `restored to \`${c.previousBranch ?? "your branch"}\`${c.stashRef ? " (stash popped)" : ""}`
   return "untouched"
@@ -418,7 +419,8 @@ export function renderFinalReport(run: RunRecord, o: { crashUrl?: string; compar
   if (run.skipReason) rows.push(["Skipped", run.skipReason])
   L.push("| | |", "|---|---|", ...rows.map(([k, v]) => `| ${k} | ${cell(v)} |`), "")
   if (o.notes?.length) L.push(...o.notes.map((n) => `- ${n}`), "")
-  if (run.checkout?.active) L.push("Restore your checkout by hand:", "", "```", manualRestoreText(run), "```", "")
+  if (run.checkout?.active && run.meta?.restoreKept === true) L.push(`The fix is still uncommitted on \`${run.branch}\`: \`/fixora retry ${run.runId} --from fix\` continues there, \`/fixora clean ${run.runId}\` restores your branch (and deletes the fix branch), or by hand:`, "", "```", manualRestoreText(run), "```", "")
+  else if (run.checkout?.active) L.push("Restore your checkout by hand:", "", "```", manualRestoreText(run), "```", "")
   const next: string[] = []
   if (run.mrUrl || run.pipeline.committed) next.push(`\`/fixora feedback ${run.runId} "<change or question>"\``)
   if (run.status !== "done") next.push(`\`/fixora retry ${run.runId}\``)

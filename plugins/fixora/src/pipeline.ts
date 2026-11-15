@@ -23,7 +23,7 @@ import { latestFixAttempt, runReview } from "./review.js"
 import { scanAddedLines } from "./secrets.js"
 import { sourceById } from "./sources/index.js"
 import { crashFromFile } from "./sources/manual.js"
-import { saveRun } from "./state.js"
+import { fixInProgress, saveRun } from "./state.js"
 import type { Crash, RunRecord, Step, WorkerGrants, WorkerPhase } from "./types.js"
 import { checkChangedFiles, failedChecks, summarizeChecks } from "./validate.js"
 import { awaitSubmission, ensureWorker, lastAssistantText, type Outcome } from "./worker.js"
@@ -323,6 +323,13 @@ export class Pipeline {
     if (run.meta?.prepareStage === "inspect" && run.meta?.prepareDirty === true && !run.checkout.active) {
       const files = Number(run.meta?.prepareDirtyFiles ?? 0)
       const status = String(run.meta?.prepareStatus ?? "")
+      if (run.branch) {
+        // Re-entry: the prompt told the agent to carry uncommitted changes onto the fix branch; a dirty
+        // report here means it could not (a conflicting checkout). Never stash a fix in progress.
+        run.status = "blocked"
+        run.blockedReason = "dirty-worktree"
+        throw new FixoraStop(`The checkout ${run.repo} has ${files} uncommitted change(s) that could not be carried onto \`${run.branch}\`${this.lastRejection()}. If they are the fix of this run, \`git checkout ${run.branch}\` with them (resolve what git refuses); if they are your own work, commit or stash it; then \`/fixora retry ${run.runId} --from fix\`.`)
+      }
       const decision = decideApproval("stash", run, this.opts, { serviceAvailable: true })
       if (decision.decision === "ask") {
         await writeFile(join(run.folder, "stash-preview.md"), `${renderApprovalPreview(run, { kind: "stash", branch: fallbackBranch, stash: { files, status }, crashUrl: this.crashUrl() })}\n`)
@@ -447,7 +454,7 @@ export class Pipeline {
     const attempt = latestFixAttempt(run)
     const budget = this.opts.worker.maxPhaseMinutes.fix
     await stageBegin(this.rt, run, "fix")
-    const r = await awaitSubmission(this.rt, run, sessionID, fixFollowUpPrompt(run, { attempt, problems: text }), {
+    const r = await awaitSubmission(this.rt, run, sessionID, fixFollowUpPrompt(run, { attempt, problems: text }, this.opts), {
       minutes: budget,
       signal: this.o.signal,
       label: `asking the agent to fix the problems (attempt ${attempt})`,
@@ -478,7 +485,7 @@ export class Pipeline {
         return "loop"
       }
       run.status = "review-exhausted"
-      throw new FixoraStop(`The reviewer rejected the fix ${run.reviews.length} time(s); last reasons: ${important.map((f) => `${f.file}: ${f.message}`).join("; ") || verdict.summary}. The change stays uncommitted on \`${run.branch}\` (the checkout is restored to your branch; switch back with \`git checkout ${run.branch}\` to inspect it). Fix by hand and \`/fixora retry ${run.runId} --from fix\`, or \`/fixora restart ${run.runId}\`.`)
+      throw new FixoraStop(`The reviewer rejected the fix ${run.reviews.length} time(s); last reasons: ${important.map((f) => `${f.file}: ${f.message}`).join("; ") || verdict.summary}. The change stays uncommitted on \`${run.branch}\`, which stays checked out. Fix by hand and \`/fixora retry ${run.runId} --from fix\`, or \`/fixora restart ${run.runId}\`.`)
     }
     run.pipeline.reviewed = true
     await stageEnd(this.rt, run, "review", "ok", `${verdict.verdict} — ${verdict.summary.slice(0, 100)}`)
@@ -720,14 +727,27 @@ export class Pipeline {
     const run = this.run
     if (!run.checkout?.active) return
     const outcome = { status: run.status, error: run.error, step: run.step }
+    // A run that stopped with its fix uncommitted (fix / validate / review) keeps the fix branch checked
+    // out: `git checkout <previous>` would carry the half-done change onto the user's branch, where the
+    // next retry could not tell it from their own work.
+    const keepFix = fixInProgress(run)
     await stageBegin(this.rt, run, "restore")
     run.status = outcome.status
-    const result = await this.runOp({ phase: "restore", op: "restore", title: `restore the checkout to \`${run.checkout.previousBranch ?? run.checkout.previousHeadSha ?? "the previous branch"}\`${run.checkout.stashRef ? " and pop the stash" : ""}`, steps: restoreSteps(run), report: `{ branch: "<branch now checked out>", stashPopped: true/false }`, minutes: this.opts.worker.maxPhaseMinutes.restore, fatal: false, signal: undefined }).catch(() => undefined)
+    const title = keepFix
+      ? `restore the checkout to \`${run.checkout.previousBranch ?? run.checkout.previousHeadSha ?? "the previous branch"}\`${run.checkout.stashRef ? " and pop the stash" : ""}, unless the fix of this run is still uncommitted on \`${run.branch}\` (then keep that branch checked out)`
+      : `restore the checkout to \`${run.checkout.previousBranch ?? run.checkout.previousHeadSha ?? "the previous branch"}\`${run.checkout.stashRef ? " and pop the stash" : ""}`
+    const result = await this.runOp({ phase: "restore", op: "restore", title, steps: restoreSteps(run, { keepFix }), report: keepFix ? `{ branch: "<branch now checked out>", stashPopped: true/false, kept: true/false }` : `{ branch: "<branch now checked out>", stashPopped: true/false }`, minutes: this.opts.worker.maxPhaseMinutes.restore, fatal: false, signal: undefined }).catch(() => undefined)
     run.status = outcome.status
     run.error = outcome.error
     if (result?.ok && !run.checkout.active) {
       await stageEnd(this.rt, run, "restore", "ok", `${run.checkout.previousBranch ?? "previous branch"}${run.checkout.stashRef ? " · stash popped" : ""}`)
       run.step = outcome.step
+      return
+    }
+    if (result?.ok && run.checkout.active && run.meta?.restoreKept === true) {
+      await stageEnd(this.rt, run, "restore", "ok", `kept on ${run.branch} (uncommitted fix)`)
+      run.step = outcome.step
+      this.notes.push(`The fix stays uncommitted on \`${run.branch}\`, which is still checked out${run.checkout.stashRef ? ` (your own changes stay in stash \`${run.checkout.stashRef.slice(0, 10)}\`)` : ""}. \`/fixora retry ${run.runId} --from fix\` continues there; \`/fixora clean ${run.runId}\` puts your branch back instead.`)
       return
     }
     const why = result?.errors.join("; ") || "the worker did not report back"

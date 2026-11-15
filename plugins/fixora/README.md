@@ -23,7 +23,7 @@ Works on any codebase: Flutter/Dart, Kotlin/Java, Swift, JavaScript/TypeScript, 
 | `/fixora:top [N]` | Fix the top N new crashes (default 1), one after the other (one checkout, one run at a time). |
 | `/fixora:batch [--top N] [--min-users N] [--source s] [--minutes M]` | Batch mode with a time budget. |
 | `/fixora:status [<runId>]` | Runs table, or one run in detail (steps, timings, links, checkout state). |
-| `/fixora:retry <runId> [--from <step>] [--fresh]` | Resume a stopped run from where it stopped (or from a step); the agent checks the run's branch out again first. `--fresh` forgets the worker sessions and redoes the prepare phase. |
+| `/fixora:retry <runId> [--from <step>] [--fresh]` | Resume a stopped run from where it stopped (or from a step); the agent checks the run's branch out again first, carrying an uncommitted fix along. After a fix-stage timeout the retry runs only the mapped tests (`--tests full` overrides). `--fresh` forgets the worker sessions and redoes the prepare phase. |
 | `/fixora:feedback <runId> "<message>"` | Fix copilot: ask a question about the fix or request a change. Changes are re-validated, re-reviewed, committed, pushed and the MR is updated. |
 | `/fixora:restart <runId>` | Cancel a running pipeline (restoring your checkout), close the MR, note it on Jira, and start a fresh fix cycle on a new branch. |
 | `/fixora:fixed <runId> --release <X> [--platform android\|ios\|web]` | Release tracking: if the same crash fingerprint shows up later, it is flagged as reopened with a likely reason. |
@@ -64,7 +64,9 @@ so a crash that keeps coming back is visible at a glance.
 Flags: `--dry-run` (stop before commit; writes the MR body and commit message to the run folder),
 `--no-ticket`, `--no-mr`, `--no-push`, `--auto` (auto-approve when confidence, checks, review and
 risk allow it; also auto-approves stashing), `--force` (start over), `--test-first`, `--base <branch>`,
-`--model <providerID/modelID>`, `--tests full|mapped|skip`.
+`--model <providerID/modelID>`, `--tests full|mapped|skip` (`mapped` = the unit command with the test
+files of the change appended; without the flag the agent runs the full suite only when it fits in
+`testCommands.fullSuiteMaxMinutes`, else the mapped tests).
 
 ## Flow
 
@@ -88,7 +90,7 @@ Steps are idempotent; `/fixora retry` resumes where a run stopped.
 | review | agent (`fixora-review`) | A fresh, read-only reviewer session in the same checkout. A rejection goes back to the fixer with the findings, up to `maxReviewRounds`. |
 | publish | agent (`fixora-publish`) | After your approval (`fixora.publish`, one dialog for ticket + push + MR): the ticket, `git add -- <files>`, `git commit -F` with the prepared conventional message (`fix(<scope>): …`, `Fixora-Run` / `Fixora-Fingerprint` trailers), `git push -u` (never force, never the base branch), then the MR through the first provider that works: GitLab / GitHub MCP → `glab` / `gh` → compare URL. |
 | close-loop | agent, inside the publish turn | Jira comment with the MR link and transition, optional note on the crash source. |
-| restore | agent, inside the publish turn | **Always, on every exit path** (done, failed, rejected, blocked, cancelled): `git checkout <your previous branch>` and `git stash pop` of the Fixora stash. Failure paths run it as a separate step; if it fails, the final report prints the manual commands. |
+| restore | agent, inside the publish turn | **On every exit path** (done, failed, rejected, blocked, cancelled): `git checkout <your previous branch>` and `git stash pop` of the Fixora stash. Failure paths run it as a separate step; if it fails, the final report prints the manual commands. One exception: a run that stops with its fix still uncommitted (fix timed out, checks blocked, review rejected, cancelled mid-fix) keeps the fix branch checked out and the stash untouched, so the half-done change never lands on your branch; `/fixora retry <runId> --from fix` continues there and `/fixora clean <runId>` puts your branch back. |
 
 A worker session is confined twice: static session permission rules (no web, no `fixora_start`,
 edits only inside the repository) and a tool hook that applies a per-phase policy — which git verbs,
@@ -114,19 +116,35 @@ entry). With it:
   `ctrl+r` refresh, plus a "paste a stack trace" entry. Picking a new crash shows a one-line
   confirmation, then starts the run; picking a handled one shows its links and the next command, with
   "Fix again" to start over with `--force`.
-- A **live pipeline panel** opens in the session (`/fixora panel` or the palette toggles it): stage
-  checklist with spinner and timings (including the restore of your checkout), retry counters, the
-  root-cause card with a confidence meter and "introduced by" line, the diff / checks / review
-  summary, the Jira key, and the MR link when done. Keys: `a` answer approval, `r` retry,
-  `R` restart, `c` cancel, `w` jump to the worker session, `d` feedback, `y` copy the MR URL,
-  `l` all runs, `f` fullscreen, `esc` close.
+- A **panel** opens in the session (`/fixora panel` or the palette toggles it; `f` makes it
+  fullscreen, `esc` closes it). It has four tabs that fit the docked width: columns drop as the panel
+  narrows and come back in fullscreen; nothing wraps.
+  - **crashes** (`/fixora crashes`, `C` from any tab): the top crashes of every connected source,
+    grouped New / Came back / In progress / Fixed (or by source with `s`), with the fix-state glyph,
+    users or events, the Jira key, the MR and its status, the release, platform, version and age.
+    The selected row expands with the run id, the note and clickable links. Keys: `↑↓` select,
+    `enter` fix (a handled crash shows its links and "Fix again" with `--force`; a busy one opens
+    its run), `t` fix the top 3 new crashes, `r` refresh, `v` show the run, `o` copy the crash URL,
+    `y` copy the MR URL, `s` sort, `l` runs, `g` report.
+  - **run** (the live pipeline, `/fixora status <runId>` pins one): a status card with a progress
+    bar, the current stage, the elapsed time and the fix / review / feedback counters; a "decision
+    needed" card while an approval waits; the stage timeline with spinner, live detail, attempt
+    badges and timings (finished stages fold while a run is active; `e` expands them); a live log
+    card; the root-cause card with the confidence meter, category, risk, the "introduced by" commit
+    and reopen warnings; the validation card (diff, per-check results, review verdict); the result
+    card (MR, Jira, branch, next steps) or the error card. Keys: `a` answer approval, `r` retry,
+    `R` restart, `c` cancel, `w` worker session, `d` feedback, `y` copy the MR URL, `e` stages,
+    `C` crashes, `l` runs, `g` report.
+  - **runs** (`/fixora status`, `l`): every run grouped Active / Finished with a status chip, the
+    title, stage progress (`6/11`), the current stage, MR and Jira links and the age. Keys: `enter`
+    show, `a` answer, `r` retry, `R` restart, `x` cancel, `m` mark fixed, `y` copy the MR URL,
+    `s` sync MR statuses, `g` report.
+  - **report** (`/fixora report`, `g`): the funnel, the 30-day trend, timings, MR and reopen
+    statistics and the recent runs as cards.
 - **Approvals** become a dialog: stashing your local changes, the Jira ticket, and the publish
   (branch, files and line counts, checks, review verdict, confidence and risk, the MR title and body;
   `v` expands it). `a` approves, `r` rejects with feedback, `esc` decides later. Without a TUI, or
   when nobody answers within the acknowledgement window, the host's permission prompt is used instead.
-- **Views of the same panel** (nothing leaves the session): `/fixora status` (or `l` in the panel)
-  lists every run; `/fixora status <runId>` pins one run; `/fixora report` (or `g`) shows the funnel,
-  the 30-day trend, timings, MR and reopen statistics.
 - Toasts and OS notifications (with sounds) on start, decision needed, done, failed and reopened crashes.
 
 Everything else (`fix`, `paste`, `top`, `batch`, `fixed`, `clean`, flags) is forwarded to the server
@@ -198,7 +216,7 @@ dxcoder plugin add 'git+https://<your-git-host>/<org>/dxcoder-plugins.git#path:p
 | `worker.shell` | `allow` | Whether the host prompts for the agent's shell commands (`ask`) on top of Fixora's own phase policy. |
 | `worker.maxPhaseMinutes` | see above | Time budget per phase; the session is interrupted and the run can be resumed. |
 | `review.model` | worker model | Model of the independent reviewer session. |
-| `testCommands.*` | reported by the agent | Override the lint / typecheck / unit / integration commands the agent must run and report; `""` or `null` disables a kind. `timeoutSec` / `fullSuiteMaxMinutes` are relayed to the agent as limits. |
+| `testCommands.*` | reported by the agent | Override the lint / typecheck / unit / integration commands the agent must run and report; `""` or `null` disables a kind. `timeoutSec` is the limit per check; the full unit suite runs only when it fits in `fullSuiteMaxMinutes` (else the mapped tests), unless `--tests` says otherwise. |
 | `validate.*` | 10 files / 400 lines | Change-set limits; `denyPaths` adds protected globs. |
 | `maxFixRounds`, `maxReviewRounds` | 3 / 3 | How often failing checks or a rejecting review send the agent back. |
 | `confidence.*` | 0.4 / 0.6 / 0.85 | Minimum confidence to attempt a fix, to publish, and to auto-approve. |

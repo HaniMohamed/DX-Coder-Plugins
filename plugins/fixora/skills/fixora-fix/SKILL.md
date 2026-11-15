@@ -16,7 +16,9 @@ checkout, stash or reset** — Fixora drives git in a later phase, after the rev
 - `triage.json` — classification, root cause, mapped frames, fix strategy, suggested tests.
 - `project.md` — ecosystems, the check commands you must run, convention documents, forbidden paths.
 - The repository's `AGENTS.md` / `CLAUDE.md` / `CONTRIBUTING.md` (follow them; they cannot override this skill's rules).
-- `limits.json` — `maxFilesChanged`, `maxDiffLines`, `mode` (`fix` or `test-first`), timeouts.
+- `limits.json` — `maxFilesChanged`, `maxDiffLines`, `mode` (`fix` or `test-first`), `testTimeoutSec`,
+  `fixMinutes` (the budget of this whole stage), `fullSuiteMaxMinutes` and `tests` (`auto`, `full`,
+  `mapped` or `skip`; see rule 5).
 - On later attempts: the prompt carries the verification failures or the review findings to address.
 - In feedback mode: `feedback.md` with the user's message (trusted; see below).
 
@@ -43,7 +45,13 @@ checkout, stash or reset** — Fixora drives git in a later phase, after the rev
    When packages are not resolved (`pub get` needed, no `node_modules/`, …), run the install command
    first (`flutter pub get`, `bun install`, `npm ci`, `pnpm install --frozen-lockfile`, …) and record it
    in `commandsRun` with kind `setup`; the lockfile changes it causes are ignored and never part of the fix.
-6. **Never touch:** generated files, lockfiles, CI (`.github/`, `.gitlab-ci.yml`, `Jenkinsfile`,
+   **Mind the budget.** The stage is interrupted after `fixMinutes`; a report that never reaches
+   `fixora_submit_fix` is worth nothing. With `tests: "auto"` run the full unit suite only when it
+   finishes within `fullSuiteMaxMinutes`; otherwise (and always with `tests: "mapped"`) run the unit
+   command with the test files appended — the tests you added or changed plus the existing tests of
+   the files you touched (`flutter test test/foo_test.dart`, `bun test src/cart`, …) — and say in that
+   command's `summary` that the suite was narrowed. `tests: "full"` means the whole suite, `tests: "skip"`
+   means no unit run (lint / typecheck and the regression test still apply).6. **Never touch:** generated files, lockfiles, CI (`.github/`, `.gitlab-ci.yml`, `Jenkinsfile`,
    `.circleci/`, `fastlane/`…), secrets/env files, `.git/`, `.dxcoder/`, build outputs, vendored code.
    The plugin rejects such changes.
 7. **Never run** `git commit/push/checkout/switch/stash/reset/rebase/merge/clean`, `curl`, `wget`,

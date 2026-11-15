@@ -157,15 +157,22 @@ function prepareSection(run: RunRecord, opts: FixoraOptions, o: WorkInput): stri
         ? `Branch name, from the configured naming convention (${opts.branchNaming.template}${opts.branchNaming.example ? `, e.g. ${opts.branchNaming.example}` : ""}): \`${o.fallbackBranch}\` — use it exactly${o.ticket ? `, with <key> replaced by the Jira key from the ticket step below (or by ${o.ticketFallback ?? run.crashId} when no ticket could be created)` : ""}. Create it with \`git checkout -b <name> ${base}\`; if it already exists locally or on the remote, check it out instead.`
         : `Fallback branch name when the repository has no naming convention: \`${o.fallbackBranch}\`.`,
     o.ticket && !run.jiraKey ? ["Before creating the branch (the name needs the ticket key):", ...ticketLines(run, o.ticket, "then continue with the branch")].join("\n") : "",
-    run.checkout?.previousBranch ? `A previous attempt recorded previousBranch "${run.checkout.previousBranch}" (HEAD ${run.checkout.previousHeadSha ?? "?"})${run.checkout.stashRef ? ` and stashRef ${run.checkout.stashRef} (message "fixora/${run.runId}")` : ""}. If the checkout is already on the fix branch, report those recorded values again instead of the current ones, and never stash a second time when a stash with that message already exists.` : "",
-    o.stashApproved
+    run.checkout?.previousBranch ? `A previous attempt recorded previousBranch "${run.checkout.previousBranch}" (HEAD ${run.checkout.previousHeadSha ?? "?"})${run.checkout.stashRef ? ` and stashRef ${run.checkout.stashRef} (message "fixora/${run.runId}")` : ""}. Report those recorded values again instead of the current ones${run.branch ? "" : " if the checkout is already on the fix branch"}, and never stash a second time when a stash with that message already exists.` : "",
+    run.branch
+      ? [
+          `Re-entry rules (this run already has its branch): uncommitted changes in the checkout, other than entries under .dxcoder/ and generated paths, are the fix of this run in progress. Never stash them, never report the checkout as dirty, never discard anything.`,
+          `Step 1 — inspect: \`git rev-parse --show-toplevel\`, \`git rev-parse --abbrev-ref HEAD\`, \`git rev-parse HEAD\`, \`git status --porcelain=v1 --untracked-files=all\`.`,
+          `Step 2 — if HEAD is already \`${run.branch}\`: nothing to switch. Otherwise \`git checkout ${run.branch}\` (git carries the uncommitted changes along; create the branch from ${run.base.remote}/${run.branch} only when it exists nowhere locally). If git refuses the checkout because of those changes, do not resolve or stash anything: call fixora_submit_prepare with stage "inspect", dirty true, the porcelain text in \`status\`, git's error in \`notes\`, and STOP.`,
+          `Step 3 — \`git fetch ${run.base.remote} ${run.base.branch}\` (a failure is a note, not a block: the branch already exists), the quick toolchain scan as the fixora-prepare skill describes, then fixora_submit_prepare with stage "ready", dirty false, branch "${run.branch}", created false${run.checkout?.stashRef ? `, stashRef "${run.checkout.stashRef}"` : ""}.`,
+        ].join("\n")
+      : o.stashApproved
       ? `The user approved stashing. First run \`git stash push -u -m ${shellQuote(`fixora/${run.runId}`)}\`, then \`git rev-parse stash@{0}\` and report that commit id as \`stashRef\`. Never drop or clear stashes. Then fetch, branch, checkout and the quick toolchain scan as the fixora-prepare skill describes, and call fixora_submit_prepare with stage "ready".`
       : [
           "Step 1 — inspect: `git rev-parse --show-toplevel`, `git rev-parse --abbrev-ref HEAD` (a detached HEAD → use the commit id), `git rev-parse HEAD`, then `git status --porcelain=v1 --untracked-files=all`. Ignore entries under `.dxcoder/` and generated paths (lockfiles, node_modules, .dart_tool, build outputs) when deciding whether the checkout is dirty.",
           'Step 2 — if the checkout is DIRTY (any other entry): call fixora_submit_prepare with stage "inspect", dirty true, the porcelain text in `status` and `dirtyFiles`, and STOP. Do not stash, do not change branches: Fixora asks the user first.',
           'Step 3 — if the checkout is CLEAN: fetch the base branch, create (or check out) the fix branch, do the quick toolchain scan as the fixora-prepare skill describes, then call fixora_submit_prepare with stage "ready".',
         ].join("\n"),
-    o.exactBranch ? SPEED_NOTE_EXACT : SPEED_NOTE,
+    run.branch || o.exactBranch ? SPEED_NOTE_EXACT : SPEED_NOTE,
   ].filter(Boolean)
 }
 
@@ -179,11 +186,22 @@ function triageSection(run: RunRecord): string[] {
   ].filter(Boolean)
 }
 
+/** How much of the test suite the fix stage runs: `--tests full|mapped|skip`, else a time-boxed default. */
+export function testBudgetLine(run: RunRecord, opts: FixoraOptions): string {
+  const mode = run.meta?.tests
+  const mapped = "the unit command with the test files appended (the tests you added or changed plus the existing tests of the files you touched, e.g. `flutter test test/foo_test.dart`, `bun test src/cart`); record each such command in commandsRun"
+  if (mode === "skip") return "Tests: --tests skip — do not run the unit suite; still run lint / typecheck and add the regression test."
+  if (mode === "mapped") return `Tests: --tests mapped — do not run the full unit suite; run ${mapped}.`
+  if (mode === "full") return "Tests: --tests full — run the complete unit suite, whatever it takes."
+  return `Tests: the budget for this stage is ${opts.worker.maxPhaseMinutes.fix} minutes in total, so run the full unit suite only when it finishes within ${opts.testCommands.fullSuiteMaxMinutes} minutes (a large Flutter / Gradle / Xcode suite usually does not); otherwise run ${mapped}, and say in that command's summary that the suite was narrowed. Submitting with mapped tests beats timing out before fixora_submit_fix.`
+}
+
 function fixSection(run: RunRecord, opts: FixoraOptions, o: WorkInput): string[] {
   const checks = o.checks.map((c) => `\`${c.command}\`${c.cwd ? ` (in ${c.cwd})` : ""}${c.optional ? " (optional)" : ""}`).join(", ")
   const common = [
     `Edit files inside the repository only. Never commit, push, checkout, stash or reset: Fixora drives git in the publish turn after the review.`,
     `Check commands to run yourself before submitting (every non-optional one must appear in commandsRun with its real exit code): ${checks || "the ones named in project.md (written by the prepare stage); none detected → still add a test in the conventional location"}. If packages are not resolved, run the install command (flutter pub get, bun install, npm ci, …) first and record it in commandsRun with kind "setup"; its lockfile changes are ignored. Stop a check after ${opts.testCommands.timeoutSec} seconds and report it as timed out.`,
+    testBudgetLine(run, opts),
     `Limits: at most ${opts.validate.maxFilesChanged} files and ${opts.validate.maxDiffLines} diff lines. Never touch CI, lockfiles, generated files or .dxcoder.`,
     `Before calling fixora_submit_fix run \`git add -N . && git status --porcelain=v1 --untracked-files=all\` and \`git diff HEAD\`, and pass both outputs verbatim as \`status\` and \`diff\`.`,
   ]
@@ -231,8 +249,8 @@ export function workPrompt(run: RunRecord, opts: FixoraOptions, o: WorkInput): P
   return { text: L.join("\n").trimEnd(), files, skills }
 }
 
-export function fixFollowUpPrompt(run: RunRecord, o: { attempt: number; problems: string }): Prompt {
-  const text = `${o.problems}\n\nRepository: ${run.repo} (branch \`${run.branch}\`). Re-run the check commands, then run \`git add -N . && git status --porcelain=v1 --untracked-files=all\` and \`git diff HEAD\` and call fixora_submit_fix with runId "${run.runId}", attempt ${o.attempt}, and both outputs as \`status\` / \`diff\`. Never commit or push. Then stop.`
+export function fixFollowUpPrompt(run: RunRecord, o: { attempt: number; problems: string }, opts?: FixoraOptions): Prompt {
+  const text = `${o.problems}\n\nRepository: ${run.repo} (branch \`${run.branch}\`). Re-run the check commands${opts ? ` (${testBudgetLine(run, opts)})` : ""}, then run \`git add -N . && git status --porcelain=v1 --untracked-files=all\` and \`git diff HEAD\` and call fixora_submit_fix with runId "${run.runId}", attempt ${o.attempt}, and both outputs as \`status\` / \`diff\`. Never commit or push. Then stop.`
   return { text, files: ["limits.json"], skills: [SKILLS.fix] }
 }
 
@@ -347,8 +365,8 @@ export function opsPrompt(o: { runId?: string; op: string; title: string; steps:
   return { text: L.join("\n"), files: [], skills: [SKILLS.ops] }
 }
 
-export function restoreSteps(run: RunRecord): OpStep[] {
-  return restorePlan(run).map((command) => ({ command }))
+export function restoreSteps(run: RunRecord, o: { keepFix?: boolean } = {}): OpStep[] {
+  return restorePlan(run, o).map((command) => ({ command }))
 }
 
 export { restorePlan }
