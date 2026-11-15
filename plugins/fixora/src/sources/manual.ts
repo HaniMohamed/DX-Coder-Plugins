@@ -44,24 +44,18 @@ export const manual: CrashSource = {
     const m = /^manual:(.+)$/.exec(input)
     return m ? { id: m[1]! } : undefined
   },
-  async get(sc, id, extra) {
-    const file = extra?.file ?? id
-    let text: string
-    try {
-      text = await readFile(file, "utf8")
-    } catch (error) {
-      throw new Error(`cannot read stack trace file ${file}: ${(error as Error).message}`)
-    }
-    if (!text.trim()) throw new Error(`${file} is empty`)
-    const crash = crashFromText({
-      text,
-      title: extra?.title,
-      platform: extra?.platform,
-      language: extra?.language as Language | undefined,
-      appPackage: sc.options.appPackage,
-      inAppPrefixes: sc.options.inAppPackages,
-    })
-    if (crash.frames.length === 0) throw new Error(`could not parse any stack frame from ${file}. Supported formats: Dart/Flutter, Kotlin/Java, Swift/Objective-C, JavaScript/TypeScript, Python, Go, .NET, and any "path:line" lines.`)
-    return crash
-  },
+}
+
+/** Reads the plugin's own copy of a pasted trace (`<run folder>/trace.txt`); no MCP, no agent. */
+export async function crashFromFile(o: { file: string; title?: string; platform?: string; language?: string; appPackage?: string; inAppPrefixes?: string[] }): Promise<Crash> {
+  let text: string
+  try {
+    text = await readFile(o.file, "utf8")
+  } catch (error) {
+    throw new Error(`cannot read stack trace file ${o.file}: ${(error as Error).message}`)
+  }
+  if (!text.trim()) throw new Error(`${o.file} is empty`)
+  const crash = crashFromText({ text, title: o.title, platform: o.platform, language: o.language as Language | undefined, appPackage: o.appPackage, inAppPrefixes: o.inAppPrefixes })
+  if (crash.frames.length === 0) throw new Error(`could not parse any stack frame from ${o.file}. Supported formats: Dart/Flutter, Kotlin/Java, Swift/Objective-C, JavaScript/TypeScript, Python, Go, .NET, and any "path:line" lines.`)
+  return crash
 }

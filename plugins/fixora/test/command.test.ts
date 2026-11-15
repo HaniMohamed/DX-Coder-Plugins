@@ -31,12 +31,11 @@ describe("parseCommand", () => {
   })
 
   test("fix with flags", () => {
-    const r = ok("fix crashlytics:abc --dry-run --no-ticket --no-mr --auto --force --test-first --base develop --model openai/gpt-5 --review quick --tests mapped")
+    const r = ok("fix crashlytics:abc --dry-run --no-ticket --no-mr --auto --force --test-first --base develop --model openai/gpt-5 --tests mapped")
     expect(r).toMatchObject({ verb: "fix", ref: "crashlytics:abc" })
     if (r.verb !== "fix") throw new Error()
-    expect(r.flags).toMatchObject({ dryRun: true, ticket: false, mr: false, push: true, auto: true, force: true, testFirst: true, base: "develop", model: "openai/gpt-5", review: "quick", tests: "mapped" })
+    expect(r.flags).toMatchObject({ dryRun: true, ticket: false, mr: false, push: true, auto: true, force: true, testFirst: true, base: "develop", model: "openai/gpt-5", tests: "mapped" })
     expect(err("fix")).toContain("fix needs a crash reference")
-    expect(err("fix sentry:1 --review loud")).toContain("--review must be")
     expect(err("fix sentry:1 --model gpt5")).toContain("--model must be")
   })
 
@@ -66,6 +65,8 @@ describe("parseCommand", () => {
     expect(ok("report")).toEqual({ verb: "report", days: 30 })
     expect(ok("clean sentry-1 --remote")).toEqual({ verb: "clean", runId: "sentry-1", remote: true })
     expect(ok("sync")).toEqual({ verb: "sync" })
+    expect(ok("reset")).toEqual({ verb: "reset", files: false })
+    expect(ok("reset --files")).toEqual({ verb: "reset", files: true })
     expect(ok("help")).toEqual({ verb: "help" })
     expect(err("frobnicate")).toContain("unknown verb")
   })

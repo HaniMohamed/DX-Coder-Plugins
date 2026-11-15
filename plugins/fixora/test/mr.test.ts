@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { assertSafePush, branchName, compareUrl, isProtectedBranch, parseRemote, slug } from "../src/git.js"
-import { githubCreateInput, gitlabCreateInput, pickMrProvider, serviceMatchesHost, statusFromResult, urlFromResult } from "../src/mr.js"
+import { cliCreateCommand, githubCreateInput, gitlabCreateInput, mrProviderOrder, renderMrAttempts, renderMrOp, serviceMatchesHost, statusFromResult, urlFromResult } from "../src/mr.js"
 import type { Services } from "../src/types.js"
 
 const fixture = (p: string) => JSON.parse(readFileSync(join(import.meta.dir, "fixtures", p), "utf8")) as unknown
@@ -49,17 +49,33 @@ describe("mr", () => {
     github: { id: "github", namespace: "github", serverName: "github", status: "connected", toolIds: [], capabilities: { createPr: "github_create_pull_request" } },
   }
 
-  test("provider order: MCP → CLI → URL, honouring the host", async () => {
-    expect(await pickMrProvider(services, remoteGl, { cli: async () => true })).toBe("gitlab-mcp")
-    expect(await pickMrProvider(services, remoteGh, { cli: async () => true })).toBe("github-mcp")
+  test("provider order: MCP → CLI → URL, honouring the host", () => {
+    expect(mrProviderOrder(services, remoteGl)).toEqual(["gitlab-mcp", "glab", "url"])
+    expect(mrProviderOrder(services, remoteGh)).toEqual(["github-mcp", "gh", "url"])
     const other = { ...services, gitlab: { ...services.gitlab!, environment: { GITLAB_API_URL: "https://gitlab.other.com/api/v4" } } }
-    expect(await pickMrProvider(other, remoteGl, { cli: async (b) => b === "glab" })).toBe("glab")
-    expect(await pickMrProvider(other, remoteGl, { cli: async () => false })).toBe("url")
-    expect(await pickMrProvider({}, remoteGh, { cli: async (b) => b === "gh" })).toBe("gh")
-    expect(await pickMrProvider({}, parseRemote("ssh://git@git.corp.io/team/app")!, { cli: async () => true })).toBe("url")
-    expect(await pickMrProvider({ gitlab: services.gitlab }, parseRemote("ssh://git@git.corp.io/team/app")!, { forge: "gitlab", cli: async () => false })).toBe("url")
+    expect(mrProviderOrder(other, remoteGl)).toEqual(["glab", "url"])
+    expect(mrProviderOrder({}, remoteGh)).toEqual(["gh", "url"])
+    expect(mrProviderOrder({}, parseRemote("ssh://git@git.corp.io/team/app")!)).toEqual(["url"])
+    expect(mrProviderOrder(services, parseRemote("ssh://git@git.corp.io/team/app")!)).toEqual(["github-mcp", "url"]) // the GitLab server is pinned to another host
+    expect(mrProviderOrder({ gitlab: services.gitlab }, parseRemote("ssh://git@git.corp.io/team/app")!, { forge: "gitlab" })).toEqual(["glab", "url"])
+    expect(mrProviderOrder({ gitlab: { ...services.gitlab!, environment: {} } }, parseRemote("ssh://git@git.corp.io/team/app")!, { forge: "gitlab" })).toEqual(["gitlab-mcp", "glab", "url"])
     expect(serviceMatchesHost(services.gitlab, "gitlab.example.com")).toBe(true)
     expect(serviceMatchesHost(services.github, "github.com")).toBe(true)
+  })
+
+  test("attempts carry the adapted MCP input, the exact CLI line and the compare URL", () => {
+    const target = { remote: remoteGl, base: "main", branch: "fixora/x" }
+    const mr = { title: "Guard nil", body: "b", draft: true, labels: ["fixora"], reviewers: ["bob"] }
+    const attempts = renderMrAttempts({ order: ["gitlab-mcp", "glab", "url"], target, mr, services, toolProps: () => ({ projectId: {}, sourceBranch: {}, targetBranch: {}, title: {}, body: {}, draft: {} }), bodyFile: "/run/mr.md" })
+    expect(attempts[0]).toMatchObject({ provider: "gitlab-mcp", toolId: "gitlab_create_merge_request", input: { projectId: "mobile/shop", sourceBranch: "fixora/x", targetBranch: "main", title: "Draft: Guard nil", body: "b", draft: true } })
+    expect(attempts[1]!.command).toBe("glab mr create --source-branch fixora/x --target-branch main --title 'Draft: Guard nil' --description-file /run/mr.md --yes --remove-source-branch --draft --label fixora --reviewer bob")
+    expect(attempts[2]!.url).toContain("/-/merge_requests/new?")
+    expect(cliCreateCommand("gh", { ...target, remote: remoteGh }, mr, "/run/mr.md")).toBe("gh pr create --head fixora/x --base main --title 'Guard nil' --body-file /run/mr.md --draft --label fixora --reviewer bob")
+    const view = renderMrOp({ provider: "glab", op: "view", target, id: "418", url: "https://gitlab.example.com/mobile/shop/-/merge_requests/418", services, toolProps: () => ({}) })
+    expect(view?.command).toBe("glab mr view 418 --output json")
+    const close = renderMrOp({ provider: "gitlab-mcp", op: "close", target, id: "418", url: "x", services: { gitlab: { ...services.gitlab!, capabilities: { ...services.gitlab!.capabilities, updateMr: "gitlab_update_merge_request" } } }, toolProps: () => ({}) })
+    expect(close).toMatchObject({ toolId: "gitlab_update_merge_request", input: { project_id: "mobile/shop", merge_request_iid: 418, state_event: "close" } })
+    expect(renderMrOp({ provider: "url", op: "view", target, url: "x", services, toolProps: () => ({}) })).toBeUndefined()
   })
 
   test("input mapping and result parsing", () => {

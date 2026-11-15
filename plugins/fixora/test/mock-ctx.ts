@@ -1,15 +1,15 @@
-// A fake DXcoder plugin context for end-to-end tests: in-memory storage, recorded synthetic
-// messages, scripted worker sessions that call the plugin's own tools, real git worktrees.
+// A fake DXcoder plugin context for orchestration tests: in-memory storage, recorded synthetic
+// messages, scripted worker sessions that call the plugin's own tools, fake MCP tools (listed, never
+// executed by the plugin), recorded permission requests and RPC events. No git, no processes.
 
 import type { Plugin } from "@opencode/plugin"
-import { runGit } from "../src/git.js"
 
 export interface RegisteredTool {
   id: string
   name: string
   description: string
   input: unknown
-  options?: { namespace?: string }
+  options?: { namespace?: string; codemode?: boolean }
   execute: (input: unknown, ctx: { sessionID: string; agent: string; messageID: string; id: string; signal: AbortSignal; progress: () => Promise<void> }) => Promise<{ output?: unknown; content?: string }>
 }
 
@@ -27,7 +27,8 @@ export interface SessionRecord {
   agent?: string
   location?: { directory: string }
   permissions?: unknown
-  prompts: Array<{ text: string; skills?: Array<{ id: string }>; files?: unknown[] }>
+  prompts: Array<{ text: string; skills?: Array<{ id: string }>; files?: Array<{ uri: string; name?: string }> }>
+  interrupted: number
 }
 
 export type Worker = (prompt: { text: string; skills?: Array<{ id: string }> }, session: SessionRecord, tools: (name: string) => RegisteredTool) => Promise<void>
@@ -45,9 +46,13 @@ export interface MockCtx {
   rejectPermissions: Set<string>
   mcpTools: RegisteredTool[]
   mcpServers: Array<{ name: string; status: string }>
+  /** Assistant text `session.context` returns (feedback answers). */
+  assistantText: string
 }
 
-export function mockCtx(o: { directory: string; options?: Record<string, unknown>; worker: Worker; worktreeRoot: string }): MockCtx {
+export const toolCtx = (sessionID: string) => ({ sessionID, agent: "build", messageID: "m", id: "c", signal: new AbortController().signal, progress: async () => {} })
+
+export function mockCtx(o: { directory: string; options?: Record<string, unknown>; worker: Worker }): MockCtx {
   const storage = new Map<string, unknown>()
   const synthetics: Synthetic[] = []
   const sessions = new Map<string, SessionRecord>()
@@ -59,7 +64,7 @@ export function mockCtx(o: { directory: string; options?: Record<string, unknown
   const mcpTools: RegisteredTool[] = []
   const mcpServers: MockCtx["mcpServers"] = []
   let counter = 0
-  const box: { worker: Worker } = { worker: o.worker }
+  const box: { worker: Worker; assistantText: string } = { worker: o.worker, assistantText: "" }
 
   const toolById = (name: string) => {
     const t = [...tools.values(), ...mcpTools].find((x) => x.id === name || x.name === name)
@@ -84,15 +89,15 @@ export function mockCtx(o: { directory: string; options?: Record<string, unknown
     session: {
       create: async (input: { parentID?: string; title?: string; agent?: string; location?: { directory: string }; permissions?: unknown }) => {
         const id = `ses_${++counter}`
-        sessions.set(id, { id, parentID: input.parentID, title: input.title, agent: input.agent, location: input.location, permissions: input.permissions, prompts: [] })
+        sessions.set(id, { id, parentID: input.parentID, title: input.title, agent: input.agent, location: input.location, permissions: input.permissions, prompts: [], interrupted: 0 })
         return { id }
       },
       get: async (input: { sessionID: string }) => {
         const s = sessions.get(input.sessionID)
         if (!s) throw new Error("not found")
-        return s
+        return { ...s, location: s.location ?? { directory: o.directory } }
       },
-      prompt: async (input: { sessionID: string; text: string; skills?: Array<{ id: string }>; files?: unknown[] }) => {
+      prompt: async (input: { sessionID: string; text: string; skills?: Array<{ id: string }>; files?: Array<{ uri: string; name?: string }> }) => {
         const s = sessions.get(input.sessionID)
         if (!s) throw new Error(`no session ${input.sessionID}`)
         s.prompts.push({ text: input.text, skills: input.skills, files: input.files })
@@ -101,8 +106,12 @@ export function mockCtx(o: { directory: string; options?: Record<string, unknown
       },
       wait: async () => {},
       synthetic: async (input: Synthetic) => void synthetics.push(input),
-      interrupt: async () => ({ interrupted: true }),
-      context: async () => [],
+      interrupt: async (input: { sessionID: string }) => {
+        const s = sessions.get(input.sessionID)
+        if (s) s.interrupted++
+        return { interrupted: true }
+      },
+      context: async () => (box.assistantText ? [{ role: "assistant", parts: [{ type: "text", text: box.assistantText }] }] : []),
       generate: async () => ({ text: "" }),
     },
     permission: {
@@ -142,18 +151,6 @@ export function mockCtx(o: { directory: string; options?: Record<string, unknown
       },
       reload: async () => {},
     },
-    worktree: {
-      create: async (input: { branch?: string; name?: string; directory?: string }) => {
-        const dir = input.directory ?? `${o.worktreeRoot}/${input.name ?? `wt-${++counter}`}`
-        await runGit(o.directory, ["worktree", "add", "--quiet", "--detach", dir, input.branch ?? "HEAD"])
-        return { directory: dir }
-      },
-      remove: async (input: { directory: string }) => {
-        await runGit(o.directory, ["worktree", "remove", "--force", input.directory], { allowFail: true })
-      },
-      list: async () => [],
-      refresh: async () => {},
-    },
     rpc: {
       register: async () => ({ events: { emit: async (name: string, data: unknown) => void rpcEvents.push({ name, data }) }, dispose: async () => {} }),
     },
@@ -180,5 +177,20 @@ export function mockCtx(o: { directory: string; options?: Record<string, unknown
     set worker(w: Worker) {
       box.worker = w
     },
+    get assistantText() {
+      return box.assistantText
+    },
+    set assistantText(t: string) {
+      box.assistantText = t
+    },
   }
 }
+
+/** A fake MCP tool that is only listed (the plugin never executes MCP tools itself). */
+export const fakeMcpTool = (id: string, props: Record<string, unknown> = {}): RegisteredTool => ({
+  id,
+  name: id,
+  description: `fake ${id}`,
+  input: { type: "object", properties: props },
+  execute: async () => ({ output: {} }),
+})

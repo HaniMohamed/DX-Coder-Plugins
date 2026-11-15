@@ -109,7 +109,7 @@ export default Plugin.define({
           await rpc["run.retry"]({ runId, sessionID, from }).then(() => toast.show({ message: `Fixora retrying ${runId}`, variant: "info" }), (e: { message?: string }) => toast.show({ message: e.message ?? "retry failed", variant: "warning" }))
         },
         async restart(runId) {
-          const ok = await context.ui.dialog.confirm({ title: "Fixora · restart", message: `Close the merge request of ${runId} (if any) and start a fresh fix cycle on a new branch?`, label: { confirm: "Restart", cancel: "Keep" } })
+          const ok = await context.ui.dialog.confirm({ title: "Fixora · restart", message: `Close the merge request of ${runId} (if any), restore your checkout and start a fresh fix cycle on a new branch?`, label: { confirm: "Restart", cancel: "Keep" } })
           if (!ok) return
           const sessionID = state.runs[runId]?.sessionID || currentSession(fx)
           if (!sessionID) return

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { decideAutoAllow, matchServices, mcpNamespace, normalizeToolOutput, adaptInput, pendingKey, parseToolText, renderDoctor, renderToolSchema } from "../src/mcp.js"
+import { classifyTool, isWriteTool, matchServices, mcpNamespace, normalizeToolOutput, adaptInput, paramStyleOf, parseToolText, renderDoctor, renderToolSchema } from "../src/mcp.js"
 import { pruneUndefined, prunedHandlers } from "../src/rpc.js"
 
 describe("matchServices", () => {
@@ -46,12 +46,21 @@ describe("matchServices", () => {
   })
 })
 
-describe("decideAutoAllow", () => {
-  test("allows only registered plugin-originated calls", () => {
-    const pending = new Set([pendingKey("ses_1", "sentry_get_issue_details")])
-    expect(decideAutoAllow({ sessionID: "ses_1", action: "sentry_get_issue_details" }, pending)).toBe("allow")
-    expect(decideAutoAllow({ sessionID: "ses_2", action: "sentry_get_issue_details" }, pending)).toBeUndefined()
-    expect(decideAutoAllow({ sessionID: "ses_1", action: "sentry_update_issue" }, pending)).toBeUndefined()
+describe("classifyTool / isWriteTool / paramStyleOf", () => {
+  test("tools map to their service by namespace; writes are recognised by capability or name", () => {
+    const services = matchServices(["sentry_get_issue_details", "sentry_update_issue", "firebase_crashlytics_get_issue", "firebase_crashlytics_create_note", "jira_jira_search", "jira_jira_create_issue", "gitlab_gitlab_create_mr", "gitlab_gitlab_get_mr"], [])
+    expect(classifyTool("sentry_update_issue", services)).toMatchObject({ service: { id: "sentry" }, capability: "updateIssue" })
+    expect(classifyTool("gitlab_gitlab_get_mr", services)).toMatchObject({ service: { id: "gitlab" }, capability: "getMr" })
+    expect(classifyTool("firebase_crashlytics_list_events", services)).toMatchObject({ service: { id: "crashlytics" }, capability: undefined })
+    expect(classifyTool("read", services)).toBeUndefined()
+    expect(isWriteTool("sentry_update_issue", "updateIssue")).toBe(true)
+    expect(isWriteTool("sentry_get_issue_details", "getIssue")).toBe(false)
+    expect(isWriteTool("firebase_crashlytics_list_events")).toBe(false)
+    expect(isWriteTool("firebase_crashlytics_delete_issue")).toBe(true)
+    expect(isWriteTool("jira_jira_add_comment")).toBe(true)
+    expect(paramStyleOf({ app_id: {}, issue_id: {} })).toBe("snake")
+    expect(paramStyleOf({ appId: {} })).toBe("camel")
+    expect(paramStyleOf({})).toBe("camel")
   })
 })
 
@@ -70,8 +79,10 @@ describe("renderDoctor", () => {
     const servers = [{ name: "firebase", status: { status: "connected" } }, { name: "jira", status: "connected" }]
     const toolIds = ["firebase_firebase_get_project", "firebase_firebase_list_apps", "jira_jira_get_issue", "jira_jira_search", "jira_jira_create_issue"]
     const services = matchServices(toolIds, servers)
-    const out = renderDoctor({ servers, toolIds, services, options: { sources: ["crashlytics"], crashlytics: { appIds: ["1:1:android:a"] }, jira: { project: "DE", issueType: "Sub-task", parent: "DE-62556" } } })
+    const out = renderDoctor({ servers, toolIds, services, options: { sources: ["crashlytics"], crashlytics: { appIds: ["1:1:android:a"] }, jira: { project: "DE", issueType: "Sub-task", parent: "DE-62556" } }, warnings: ["`worktree` is ignored: x"] })
     expect(out).toContain("**firebase** (connected) — 2 tool(s)")
+    expect(out).toContain("### Ignored legacy options")
+    expect(out).toContain("`worktree` is ignored")
     expect(out).toContain("crashlytics: not found")
     expect(out).toContain('jira: server "jira" (connected)')
     expect(out).toContain("DE / Sub-task under DE-62556")

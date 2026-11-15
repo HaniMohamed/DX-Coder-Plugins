@@ -1,24 +1,31 @@
 // Command verbs: list / fix / paste / top / batch / status / retry / feedback / restart / fixed /
-// report / clean / sync. Deterministic work happens here and in pipeline.ts; the model only runs in
-// worker sessions.
+// report / clean / sync / doctor. The plugin decides and records; the agent does every git, check
+// and MCP action in worker sessions inside the session's checkout.
 
 import { existsSync } from "node:fs"
-import { copyFile, mkdir, writeFile } from "node:fs/promises"
+import { copyFile, mkdir, rm, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import type { Flags } from "./command.js"
-import { git } from "./git.js"
-import { connectJira } from "./jira.js"
-import { connected, detectServices, INSTALL_SOURCES, listServers, renderDoctor, renderToolSchema } from "./mcp.js"
-import { Pipeline } from "./pipeline.js"
-import { ensureRunRepo, sessionRepo, type SessionRepo } from "./repo.js"
-import { FixoraStop, notify, present, tell, type Runtime } from "./progress.js"
-import { renderCrashTable, renderFunnelReport, renderJiraComment, renderRunsTable, renderRunStatus } from "./render.js"
-import { availableSources, listTopCrashes, resolveRef, runIdFor } from "./sources/index.js"
-import { acquireLock, funnel, keys, listCrashIndex, listRuns, loadCrashIndex, loadRun, now, releaseLock, resumePoint, saveCrashIndex, saveRun, TERMINAL } from "./state.js"
-import type { CrashSummary, RunRecord, Source, Step } from "./types.js"
 import { describeError } from "./errors.js"
+import { parseRemote, shellQuote } from "./git.js"
+import { jiraCommentInput } from "./jira.js"
+import { connected, detectServices, INSTALL_SOURCES, listServers, renderDoctor, renderToolSchema, toolSchemas } from "./mcp.js"
+import { renderMrOp, type MrProvider } from "./mr.js"
+import { legacyOptionWarnings } from "./options.js"
+import { Pipeline } from "./pipeline.js"
+import { crashListPrompt, nudgePrompt, opsPrompt, restoreSteps, SKILLS, type OpStep } from "./prompts.js"
+import { FixoraStop, notify, present, progress, sourceContext, tell, toolProps, type Runtime } from "./progress.js"
+import { renderCrashTable, renderFunnelReport, renderJiraComment, renderRunsTable, renderRunStatus } from "./render.js"
+import { ensureRunRepo, folderFor, sessionRepo, type SessionRepo } from "./repo.js"
+import { availableSources, listPlans, resolveRef, runIdFor } from "./sources/index.js"
+import { acquireLock, funnel, getJson, keys, listCrashIndex, listKeys, listRuns, loadCrashIndex, loadRun, now, releaseLock, resumePoint, saveCrashIndex, saveRun, setJson, TERMINAL, wipeStorage } from "./state.js"
+import type { CrashListRecord } from "./tools.js"
+import type { CrashSummary, RunRecord, Source, Step, WorkerGrants, WorkerPhase } from "./types.js"
+import { awaitSubmission, ensureLister, ensureWorker, promptSession } from "./worker.js"
 
-export const folderFor = (repo: string, runId: string) => join(repo, ".dxcoder", "fixora", runId)
+export { folderFor }
+
+const rand = () => Math.random().toString(36).slice(2, 10)
 
 export function newRun(rt: Runtime, o: { runId: string; source: Source; crashId: string; sessionID: string; flags: Flags; refExtra?: Record<string, string>; title?: string; repo: SessionRepo }): RunRecord {
   const at = now()
@@ -31,13 +38,13 @@ export function newRun(rt: Runtime, o: { runId: string; source: Source; crashId:
     title: o.title ?? o.runId,
     originSessionID: o.sessionID,
     repo: o.repo.repo,
-    projectID: o.repo.projectID,
     createdAt: at,
     updatedAt: at,
     step: "detect",
     status: "running",
     flags: { dryRun: o.flags.dryRun, ticket: o.flags.ticket, push: o.flags.push, mr: o.flags.mr, auto: o.flags.auto, force: o.flags.force, testFirst: o.flags.testFirst ?? rt.opts.mode === "test-first" },
     base: { remote: rt.opts.remote, branch: o.flags.base ?? rt.opts.baseBranch },
+    checkout: { active: false },
     sessions: {},
     commitShas: [],
     reviews: [],
@@ -50,28 +57,88 @@ export function newRun(rt: Runtime, o: { runId: string; source: Source; crashId:
   }
 }
 
+/** Re-reads the host's tools and MCP servers (read-only) and caches the tool schemas. */
 export async function refreshServices(rt: Runtime) {
-  rt.services = await detectServices(rt.ctx)
+  const [services, schemas] = await Promise.all([detectServices(rt.ctx), toolSchemas(rt.ctx).catch(() => new Map())])
+  rt.services = services
+  rt.schemas = schemas
   return rt.services
 }
 
-/** Runs the pipeline for a run record, tracking it as in flight. Resolves when the pipeline ends. */
+/** Shows the legacy-option warnings once per process. */
+export async function warnLegacyOnce(rt: Runtime, sessionID: string) {
+  if (rt.warnedLegacy) return
+  rt.warnedLegacy = true
+  const warnings = legacyOptionWarnings(rt.ctx.options)
+  if (warnings.length) await notify(rt.ctx, sessionID, `fixora: ignored legacy options — ${warnings.join("; ")}`)
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * Runs the pipeline for a run record, tracking it as in flight. One checkout cannot host two runs,
+ * so a repository lock serialises them (polled, within the batch time budget). Resolves when the
+ * pipeline, including the restore phase, has ended.
+ */
 export async function startPipeline(rt: Runtime, run: RunRecord, o: { from: Step; feedback?: string }): Promise<RunRecord> {
   if (rt.inflight.has(run.runId)) throw new FixoraStop(`Run ${run.runId} is already in progress. Use \`/fixora status ${run.runId}\`, or \`/fixora restart ${run.runId}\` to abort and start over.`)
   const lock = await acquireLock(rt.ctx, keys.lockCrash(run.runId), run.originSessionID)
   if (!lock.ok && !lock.stale) throw new FixoraStop(`Run ${run.runId} is locked by session ${lock.lock.owner} until ${lock.lock.expiresAt}. If that session is gone, wait for the lock to expire or \`/fixora restart ${run.runId}\`.`)
   if (!lock.ok && lock.stale) await notify(rt.ctx, run.originSessionID, `fixora ${run.runId}: reclaimed a stale lock from ${lock.lock.owner}`)
   const controller = new AbortController()
-  rt.inflight.set(run.runId, controller)
-  run.status = "running"
-  await saveRun(rt.ctx, run)
-  await rt.emit("run.started", { runId: run.runId, sessionID: run.originSessionID, title: run.title })
-  return new Pipeline(rt, run, { from: o.from, signal: controller.signal, feedback: o.feedback }).execute()
+  const repoKey = keys.lockRepo(run.repo)
+  const done = (async () => {
+    try {
+      // Wait for the checkout: another run may be using it.
+      const deadline = Date.now() + rt.opts.batch.maxMinutes * 60_000
+      let waited = false
+      for (;;) {
+        const r = await acquireLock(rt.ctx, repoKey, run.runId)
+        if (r.ok || r.stale) break
+        if (controller.signal.aborted) throw new FixoraStop(`run ${run.runId} was cancelled while waiting for the checkout`)
+        if (Date.now() > deadline) throw new FixoraStop(`Run ${run.runId} waited ${rt.opts.batch.maxMinutes} minutes for the checkout ${run.repo}, still used by run ${r.lock.owner}. Retry later or \`/fixora restart ${r.lock.owner}\`.`)
+        if (!waited) {
+          waited = true
+          await progress(rt, run, `waiting for the checkout (used by run ${r.lock.owner})`)
+        }
+        await sleep(rt.lockPollMs ?? 5000)
+      }
+      run.status = "running"
+      await saveRun(rt.ctx, run)
+      await rt.emit("run.started", { runId: run.runId, sessionID: run.originSessionID, title: run.title })
+      return await new Pipeline(rt, run, { from: o.from, signal: controller.signal, feedback: o.feedback }).execute()
+    } catch (error) {
+      // Only the lock wait can throw here; the pipeline reports its own failures.
+      run.status = "failed"
+      run.error = describeError(error)
+      await saveRun(rt.ctx, run)
+      await tell(rt.ctx, run.originSessionID, `fixora ${run.runId}: ${run.error.slice(0, 120)}`, run.error)
+      return run
+    } finally {
+      rt.inflight.delete(run.runId)
+      const held = await getJson<{ owner: string }>(rt.ctx, repoKey)
+      if (held?.owner === run.runId) await releaseLock(rt.ctx, repoKey).catch(() => {})
+      await releaseLock(rt.ctx, keys.lockCrash(run.runId)).catch(() => {})
+    }
+  })()
+  rt.inflight.set(run.runId, { controller, done })
+  return done
 }
 
 // ---------- list ----------
 
-export async function runList(rt: Runtime, input: { sessionID: string; top?: number; minUsers?: number; source?: Source }): Promise<{ crashes: CrashSummary[]; markdown: string; errors: string[] }> {
+export interface ListInput {
+  sessionID: string
+  top?: number
+  minUsers?: number
+  source?: Source
+  refresh?: boolean
+  /** Diagnostic: keep raw replies and never use the cache. */
+  probe?: boolean
+}
+
+/** Lists the top crashes through a lister session (the agent makes the MCP calls). Cached per origin session. */
+export async function runList(rt: Runtime, input: ListInput): Promise<{ crashes: CrashSummary[]; markdown: string; errors: string[]; record?: CrashListRecord }> {
   await refreshServices(rt)
   const sources = availableSources(rt.services, rt.opts)
   if (sources.length === 0) {
@@ -79,7 +146,37 @@ export async function runList(rt: Runtime, input: { sessionID: string; top?: num
     const hint = configured.length ? `\n\nConfigured but not connected: ${configured.map((s) => `${s!.id} ("${s!.serverName}", ${s!.status})`).join(", ")} — connect from /mcps.` : ""
     throw new FixoraStop(`${INSTALL_SOURCES}${hint}`)
   }
-  const { crashes, errors } = await listTopCrashes({ ctx: rt.ctx, services: rt.services, options: rt.opts, sessionID: input.sessionID }, { top: input.top ?? rt.opts.batch.top * 2, minUsers: input.minUsers, source: input.source })
+  const query = { top: input.top ?? rt.opts.batch.top * 2, minUsers: input.minUsers, source: input.source }
+  const where = await sessionRepo(rt.ctx, input.sessionID)
+  const listerKey = keys.lister(input.sessionID)
+  const listerRecord = (await getJson<{ sessionID?: string; lastRequestId?: string }>(rt.ctx, listerKey)) ?? {}
+  let record: CrashListRecord | undefined
+  if (!input.refresh && !input.probe && listerRecord.lastRequestId) {
+    const cached = await getJson<CrashListRecord>(rt.ctx, keys.crashes(listerRecord.lastRequestId))
+    const fresh = cached?.result && Date.now() - Date.parse(cached.result.at) < rt.opts.crashes.cacheMinutes * 60_000
+    if (cached && fresh && cached.query.top === query.top && cached.query.minUsers === query.minUsers && cached.query.source === query.source) record = cached
+  }
+  if (!record) {
+    const sc = sourceContext(rt)
+    const { plans, errors: planErrors } = listPlans(sc, { ...query, top: input.probe ? 3 : query.top })
+    if (plans.length === 0) throw new FixoraStop(`No crash source can be queried: ${planErrors.join("; ") || "no list tool found"}.`)
+    const requestId = `list-${rand()}`
+    record = { requestId, originSessionID: input.sessionID, createdAt: now(), query, plans, planErrors }
+    await setJson(rt.ctx, keys.crashes(requestId), record)
+    const sessionID = await ensureLister(rt, input.sessionID, where.repo, requestId)
+    await setJson(rt.ctx, listerKey, { ...(await getJson<{ sessionID: string }>(rt.ctx, listerKey)), lastRequestId: requestId })
+    await notify(rt.ctx, input.sessionID, `fixora: the agent is listing crashes from ${plans.map((p) => p.source).join(", ")} (session ${sessionID})`)
+    const prompt = crashListPrompt({ requestId, plans, top: query.top, probe: input.probe })
+    let outcome = await promptSession(rt, sessionID, prompt, { minutes: rt.opts.worker.maxPhaseMinutes.list })
+    record = (await getJson<CrashListRecord>(rt.ctx, keys.crashes(requestId))) ?? record
+    if (!record.result && outcome === "done") {
+      outcome = await promptSession(rt, sessionID, nudgePrompt("fixora_submit_crashes", undefined, SKILLS.crashes, `requestId "${requestId}" and every reply or error you got`), { minutes: 3 })
+      record = (await getJson<CrashListRecord>(rt.ctx, keys.crashes(requestId))) ?? record
+    }
+    if (!record.result) throw new FixoraStop(outcome === "timeout" ? `Listing crashes exceeded ${rt.opts.worker.maxPhaseMinutes.list} minutes. See the lister session ${sessionID} and try again.` : `The lister session ${sessionID} did not report the crash list. See that session, then run /fixora again.`)
+  }
+  const crashes = record.result!.crashes.map((c) => ({ ...c }))
+  const errors = [...record.result!.errors]
   const states = new Map<string, { state: string; runId?: string; mrUrl?: string }>()
   for (const c of crashes) {
     const run = await loadRun(rt.ctx, runIdFor(c.source, c.id))
@@ -92,16 +189,16 @@ export async function runList(rt: Runtime, input: { sessionID: string; top?: num
     }
   }
   const table = renderCrashTable(crashes, { states })
-  const markdown = [`### Fixora · top crashes (${sources.map((s) => s.id).join(", ")})`, "", table, ...(errors.length ? ["", `Errors: ${errors.join("; ")}`] : [])].join("\n")
-  const where = await sessionRepo(rt.ctx, input.sessionID)
+  const hint = errors.length && crashes.length === 0 ? "\n\nEvery source call failed. HTML / 5xx / \"Unable to parse JSON\" errors are usually transient on the Google side or a proxy: run `/fixora` again, or `/fixora doctor --probe` to see the raw replies. 401 / 403 mean the MCP server's account cannot read this project." : ""
+  const markdown = [`### Fixora · top crashes (${sources.map((s) => s.id).join(", ")})`, "", table, ...(errors.length ? ["", `Errors: ${errors.join("; ")}${hint}`] : [])].join("\n")
   const file = join(where.repo, ".dxcoder", "fixora", "crashes.md")
   await mkdir(join(where.repo, ".dxcoder", "fixora"), { recursive: true })
   await writeFile(file, `${markdown}\n`)
-  return { crashes, markdown, errors }
+  return { crashes, markdown, errors, record }
 }
 
 export async function presentList(rt: Runtime, sessionID: string, list: { crashes: CrashSummary[]; markdown: string }) {
-  const refs = list.crashes.slice(0, 10).map((c) => `${c.source}:${c.id}`)
+  const refs = list.crashes.slice(0, 10).map((c) => c.ref ?? `${c.source}:${c.id}`)
   await rt.ctx.session.synthetic({
     sessionID: sessionID as never,
     description: `fixora: ${list.crashes.length} crash(es) listed`,
@@ -137,13 +234,12 @@ export async function prepareRun(rt: Runtime, input: StartInput): Promise<RunRec
   const runId = runIdFor(resolved.source, resolved.id)
   const existing = await loadRun(rt.ctx, runId)
   if (existing) {
-    if (rt.inflight.has(existing.runId) || existing.status === "running" || existing.status === "awaiting-approval") {
-      if (rt.inflight.has(existing.runId)) throw new FixoraStop(`Run ${runId} is already in progress (step ${existing.step}). \`/fixora status ${runId}\` shows it.`)
-    }
+    if (rt.inflight.has(existing.runId)) throw new FixoraStop(`Run ${runId} is already in progress (step ${existing.step}). \`/fixora status ${runId}\` shows it.`)
     if (!input.flags.force) {
       if (existing.mrUrl || existing.status === "done") throw new FixoraStop(`Run ${runId} already ${existing.mrUrl ? `has a merge request: ${existing.mrUrl}` : "finished"}. Use \`/fixora feedback ${runId} "…"\` to change the fix, \`/fixora restart ${runId}\` for a fresh cycle, or \`--force\` to start over.`)
       if (!TERMINAL.has(existing.status)) throw new FixoraStop(`Run ${runId} stopped at step \`${existing.step}\` (${existing.status}${existing.error ? `: ${existing.error.slice(0, 160)}` : ""}). Use \`/fixora retry ${runId}\` to continue from there, or \`--force\` to start over.`)
     }
+    if (existing.checkout?.active) throw new FixoraStop(`Run ${runId} still has its branch checked out in ${existing.repo} (restore pending). Run \`/fixora clean ${runId}\` first, or \`/fixora retry ${runId}\`.`)
     await Pipeline.moveToHistory(existing.folder, input.flags.force ? ["trace.txt"] : ["crash.json", "crash.md", "run.log", "trace.txt"])
   }
   const repo = await sessionRepo(rt.ctx, input.sessionID)
@@ -152,7 +248,7 @@ export async function prepareRun(rt: Runtime, input: StartInput): Promise<RunRec
   // A pasted trace lives in the run folder; keep pointing at it when the crash is re-run or restarted.
   if (!resolved.extra && existing?.meta?.refExtra) run.meta = { ...run.meta, refExtra: existing.meta.refExtra }
   if (existing?.title && run.title === run.runId) run.title = existing.title
-  // A forced re-run is a new attempt: new branch and worktree names, the old ones are left for inspection.
+  // A forced re-run is a new attempt: a new branch name, the old one is left for inspection.
   if (existing && input.flags.force) run.counters.restarts = (existing.counters?.restarts ?? 0) + 1
   await mkdir(run.folder, { recursive: true })
   await saveRun(rt.ctx, run)
@@ -160,11 +256,13 @@ export async function prepareRun(rt: Runtime, input: StartInput): Promise<RunRec
 }
 
 export async function runFix(rt: Runtime, input: StartInput): Promise<RunRecord> {
+  await warnLegacyOnce(rt, input.sessionID)
   const run = await prepareRun(rt, input)
   return startPipeline(rt, run, { from: "detect" })
 }
 
 export async function runPaste(rt: Runtime, input: { sessionID: string; file: string; title?: string; platform?: string; language?: string; flags: Flags }): Promise<RunRecord> {
+  await warnLegacyOnce(rt, input.sessionID)
   const where = await sessionRepo(rt.ctx, input.sessionID)
   const path = input.file.startsWith("/") ? input.file : join(where.directory, input.file)
   if (!existsSync(path)) throw new FixoraStop(`File not found: ${path}`)
@@ -192,7 +290,7 @@ export async function runTop(rt: Runtime, input: { sessionID: string; count: num
   const list = await runList(rt, { sessionID: input.sessionID, top: input.count * 3, minUsers: input.minUsers, source: input.source })
   const candidates = list.crashes.filter((c) => !c.state || c.state === "new" || c.state === "failed" || c.state === "reopened").slice(0, input.count)
   if (candidates.length === 0) throw new FixoraStop("No new crashes to fix (every listed crash already has a run). Use `/fixora` to see them.")
-  await notify(rt.ctx, input.sessionID, `fixora: fixing ${candidates.length} crash(es): ${candidates.map((c) => `${c.source}:${c.id}`).join(", ")}`)
+  await notify(rt.ctx, input.sessionID, `fixora: fixing ${candidates.length} crash(es) one after the other: ${candidates.map((c) => c.ref ?? `${c.source}:${c.id}`).join(", ")}`)
   const deadline = input.maxMinutes ? Date.now() + input.maxMinutes * 60_000 : undefined
   const started: string[] = []
   const errors: string[] = []
@@ -202,7 +300,7 @@ export async function runTop(rt: Runtime, input: { sessionID: string; count: num
       break
     }
     try {
-      const run = await runFix(rt, { sessionID: input.sessionID, ref: `${c.source}:${c.id}`, flags: input.flags })
+      const run = await runFix(rt, { sessionID: input.sessionID, ref: c.ref ?? `${c.source}:${c.id}`, flags: input.flags })
       started.push(`${run.runId} (${run.status})`)
     } catch (error) {
       errors.push(`${c.source}:${c.id}: ${describeError(error).split("\n")[0]}`)
@@ -211,7 +309,7 @@ export async function runTop(rt: Runtime, input: { sessionID: string; count: num
   return { started, errors }
 }
 
-// ---------- status / report / sync ----------
+// ---------- status / report / doctor / sync ----------
 
 export async function runStatus(rt: Runtime, input: { sessionID: string; runId?: string }) {
   if (input.runId) {
@@ -240,43 +338,80 @@ export async function runDoctor(rt: Runtime, input: { sessionID: string; all?: b
     await tell(rt.ctx, input.sessionID, `fixora doctor --tool ${input.tool}`, markdown)
     return markdown
   }
-  let markdown = renderDoctor({ servers, toolIds: tools.map((t) => t.id), services: rt.services, options: rt.opts, all: input.all })
+  let markdown = renderDoctor({ servers, toolIds: tools.map((t) => t.id), services: rt.services, options: rt.opts, all: input.all, warnings: legacyOptionWarnings(rt.ctx.options) })
   if (input.probe) markdown += `\n\n${await probeSources(rt, input.sessionID)}`
   await tell(rt.ctx, input.sessionID, "fixora doctor", markdown)
   return markdown
 }
 
-/** `/fixora doctor --probe`: one real call per crash source and app, raw reply (truncated) or the exact error. */
+/** `/fixora doctor --probe`: the lister makes one real call per crash source and app; the raw replies are shown. */
 export async function probeSources(rt: Runtime, sessionID: string): Promise<string> {
-  const L: string[] = ["### Probe (one live call per source)", ""]
-  const sc = { ctx: rt.ctx, services: rt.services, options: rt.opts, sessionID }
+  const L: string[] = ["### Probe (one live call per source, made by the agent)", ""]
   const clip = (v: unknown) => {
     const text = typeof v === "string" ? v : JSON.stringify(v, null, 1)
     return text.length > 1800 ? `${text.slice(0, 1800)}\n… (${text.length - 1800} more chars)` : text
   }
-  for (const source of availableSources(rt.services, rt.opts)) {
-    if (!source.probe) continue
-    for (const p of await source.probe(sc)) {
-      L.push(`**${source.id}${p.label ? ` · ${p.label}` : ""}** → \`${p.toolId}\` with input:`, "", "```json", JSON.stringify(p.input), "```")
-      if (p.error) L.push("", `Error: ${p.error}`)
-      else {
-        const summaries = p.parsedCount !== undefined ? ` · mapped to ${p.parsedCount} crash(es)` : ""
-        L.push("", `Reply (${typeof p.raw === "string" ? "text" : "object"}${summaries}):`, "", "```", clip(p.raw), "```")
-      }
-      L.push("")
-    }
+  let list: Awaited<ReturnType<typeof runList>>
+  try {
+    list = await runList(rt, { sessionID, top: 3, probe: true })
+  } catch (error) {
+    return [...L, `- ${describeError(error)}`].join("\n")
   }
-  if (L.length === 2) L.push("- no crash source is available to probe")
+  const raw = (list.record?.result?.raw ?? []) as Array<{ source: string; toolId: string; appId?: string; raw?: unknown; error?: string }>
+  for (const r of raw) {
+    const call = list.record?.plans.find((p) => p.source === r.source)?.calls.find((c) => c.toolId === r.toolId && (!r.appId || c.appId === r.appId))
+    L.push(`**${r.source}${r.appId ? ` · ${r.appId}` : ""}** → \`${r.toolId}\` with input:`, "", "```json", JSON.stringify(call?.input ?? {}), "```")
+    if (r.error) L.push("", `Error: ${r.error}`)
+    else L.push("", `Reply (${typeof r.raw === "string" ? "text" : "object"}):`, "", "```", clip(r.raw), "```")
+    L.push("")
+  }
+  if (raw.length === 0) L.push(`- the lister reported nothing${list.errors.length ? `: ${list.errors.join("; ")}` : ""}`)
   return L.join("\n")
+}
+
+/** One ops prompt for an existing run (outside the pipeline): sync / close-mr / jira-comment / clean / restore. */
+export async function opsRound(rt: Runtime, run: RunRecord, o: { phase: WorkerPhase; grants?: WorkerGrants; op: string; title: string; steps: OpStep[]; report: string; minutes?: number }): Promise<{ ok: boolean; errors: string[]; results: Record<string, unknown> } | undefined> {
+  const sessionID = await ensureWorker(rt, run, "fixer", { phase: o.phase, grants: o.grants })
+  const token = `${o.op}:${rand()}`
+  run.meta = { ...run.meta, expect: token, received: null }
+  await saveRun(rt.ctx, run)
+  const r = await awaitSubmission(rt, run, sessionID, opsPrompt({ runId: run.runId, op: o.op, title: o.title, steps: o.steps, report: o.report, repo: run.repo }), {
+    minutes: o.minutes ?? rt.opts.worker.maxPhaseMinutes.restore,
+    label: o.title,
+    pick: (fresh) => (fresh.meta?.received === token ? fresh : undefined),
+    nudge: nudgePrompt("fixora_submit_ops", run.runId, SKILLS.ops, `op "${o.op}", ok true/false, results, errors`),
+  })
+  if (!r.value) return undefined
+  const { timings, step, ...rest } = r.value
+  void timings
+  void step
+  Object.assign(run, rest)
+  try {
+    return JSON.parse(String(run.meta?.opsResult ?? "")) as { ok: boolean; errors: string[]; results: Record<string, unknown> }
+  } catch {
+    return undefined
+  }
+}
+
+function mrTargetOf(rt: Runtime, run: RunRecord) {
+  const remote = run.base.remoteUrl ? parseRemote(run.base.remoteUrl, rt.opts.mr.forge) : undefined
+  return remote ? { remote, base: rt.opts.mr.target ?? run.base.branch, branch: run.branch! } : undefined
 }
 
 export async function runSync(rt: Runtime, input: { sessionID: string }) {
   await refreshServices(rt)
-  const runs = (await listRuns(rt.ctx)).filter((r) => r.mrUrl && r.mrStatus !== "merged" && r.mrStatus !== "closed")
+  const runs = (await listRuns(rt.ctx)).filter((r) => r.mrUrl && r.mrProvider && r.mrProvider !== "url" && r.mrStatus !== "merged" && r.mrStatus !== "closed")
   let updated = 0
   for (const r of runs) {
-    if (await Pipeline.syncMr(rt, r)) {
+    await ensureRunRepo(rt.ctx, r)
+    const target = mrTargetOf(rt, r)
+    const op = target ? renderMrOp({ provider: r.mrProvider as MrProvider, op: "view", target, id: r.mrId, url: r.mrUrl!, services: rt.services, toolProps: (id) => toolProps(rt, id) }) : undefined
+    if (!op) continue
+    const before = r.mrStatus
+    const result = await opsRound(rt, r, { phase: "sync", op: "sync", title: `read the state of merge request ${r.mrUrl}`, steps: [op.toolId ? { call: { toolId: op.toolId, namespace: op.namespace, input: op.input ?? {} } } : { command: op.command }], report: '{ status: "draft" | "open" | "merged" | "closed" }' })
+    if (result?.ok && r.mrStatus !== before) {
       updated++
+      await saveRun(rt.ctx, r)
       if (r.mrStatus === "merged") await notify(rt.ctx, input.sessionID, `fixora ${r.runId}: MR merged 🎉 — mark the release with /fixora fixed ${r.runId} --release <version>`)
     }
   }
@@ -301,16 +436,14 @@ export async function runRetry(rt: Runtime, input: { sessionID: string; runId: s
   if (!input.flags.mr) run.flags.mr = false
   if (!input.flags.push) run.flags.push = false
   if (input.flags.auto) run.flags.auto = true
-  if (input.fresh && run.worktree) {
-    await rt.ctx.worktree.remove({ projectID: run.projectID, directory: run.worktree, force: true } as never).catch(() => {})
-    run.worktree = undefined
-    run.sessions = {}
-  }
+  if (input.fresh) run.sessions = {}
   let from = resumePoint(run, input.from)
   if (run.status === "done" && !input.from) throw new FixoraStop(`Run ${run.runId} is already done. Use \`/fixora feedback\` or \`/fixora restart\`.`)
-  if (run.status === "skipped" && !input.from) from = run.meta?.forceTriage ? "analyse" : "fetch"
-  if (run.status === "blocked" && !input.from) from = run.blockedReason === "dirty-worktree" ? "branch" : "validate"
+  if (run.status === "skipped" && !input.from) from = run.triage ? "analyse" : "fetch"
+  if (run.status === "blocked" && !input.from) from = run.blockedReason === "dirty-worktree" || run.blockedReason === "not-a-repo" || run.blockedReason === "base-missing" ? "prepare" : "fix"
   if (input.fresh) from = "detect"
+  // A branch left checked out by a dead host is verified again by the prepare phase (same branch, recorded previous branch / stash).
+  if (run.checkout?.active) run.checkout = { ...run.checkout, active: false }
   run.error = undefined
   run.blockedReason = undefined
   run.skipReason = undefined
@@ -323,31 +456,17 @@ export async function runFeedback(rt: Runtime, input: { sessionID: string; runId
   if (!run) throw new FixoraStop(`No run ${input.runId}.`)
   await ensureRunRepo(rt.ctx, run)
   if (rt.inflight.has(run.runId)) throw new FixoraStop(`Run ${run.runId} is still in progress.`)
-  if (!run.worktree || !existsSync(run.worktree)) throw new FixoraStop(`Run ${run.runId} has no worktree any more. \`/fixora retry ${run.runId} --fresh\` to recreate it.`)
+  if (!run.branch) throw new FixoraStop(`Run ${run.runId} has no fix branch yet. \`/fixora retry ${run.runId}\` first.`)
   await refreshServices(rt)
   run.originSessionID = input.sessionID
   run.counters.feedback++
+  run.error = undefined
+  await mkdir(run.folder, { recursive: true })
   await writeFile(join(run.folder, "feedback.md"), `# Feedback ${run.counters.feedback}\n\n${input.message}\n`)
+  if (run.checkout?.active) run.checkout = { ...run.checkout, active: false }
   await saveRun(rt.ctx, run)
-  const controller = new AbortController()
-  rt.inflight.set(run.runId, controller)
-  await rt.emit("run.started", { runId: run.runId, sessionID: run.originSessionID, title: `${run.title} (feedback ${run.counters.feedback})` })
-  const { FixoraFeedback } = await import("./feedback.js")
-  // The worker answers or changes first, then the normal validate → review → commit → push → mr → close-loop loop runs.
-  try {
-    await FixoraFeedback.apply(rt, run, input.message, controller.signal)
-  } catch (error) {
-    rt.inflight.delete(run.runId)
-    run.status = "failed"
-    run.error = describeError(error)
-    await saveRun(rt.ctx, run)
-    throw error
-  }
-  if (!run.pipeline.fixed || run.tests !== undefined) {
-    rt.inflight.delete(run.runId)
-    return run
-  }
-  return new Pipeline(rt, run, { from: "validate", signal: controller.signal, feedback: input.message }).execute()
+  await notify(rt.ctx, input.sessionID, `fixora ${run.runId}: feedback ${run.counters.feedback} — the agent checks the branch out again and answers or changes the fix`)
+  return startPipeline(rt, run, { from: "fix", feedback: input.message })
 }
 
 export async function runRestart(rt: Runtime, input: { sessionID: string; runId: string; flags: Flags }): Promise<RunRecord> {
@@ -357,18 +476,23 @@ export async function runRestart(rt: Runtime, input: { sessionID: string; runId:
   await refreshServices(rt)
   const inflight = rt.inflight.get(run.runId)
   if (inflight) {
-    inflight.abort()
-    rt.inflight.delete(run.runId)
+    inflight.controller.abort()
     for (const s of [run.sessions.fixer, run.sessions.reviewer]) if (s) await rt.ctx.session.interrupt({ sessionID: s as never }).catch(() => {})
+    await notify(rt.ctx, input.sessionID, `fixora ${run.runId}: cancelling the running pipeline and restoring the checkout first`)
+    await inflight.done.catch(() => {})
   }
+  const latest = (await loadRun(rt.ctx, run.runId)) ?? run
+  Object.assign(run, latest)
   await releaseLock(rt.ctx, keys.lockCrash(run.runId)).catch(() => {})
-  if (run.mrUrl) await Pipeline.closeMr(rt, run).catch(() => {})
-  if (run.jiraKey) {
-    const jira = await connectJira(rt.ctx, { service: rt.services.jira, options: rt.opts, sessionID: input.sessionID })
-    await jira?.port.comment(run.jiraKey, renderJiraComment("restart", run)).catch(() => {})
+  if (run.checkout?.active) await restoreNow(rt, run)
+  if (run.mrUrl && run.mrProvider && run.mrProvider !== "url") {
+    const target = mrTargetOf(rt, run)
+    const op = target ? renderMrOp({ provider: run.mrProvider as MrProvider, op: "close", target, id: run.mrId, url: run.mrUrl, services: rt.services, toolProps: (id) => toolProps(rt, id) }) : undefined
+    if (op) await opsRound(rt, run, { phase: "clean", grants: { closeMr: true }, op: "close-mr", title: `close the merge request ${run.mrUrl} (the fix cycle restarts)`, steps: [op.toolId ? { call: { toolId: op.toolId, namespace: op.namespace, input: op.input ?? {} } } : { command: op.command }], report: "{ closed: true }" }).catch(() => undefined)
   }
-  if (run.worktree) {
-    await rt.ctx.worktree.remove({ projectID: run.projectID, directory: run.worktree, force: true } as never).catch(() => {})
+  const jira = rt.services.jira
+  if (run.jiraKey && connected(jira) && jira.capabilities.addComment) {
+    await opsRound(rt, run, { phase: "close-loop", grants: { jiraWrite: true }, op: "jira-comment", title: `comment on Jira ${run.jiraKey}`, steps: [{ call: { toolId: jira.capabilities.addComment, namespace: jira.namespace, input: jiraCommentInput(run.jiraKey, renderJiraComment("restart", run)) } }], report: "{ commented: true }" }).catch(() => undefined)
   }
   await Pipeline.moveToHistory(run.folder)
   run.originSessionID = input.sessionID
@@ -377,7 +501,9 @@ export async function runRestart(rt: Runtime, input: { sessionID: string; runId:
   run.counters.reviewRounds = 0
   run.counters.feedback = 0
   run.branch = undefined
-  run.worktree = undefined
+  run.checkout = { active: false }
+  run.toolchain = undefined
+  run.change = undefined
   run.sessions = {}
   run.mrUrl = undefined
   run.mrId = undefined
@@ -400,6 +526,13 @@ export async function runRestart(rt: Runtime, input: { sessionID: string; runId:
   return startPipeline(rt, run, { from: "fetch" })
 }
 
+/** Restores a checkout left behind by a dead host (outside the pipeline). */
+async function restoreNow(rt: Runtime, run: RunRecord) {
+  const result = await opsRound(rt, run, { phase: "restore", op: "restore", title: `restore the checkout to \`${run.checkout.previousBranch ?? run.checkout.previousHeadSha ?? "the previous branch"}\`${run.checkout.stashRef ? " and pop the stash" : ""}`, steps: restoreSteps(run), report: '{ branch: "<branch now checked out>", stashPopped: true/false }' }).catch(() => undefined)
+  await saveRun(rt.ctx, run)
+  return result
+}
+
 export async function runFixed(rt: Runtime, input: { sessionID: string; runId: string; release: string; platform?: string }) {
   const run = await loadRun(rt.ctx, input.runId)
   if (!run) throw new FixoraStop(`No run ${input.runId}.`)
@@ -412,8 +545,12 @@ export async function runFixed(rt: Runtime, input: { sessionID: string; runId: s
   await saveRun(rt.ctx, run)
   if (run.jiraKey) {
     await refreshServices(rt)
-    const jira = await connectJira(rt.ctx, { service: rt.services.jira, options: rt.opts, sessionID: input.sessionID })
-    await jira?.port.comment(run.jiraKey, renderJiraComment("fixed", run, { release: input.release })).catch(() => {})
+    const jira = rt.services.jira
+    if (connected(jira) && jira.capabilities.addComment) {
+      run.originSessionID = input.sessionID
+      await opsRound(rt, run, { phase: "close-loop", grants: { jiraWrite: true }, op: "jira-comment", title: `comment on Jira ${run.jiraKey}`, steps: [{ call: { toolId: jira.capabilities.addComment, namespace: jira.namespace, input: jiraCommentInput(run.jiraKey, renderJiraComment("fixed", run, { release: input.release })) } }], report: "{ commented: true }" }).catch(() => undefined)
+      await saveRun(rt.ctx, run)
+    }
   }
   await present(rt.ctx, input.sessionID, `fixora ${run.runId}: marked fixed in ${input.release}`, `Marked \`${run.runId}\` (${run.title}) as fixed in release **${input.release}**${input.platform ? ` (${input.platform})` : ""}. If the same crash fingerprint shows up again, Fixora will flag it as reopened.`)
 }
@@ -423,16 +560,58 @@ export async function runClean(rt: Runtime, input: { sessionID: string; runId: s
   if (!run) throw new FixoraStop(`No run ${input.runId}.`)
   await ensureRunRepo(rt.ctx, run)
   if (rt.inflight.has(run.runId)) throw new FixoraStop(`Run ${run.runId} is in progress; restart or wait first.`)
+  await refreshServices(rt)
+  run.originSessionID = input.sessionID
   const notes: string[] = []
-  if (run.worktree) {
-    await rt.ctx.worktree.remove({ projectID: run.projectID, directory: run.worktree, force: true } as never).then(() => notes.push(`removed worktree ${run.worktree}`), (e: Error) => notes.push(`worktree removal failed: ${e.message}`))
-    run.worktree = undefined
+  if (run.checkout?.active) {
+    const r = await restoreNow(rt, run)
+    notes.push(r?.ok && !run.checkout.active ? `restored the checkout to ${run.checkout.previousBranch ?? "the previous branch"}` : `restore failed: ${r?.errors.join("; ") ?? "no report"} — see the final report of the run for the manual commands`)
   }
-  if (input.remote && run.branch && run.pipeline.pushed) {
-    await rt.ctx.permission.assert({ sessionID: input.sessionID as never, action: "fixora.delete-branch", resources: [`delete remote branch ${run.base.remote}/${run.branch}`], metadata: { runId: run.runId } })
-    await git.deleteRemoteBranch(run.repo, run.base.remote, run.branch, run.base.branch).then(() => notes.push(`deleted ${run.base.remote}/${run.branch}`), (e: Error) => notes.push(`remote branch deletion failed: ${e.message}`))
+  if (run.branch) {
+    const grants: WorkerGrants = {}
+    const steps: OpStep[] = [{ command: `git branch -D ${shellQuote(run.branch)}`, note: "skip (and say so) when the branch is checked out or does not exist" }]
+    if (input.remote && run.pipeline.pushed) {
+      await rt.ctx.permission.assert({ sessionID: input.sessionID as never, action: "fixora.delete-branch", resources: [`delete remote branch ${run.base.remote}/${run.branch}`], metadata: { runId: run.runId } })
+      run.approvals["delete-branch"] = "approved"
+      grants.deleteBranch = true
+      steps.push({ command: `git push ${shellQuote(run.base.remote)} --delete ${shellQuote(run.branch)}` })
+    }
+    const r = await opsRound(rt, run, { phase: "clean", grants, op: "clean", title: `delete the run's branch ${run.branch}${grants.deleteBranch ? " locally and on the remote" : " locally"}`, steps, report: "{ localDeleted: true/false, remoteDeleted: true/false }" })
+    notes.push(r ? `${r.ok ? "deleted" : "could not delete"} ${run.branch}${r.errors.length ? ` (${r.errors.join("; ")})` : ""}` : "the worker did not report the cleanup")
   }
   run.sessions = {}
   await saveRun(rt.ctx, run)
   await present(rt.ctx, input.sessionID, `fixora ${run.runId}: cleaned`, notes.map((n) => `- ${n}`).join("\n") || "Nothing to clean.")
+}
+
+/**
+ * `/fixora reset`: forgets every stored record (runs, crash index, worker records, locks, cached
+ * crash lists). Refused while a run is in flight; runs that still have their branch checked out are
+ * listed in the approval so the user restores them by hand. `--files` also removes the plugin's own
+ * folder `<repo>/.dxcoder/fixora` of the current checkout. Branches, commits, MRs and tickets on
+ * remotes are never touched.
+ */
+export async function runReset(rt: Runtime, input: { sessionID: string; files: boolean }) {
+  if (rt.inflight.size > 0) throw new FixoraStop(`${rt.inflight.size} run(s) are in progress (${[...rt.inflight.keys()].join(", ")}). Wait for them or \`/fixora restart\` / cancel them first.`)
+  const runs = await listRuns(rt.ctx)
+  const pending = runs.filter((r) => r.checkout?.active)
+  const keysNow = await listKeys(rt.ctx)
+  const where = await sessionRepo(rt.ctx, input.sessionID)
+  const folder = join(where.repo, ".dxcoder", "fixora")
+  const resources = [
+    `forget ${runs.length} run record(s) and ${keysNow.length - runs.length} other record(s) (crash index, caches, locks)`,
+    ...(pending.length ? [`⚠ ${pending.length} run(s) still have their branch checked out: ${pending.map((r) => `${r.runId} (${r.branch}${r.checkout.stashRef ? ", stash pending" : ""})`).join(", ")} — restore by hand afterwards`] : []),
+    ...(input.files ? [`delete the folder ${folder}`] : []),
+    "branches, commits, merge requests and Jira tickets are kept",
+  ]
+  await rt.ctx.permission.assert({ sessionID: input.sessionID as never, action: "fixora.reset", resources, metadata: { files: input.files } })
+  const counts = await wipeStorage(rt.ctx)
+  const notes = Object.entries(counts).map(([kind, n]) => `${kind}: ${n}`)
+  if (input.files) {
+    await rm(folder, { recursive: true, force: true })
+    notes.push(`deleted ${folder}`)
+  }
+  if (pending.length) notes.push(`restore these checkouts by hand: ${pending.map((r) => `\`git checkout ${r.checkout.previousBranch ?? "<branch>"}\`${r.checkout.stashRef ? ` + \`git stash pop\` (fixora/${r.runId})` : ""}`).join("; ")}`)
+  await present(rt.ctx, input.sessionID, `fixora reset: ${keysNow.length} record(s) removed`, notes.length ? notes.map((n) => `- ${n}`).join("\n") : "Nothing to remove.")
+  return counts
 }

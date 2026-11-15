@@ -8,8 +8,14 @@ export const keys = {
   worker: (sessionID: string) => `fixora/worker/${sessionID}`,
   crash: (fingerprint: string) => `fixora/crash/${fingerprint}`,
   lockCrash: (runId: string) => `fixora/lock/crash/${runId}`,
-  lockRepo: (projectId: string) => `fixora/lock/repo/${encodeURIComponent(projectId)}`,
+  lockRepo: (repo: string) => `fixora/lock/repo/${encodeURIComponent(repo)}`,
   batch: (batchId: string) => `fixora/batch/${batchId}`,
+  /** A pending / cached crash list request (plan + result) for the picker. */
+  crashes: (requestId: string) => `fixora/crashes/${requestId}`,
+  /** Lister session of an origin session (one per origin session, reused). */
+  lister: (sessionID: string) => `fixora/lister/${sessionID}`,
+  /** Result of an ops prompt that belongs to no run (sync), keyed by the worker session. */
+  ops: (sessionID: string) => `fixora/ops/${sessionID}`,
 }
 
 type StorageValue = Parameters<Plugin.Context["storage"]["set"]>[1]
@@ -75,6 +81,30 @@ export async function scanAll<T>(ctx: Plugin.Context, prefix: string): Promise<T
     after = res.next
   }
   return out
+}
+
+/** Every storage key of the plugin (runs, crash index, workers, locks, crash lists, listers, ops, batches). */
+export async function listKeys(ctx: Plugin.Context, prefix = "fixora/"): Promise<string[]> {
+  const out: string[] = []
+  let after: string | undefined
+  for (let i = 0; i < 200; i++) {
+    const res = await ctx.storage.scan({ prefix, limit: 200, after })
+    for (const e of res.entries) out.push(e.key)
+    if (!res.next) break
+    after = res.next
+  }
+  return out
+}
+
+/** Removes every `fixora/*` key; returns what was removed, grouped by kind. */
+export async function wipeStorage(ctx: Plugin.Context): Promise<Record<string, number>> {
+  const counts: Record<string, number> = {}
+  for (const key of await listKeys(ctx)) {
+    const kind = key.split("/")[1] ?? "other"
+    counts[kind] = (counts[kind] ?? 0) + 1
+    await ctx.storage.remove(key)
+  }
+  return counts
 }
 
 export async function listRuns(ctx: Plugin.Context): Promise<RunRecord[]> {

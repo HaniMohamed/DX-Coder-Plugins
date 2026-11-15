@@ -43,14 +43,14 @@ describe("tui store reducers", () => {
   test("failures clear gates and mark the stage", () => {
     const s = initialState()
     applyEvent(s, "run.started", { runId: "r", sessionID: "ses" }, T0)
-    applyEvent(s, "run.stage", { runId: "r", sessionID: "ses", step: "push", status: "running" }, T0)
+    applyEvent(s, "run.stage", { runId: "r", sessionID: "ses", step: "publish", status: "running" }, T0)
     applyEvent(s, "run.awaiting", { runId: "r", sessionID: "ses", gateId: "g", kind: "publish", summary: "x" }, T0)
-    applyEvent(s, "run.failed", { runId: "r", sessionID: "ses", step: "push", status: "rejected", error: "publish was rejected" }, T0)
+    applyEvent(s, "run.failed", { runId: "r", sessionID: "ses", step: "publish", status: "rejected", error: "publish was rejected" }, T0)
     expect(awaitingGates(s)).toHaveLength(0)
-    expect(s.runs.r!.stages.find((st) => st.step === "push")!.status).toBe("failed")
+    expect(s.runs.r!.stages.find((st) => st.step === "publish")!.status).toBe("failed")
     expect(s.runs.r!.status).toBe("rejected")
-    applyEvent(s, "run.failed", { runId: "r2", sessionID: "ses", step: "map", status: "skipped", error: "no in-app frames" }, T0)
-    expect(s.runs.r2!.stages.find((st) => st.step === "map")!.status).toBe("pending")
+    applyEvent(s, "run.failed", { runId: "r2", sessionID: "ses", step: "fetch", status: "skipped", error: "no in-app frames" }, T0)
+    expect(s.runs.r2!.stages.find((st) => st.step === "fetch")!.status).toBe("pending")
   })
 
   test("hydration from summaries and records", () => {

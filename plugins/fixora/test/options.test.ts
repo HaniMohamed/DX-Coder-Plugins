@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { DEFAULTS, parseModelRef, readOptions } from "../src/options.js"
+import { DEFAULTS, legacyOptionWarnings, parseModelRef, readOptions } from "../src/options.js"
 
 describe("readOptions", () => {
   test("defaults when empty", () => {
@@ -11,7 +11,8 @@ describe("readOptions", () => {
     expect(r.value.approvals).toBe("publish")
     expect(r.value.mr.draft).toBe(true)
     expect(r.value.branchPrefix).toBe("fixora/")
-    expect(r.value).toEqual({ ...DEFAULTS, worker: { ...DEFAULTS.worker, model: undefined }, review: { mode: "session", model: undefined }, testCommands: { ...DEFAULTS.testCommands, unit: undefined, integration: undefined, lint: undefined, typecheck: undefined }, jira: { ...DEFAULTS.jira, project: undefined, parent: undefined, url: undefined, token: undefined, username: undefined, password: undefined, sslVerify: undefined }, mr: { ...DEFAULTS.mr, target: undefined, forge: undefined }, crashlytics: { appIds: [] }, sentry: { organization: undefined, project: undefined }, appPackage: undefined, worktree: { root: undefined, keep: "until-merged" } })
+    expect(r.value).toEqual({ ...DEFAULTS, worker: { ...DEFAULTS.worker, model: undefined }, review: { model: undefined }, testCommands: { ...DEFAULTS.testCommands, unit: undefined, integration: undefined, lint: undefined, typecheck: undefined }, jira: { ...DEFAULTS.jira, project: undefined, parent: undefined }, mr: { ...DEFAULTS.mr, target: undefined, forge: undefined }, crashlytics: { appIds: [] }, sentry: { organization: undefined, project: undefined }, appPackage: undefined, crashes: { cacheMinutes: 5 } })
+    expect(r.value.worker.maxPhaseMinutes).toEqual({ crash: 5, prepare: 10, triage: 10, fix: 20, review: 10, publish: 10, restore: 5, list: 5 })
   })
 
   test("accepts overrides and normalises the prefix", () => {
@@ -62,6 +63,16 @@ describe("readOptions", () => {
     expect(!noParent.ok && noParent.errors.join("\n")).toContain('needs "jira": { "parent"')
     const badKey = readOptions({ jira: { project: "DE", parent: "story 62556" } })
     expect(!badKey.ok && badKey.errors.join("\n")).toContain("jira.parent must be an issue key")
+  })
+
+  test("legacy options are ignored with a warning, never an error", () => {
+    const r = readOptions({ worktree: { root: "/x" }, review: { mode: "quick" }, jira: { url: "https://j", token: "t", project: "APP" } })
+    expect(r.ok).toBe(true)
+    const w = legacyOptionWarnings({ worktree: { root: "/x" }, review: { mode: "quick" }, jira: { url: "https://j", token: "t" } })
+    expect(w).toHaveLength(4)
+    expect(w[0]).toContain("`worktree` is ignored")
+    expect(legacyOptionWarnings({ jira: { project: "APP" } })).toEqual([])
+    expect(legacyOptionWarnings(undefined)).toEqual([])
   })
 
   test("parseModelRef", () => {

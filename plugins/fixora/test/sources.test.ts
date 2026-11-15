@@ -5,9 +5,9 @@ import { DEFAULTS } from "../src/options.js"
 import { parseToolText } from "../src/mcp.js"
 import { crashlytics, crashlyticsRef, hasIssue, mapCrashlyticsIssue, mapCrashlyticsList, parseFormattedFrames, platformOfAppId, sampleEventOf } from "../src/sources/crashlytics.js"
 import type { SourceContext } from "../src/sources/types.js"
-import { resolveRef, runIdFor } from "../src/sources/index.js"
+import { interpretCrashList, listPlans, resolveRef, runIdFor } from "../src/sources/index.js"
 import { crashFromText } from "../src/sources/manual.js"
-import { mapSentryIssue, mapSentryList, stackFromMarkdown } from "../src/sources/sentry.js"
+import { mapSentryIssue, mapSentryList, sentry, stackFromMarkdown } from "../src/sources/sentry.js"
 
 const fixture = (p: string) => JSON.parse(readFileSync(join(import.meta.dir, "fixtures", p), "utf8")) as unknown
 
@@ -119,66 +119,86 @@ describe("manual source", () => {
   })
 })
 
-describe("crashlytics across several apps", () => {
+describe("crashlytics plans across several apps (the agent makes the calls)", () => {
   const ANDROID = "1:10866044419:android:6352c04266dbc3babba836"
   const IOS = "1:10866044419:ios:6b0c10a898bd6acdbba836"
-  function fakeContext(appIds: string[], calls: Array<{ tool: string; input: Record<string, unknown> }>): SourceContext {
-    const tools = {
-      firebase_crashlytics_get_report: async (input: Record<string, unknown>) => ({ issues: (input.appId ?? input.app_id) === ANDROID ? [{ id: "a1", title: "NPE", issueStats: { userCount: 10 } }] : [{ id: "i1", title: "EXC_BAD_ACCESS", issueStats: { userCount: 40 } }, { id: "shared", title: "Null check", issueStats: { userCount: 3 } }] }),
-      firebase_crashlytics_get_issue: async (raw: Record<string, unknown>) => {
-        const input = { app: raw.appId ?? raw.app_id, issue: raw.issueId ?? raw.issue_id }
-        if (input.app === ANDROID && input.issue === "a1") return { id: "a1", title: "NPE" }
-        if (input.app === IOS && input.issue === "i1") return { id: "i1", title: "EXC_BAD_ACCESS" }
-        if (input.app === IOS && input.issue === "boom") throw new Error("PERMISSION_DENIED")
-        return "Issue not found"
-      },
-    }
-    const ctx = {
-      tool: {
-        list: async () =>
-          Object.entries(tools).map(([id, fn]) => ({
-            id,
-            execute: async (input: Record<string, unknown>) => {
-              calls.push({ tool: id, input })
-              return fn(input)
-            },
-          })),
-      },
-    }
-    const options = { ...DEFAULTS, crashlytics: { appIds } }
-    return { ctx: ctx as never, options, sessionID: "s1", services: { crashlytics: { id: "crashlytics", namespace: "firebase", serverName: "firebase", status: "connected", toolIds: Object.keys(tools), capabilities: { getReport: "firebase_crashlytics_get_report", getIssue: "firebase_crashlytics_get_issue" } } } }
-  }
+  const sc = (appIds: string[], props: Record<string, Record<string, unknown>> = {}): SourceContext => ({
+    options: { ...DEFAULTS, crashlytics: { appIds } },
+    services: {
+      crashlytics: { id: "crashlytics", namespace: "firebase", serverName: "firebase", status: "connected", toolIds: [], capabilities: { getReport: "firebase_crashlytics_get_report", getIssue: "firebase_crashlytics_get_issue", batchGetEvents: "firebase_crashlytics_batch_get_events", listEvents: "firebase_crashlytics_list_events" } },
+      sentry: { id: "sentry", namespace: "sentry", serverName: "sentry", status: "connected", toolIds: [], capabilities: { getIssue: "sentry_get_issue_details", searchIssues: "sentry_search_issues", searchErrors: "sentry_search_errors" } },
+    },
+    toolProps: (id) => props[id] ?? {},
+  })
 
-  test("list queries every app, tags the platform and builds app-qualified refs", async () => {
-    const calls: Array<{ tool: string; input: Record<string, unknown> }> = []
-    const list = await crashlytics.list!(fakeContext([ANDROID, IOS], calls), { top: 5 })
-    expect(calls.filter((c) => c.tool === "firebase_crashlytics_get_report").map((c) => c.input.appId)).toEqual([ANDROID, IOS])
-    expect(calls[0]!.input).toMatchObject({ report: "topIssues", pageSize: 5, filter: { issueErrorTypes: ["FATAL"] } })
-    expect(list.map((c) => [c.id, c.platform, c.ref])).toEqual([
+  test("listPlan: one report call per app with the window filter; interpretCrashList tags platform and app-qualified refs", () => {
+    const { plans, errors } = listPlans(sc([ANDROID, IOS]), { top: 5 })
+    expect(errors).toEqual([])
+    const cl = plans.find((p) => p.source === "crashlytics")!
+    expect(cl.calls.map((c) => c.appId)).toEqual([ANDROID, IOS])
+    expect(cl.calls[0]!.input).toMatchObject({ appId: ANDROID, report: "topIssues", pageSize: 5, filter: { issueErrorTypes: ["FATAL"] } })
+    expect(plans.find((p) => p.source === "sentry")!.calls[0]!.input).toMatchObject({ query: "is:unresolved level:error", limit: 5 })
+    const list = interpretCrashList(
+      [
+        { source: "crashlytics", toolId: "firebase_crashlytics_get_report", appId: ANDROID, raw: { issues: [{ id: "a1", title: "NPE", issueStats: { userCount: 10 } }] } },
+        { source: "crashlytics", toolId: "firebase_crashlytics_get_report", appId: IOS, raw: { issues: [{ id: "i1", title: "EXC_BAD_ACCESS", issueStats: { userCount: 40 } }, { id: "shared", title: "Null check", issueStats: { userCount: 3 } }] } },
+        { source: "sentry", toolId: "sentry_search_issues", error: "401" },
+      ],
+      sc([ANDROID, IOS]),
+      { top: 5 },
+    )
+    expect(list.crashes.map((c) => [c.id, c.platform, c.ref])).toEqual([
       ["i1", "ios", `crashlytics:i1@${IOS}`],
       ["a1", "android", `crashlytics:a1@${ANDROID}`],
       ["shared", "ios", `crashlytics:shared@${IOS}`],
     ])
-    expect(list[0]!.url).toContain(`/app/${IOS}/issues/i1`)
+    expect(list.crashes[0]!.url).toContain(`/app/${IOS}/issues/i1`)
+    expect(list.errors).toEqual(["sentry: 401"])
     // A single app keeps the short reference.
-    const single = await crashlytics.list!(fakeContext([ANDROID], []), { top: 5 })
-    expect(single.map((c) => c.ref)).toEqual(["crashlytics:a1"])
+    const single = interpretCrashList([{ source: "crashlytics", toolId: "x", appId: ANDROID, raw: { issues: [{ id: "a1", title: "NPE" }] } }], sc([ANDROID]), { top: 5 })
+    expect(single.crashes.map((c) => c.ref)).toEqual(["crashlytics:a1"])
+    expect(() => listPlans(sc([]), { top: 5 })).not.toThrow()
+    expect(listPlans(sc([]), { top: 5 }).errors[0]).toContain("Firebase app id")
   })
 
-  test("get uses the app from the reference, else probes the configured apps in order", async () => {
-    const calls: Array<{ tool: string; input: Record<string, unknown> }> = []
-    const sc = fakeContext([ANDROID, IOS], calls)
-    const direct = await crashlytics.get(sc, "i1", { appId: IOS })
-    expect(direct.appId).toBe(IOS)
-    expect(direct.platform).toBe("ios")
-    expect(calls.map((c) => c.input.appId)).toEqual([IOS])
-    calls.length = 0
-    const probed = await crashlytics.get(sc, "i1")
-    expect(probed.appId).toBe(IOS)
-    expect(calls.map((c) => c.input.appId)).toEqual([ANDROID, IOS])
-    await expect(crashlytics.get(sc, "nope")).rejects.toThrow("not found in any configured app")
-    await expect(crashlytics.get(sc, "boom")).rejects.toThrow("PERMISSION_DENIED")
-    await expect(crashlytics.get(fakeContext([], []), "a1")).rejects.toThrow("Firebase app id")
+  test("fetchPlan: the app from the reference, else every configured app in order; follow-ups carry placeholders", () => {
+    const direct = crashlytics.fetchPlan!(sc([ANDROID, IOS]), "i1", { appId: IOS })
+    expect(direct.primary.map((c) => c.appId)).toEqual([IOS])
+    expect(direct.primary[0]!.input).toEqual({ appId: IOS, issueId: "i1" })
+    expect(direct.followUps[0]!.toolId).toBe("firebase_crashlytics_batch_get_events")
+    expect(JSON.stringify(direct.followUps[0]!.input)).toContain("sampleEvent")
+    expect(direct.note).toContain(`Report \`appId\` as ${IOS}`)
+    const probed = crashlytics.fetchPlan!(sc([ANDROID, IOS]), "i1")
+    expect(probed.primary.map((c) => c.appId)).toEqual([ANDROID, IOS])
+    expect(probed.note).toContain("stop at the first reply")
+    expect(JSON.stringify(probed.followUps[0]!.input)).toContain("<appId of the app")
+    expect(() => crashlytics.fetchPlan!(sc([]), "a1")).toThrow("Firebase app id")
+    // Snake-case schema (older firebase-tools) is honoured.
+    const snake = crashlytics.fetchPlan!(sc([ANDROID], { firebase_crashlytics_get_issue: { app_id: {}, issue_id: {} } }), "x")
+    expect(snake.primary[0]!.input).toEqual({ app_id: ANDROID, issue_id: "x" })
+  })
+
+  test("mapCrash: needs the app for several apps, rejects a not-found issue reply", () => {
+    const ctx = sc([ANDROID, IOS])
+    expect(() => crashlytics.mapCrash!({ issue: { id: "i1", title: "x" } }, ctx, "i1")).toThrow("report the `appId`")
+    expect(() => crashlytics.mapCrash!({ appId: IOS, issue: "Issue not found" }, ctx, "i1")).toThrow("does not describe issue")
+    expect(() => crashlytics.mapCrash!({ appId: "1:1:web:zz", issue: { id: "i1" } }, ctx, "i1")).toThrow("not one of the configured apps")
+    const crash = crashlytics.mapCrash!({ appId: IOS, issue: { id: "i1", title: "EXC_BAD_ACCESS" }, events: fixture("crashlytics/batch_get_events.ios.unsymbolicated.json") }, ctx, "i1")
+    expect(crash.appId).toBe(IOS)
+    expect(crash.platform).toBe("ios")
+    expect(crash.symbolication).toBe("unsymbolicated")
+  })
+
+  test("sentry plans and mapCrash use the organisation and the sample event", () => {
+    const ctx = { ...sc([ANDROID]), options: { ...DEFAULTS, sentry: { organization: "acme", project: "shop" } } }
+    const plan = sentry.fetchPlan!(ctx, "4523123", { org: "other" })
+    expect(plan.primary[0]).toMatchObject({ toolId: "sentry_get_issue_details", input: { organizationSlug: "other", projectSlugOrId: "shop", issueId: "4523123" } })
+    expect(plan.followUps[0]!.toolId).toBe("sentry_search_errors")
+    const summaryOnly = sentry.mapCrash!({ issue: { id: "4523123", title: "TypeError" } }, ctx, "4523123")
+    expect(summaryOnly.frames).toHaveLength(0)
+    const withEvent = sentry.mapCrash!({ issue: { id: "4523123", title: "TypeError" }, events: fixture("sentry/get_issue_details.node.json") }, ctx, "4523123")
+    expect(withEvent.frames[0]).toMatchObject({ file: "src/cart/service.ts", line: 88 })
+    expect(sentry.annotatePlan!(ctx, "1", { text: "hi" })).toBeUndefined() // no updateIssue capability in this context
   })
 
   test("hasIssue", () => {
@@ -237,20 +257,5 @@ describe("crashlytics via firebase-tools 15 (YAML text, camelCase schema)", () =
     ])
     expect(blocks[1]!.frames[0]).toEqual({ symbol: "-[ViewController viewDidLoad]", file: "ViewController.m", line: 42 })
     expect(blocks[1]!.frames[1]).toEqual({ symbol: "Foo.bar(int)", file: undefined, line: undefined })
-  })
-
-  test("parameter spelling follows the tool schema", async () => {
-    const calls: Array<{ tool: string; input: Record<string, unknown> }> = []
-    const ctx = {
-      tool: {
-        list: async () => [
-          { id: "firebase_crashlytics_get_issue", input: { type: "object", properties: { app_id: { type: "string" }, issue_id: { type: "string" } } }, execute: async (input: Record<string, unknown>) => { calls.push({ tool: "get_issue", input }); return { id: "x", title: "t" } } },
-          { id: "firebase_crashlytics_batch_get_events", input: { type: "object", properties: { app_id: {}, issue_id: {}, page_size: {} } }, execute: async (input: Record<string, unknown>) => { calls.push({ tool: "events", input }); return { events: [] } } },
-        ],
-      },
-    }
-    const sc = { ctx: ctx as never, options: { ...DEFAULTS, crashlytics: { appIds: ["1:1:android:a"] } }, sessionID: "s", services: { crashlytics: { id: "crashlytics", namespace: "firebase", serverName: "firebase", status: "connected", toolIds: [], capabilities: { getIssue: "firebase_crashlytics_get_issue", batchGetEvents: "firebase_crashlytics_batch_get_events" } } } } as never as SourceContext
-    await crashlytics.get(sc, "x")
-    expect(calls[0]!.input).toEqual({ app_id: "1:1:android:a", issue_id: "x" })
   })
 })

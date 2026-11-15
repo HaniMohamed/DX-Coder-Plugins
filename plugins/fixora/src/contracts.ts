@@ -1,8 +1,11 @@
 // Dependency-free validators for the worker's structured outputs. Errors are fed back to the model
 // verbatim, so they say what is wrong and what is expected.
 
+import { isHexSha, isValidBranchName, isProtectedBranch } from "./git.js"
+import { JIRA_KEY } from "./options.js"
+import { isMrUrl } from "./mr.js"
 import { SECRET_PATTERNS } from "./secrets.js"
-import type { Category, Classification, FindingCategory, FixReport, ReviewVerdict, RiskLevel, Severity, Triage, Validation, Verdict } from "./types.js"
+import type { Category, CheckKind, Classification, FindingCategory, FixReport, ReviewVerdict, RiskLevel, Severity, Triage, Validation, Verdict, WorkerGrants } from "./types.js"
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v)
 const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string")
@@ -116,7 +119,7 @@ class Check {
 
 export interface TriageContext {
   runId: string
-  /** Returns true when the repo-relative path exists in the worktree. */
+  /** Returns true when the repo-relative path exists in the checkout. */
   fileExists: (path: string) => boolean
   knownCrashKeys?: string[]
 }
@@ -143,11 +146,11 @@ export function validateTriage(input: unknown, ctx: TriageContext): Validation<T
     const line = fc.num("line", { min: 1, int: true, required: false })
     const fn = fc.str("function", { required: false, max: 300 })
     const evidence = fc.str("evidence", { min: 5 })
-    if (file && !ctx.fileExists(file)) fc.errors.push(`file "${file}" does not exist in the worktree (use a repo-relative path)`)
+    if (file && !ctx.fileExists(file)) fc.errors.push(`file "${file}" does not exist in the repository (use a repo-relative path)`)
     c.errors.push(...fc.errors.map((e) => `mappedFrames[${i}].${e}`))
     if (fc.errors.length === 0 && index !== undefined && file && evidence) mapped.push({ index, file, line, function: fn, evidence })
   }
-  if (classification === "fixable" && mapped.length === 0) c.errors.push("a fixable crash needs at least one mappedFrames entry whose file exists in the worktree")
+  if (classification === "fixable" && mapped.length === 0) c.errors.push("a fixable crash needs at least one mappedFrames entry whose file exists in the repository")
   const suspect: Triage["suspectCommits"] = []
   for (const [i, s] of c.objs("suspectCommits", { max: 10 }).entries()) {
     const sc = new Check(s)
@@ -210,7 +213,7 @@ export function validateTriage(input: unknown, ctx: TriageContext): Validation<T
 export interface FixContext {
   runId: string
   attempt: number
-  /** Paths changed in the worktree according to git (repo-relative). */
+  /** Paths changed in the checkout according to the status the worker reported (repo-relative). */
   changedFiles: string[]
   forbidden: (path: string) => string | undefined
   maxFilesChanged: number
@@ -218,7 +221,11 @@ export interface FixContext {
   requireTestChange: boolean
   isTestFile: (path: string) => boolean
   testFirst: boolean
+  /** Check commands that must appear in commandsRun (the plan's non-optional ones). */
+  requiredChecks?: string[]
 }
+
+const CHECK_KINDS: CheckKind[] = ["setup", "syntax", "lint", "typecheck", "unit", "integration", "build"]
 
 export function validateFix(input: unknown, ctx: FixContext): Validation<FixReport> {
   if (!isRecord(input)) return { ok: false, errors: ["root must be an object"] }
@@ -257,8 +264,11 @@ export function validateFix(input: unknown, ctx: FixContext): Validation<FixRepo
     const exitCode = rc.num("exitCode", { int: true })
     const durationMs = rc.num("durationMs", { min: 0 })
     const summaryText = rc.str("summary", { max: 500 })
+    const kind = rc.oneOf("kind", CHECK_KINDS, false)
+    const cwd = rc.str("cwd", { required: false, max: 300 })
+    const outputTail = rc.str("outputTail", { required: false, max: 20_000 })
     c.errors.push(...rc.errors.map((e) => `commandsRun[${i}].${e}`))
-    if (command && exitCode !== undefined && durationMs !== undefined && summaryText) commandsRun.push({ command, exitCode, durationMs, summary: summaryText })
+    if (command && exitCode !== undefined && durationMs !== undefined && summaryText) commandsRun.push({ command, exitCode, durationMs, summary: summaryText, kind, cwd, outputTail })
   }
   let reproduction: FixReport["reproduction"]
   const repro = c.obj("reproduction", ctx.testFirst)
@@ -287,15 +297,19 @@ export function validateFix(input: unknown, ctx: FixContext): Validation<FixRepo
   if (changesMade) {
     const reported = new Set(filesChanged.map((f) => f.replace(/\\/g, "/").replace(/^\.\//, "")))
     const actual = new Set(ctx.changedFiles)
-    for (const f of actual) if (!reported.has(f)) c.errors.push(`filesChanged is missing "${f}" which is modified in the worktree (git status)`)
+    for (const f of actual) if (!reported.has(f)) c.errors.push(`filesChanged is missing "${f}" which is modified according to git status`)
     for (const f of reported) if (!actual.has(f)) c.errors.push(`filesChanged lists "${f}" but git reports no change to it`)
     for (const f of actual) {
       const why = ctx.forbidden(f)
       if (why) c.errors.push(`"${f}" must not be changed: ${why}. Revert it.`)
     }
     if (actual.size > ctx.maxFilesChanged) c.errors.push(`${actual.size} files changed, limit is ${ctx.maxFilesChanged}; reduce the scope of the fix`)
-    if (actual.size === 0) c.errors.push("changesMade is true but the worktree has no changes")
+    if (actual.size === 0) c.errors.push("changesMade is true but the reported git status shows no changes")
     if (ctx.hasTestRunner && commandsRun.length === 0) c.errors.push("commandsRun is empty: run the project's check commands and record them")
+    for (const required of ctx.requiredChecks ?? []) {
+      const r = required.trim()
+      if (!commandsRun.some((x) => x.command.trim() === r || x.command.trim().startsWith(`${r} `))) c.errors.push(`commandsRun does not contain \`${r}\`; run it and report its result`)
+    }
     const testTouched = [...actual].some((f) => ctx.isTestFile(f))
     if (ctx.requireTestChange && !testTouched && unresolved.length === 0) c.errors.push("no test file was added or changed; add a regression test (or explain in unresolved[] why none is possible)")
     if (testsAdded.length === 0 && testTouched === false && unresolved.length === 0) c.errors.push("testsAdded is empty; list the tests you added or adjusted")
@@ -378,3 +392,236 @@ export function parseJsonFile<T>(text: string, validate: (v: unknown) => Validat
 }
 
 const dedupe = (errors: string[]) => [...new Set(errors)]
+
+// ---------- prepare ----------
+
+export interface PrepareContext {
+  runId: string
+  branchPrefix: string
+  baseBranch: string
+  /** A branch the run already created (resumed runs must check that one out). */
+  existingBranch?: string
+}
+
+export interface PrepareSubmission {
+  version: 1
+  runId: string
+  stage: "inspect" | "ready"
+  repoRoot: string
+  previousBranch: string
+  previousHeadSha: string
+  dirty: boolean
+  status?: string
+  dirtyFiles?: number
+  stashRef?: string
+  blocked?: "not-a-repo" | "base-missing"
+  blockedDetail?: string
+  baseRef?: string
+  baseSha?: string
+  remoteUrl?: string | null
+  branch?: string
+  created?: boolean
+  toolchain?: { ecosystems: unknown; checks: unknown; setup: Array<{ command: string; exitCode: number; summary: string }> }
+  conventionFiles: string[]
+  notes: string[]
+}
+
+export function validatePrepare(input: unknown, ctx: PrepareContext): Validation<PrepareSubmission> {
+  if (!isRecord(input)) return { ok: false, errors: ["root must be an object"] }
+  const c = new Check(input)
+  if (input.version !== 1) c.errors.push("version must be 1")
+  const runId = c.str("runId")
+  if (runId && runId !== ctx.runId) c.errors.push(`runId must be "${ctx.runId}"`)
+  const stage = c.oneOf("stage", ["inspect", "ready"] as const)
+  const blocked = c.oneOf("blocked", ["not-a-repo", "base-missing"] as const, false)
+  const blockedDetail = c.str("blockedDetail", { required: false, max: 2000 })
+  const repoRoot = c.str("repoRoot", { required: !blocked, max: 1000 })
+  const previousBranch = c.str("previousBranch", { required: !blocked, max: 300 })
+  const previousHeadSha = c.str("previousHeadSha", { required: !blocked, max: 64 })
+  if (previousHeadSha && !isHexSha(previousHeadSha)) c.errors.push("previousHeadSha must be a hex commit id")
+  const dirty = c.bool("dirty", !blocked) ?? false
+  const status = c.str("status", { required: false, max: 60_000 })
+  const dirtyFiles = c.num("dirtyFiles", { min: 0, int: true, required: false })
+  const stashRaw = input.stashRef
+  if (stashRaw !== undefined && stashRaw !== null && !isHexSha(stashRaw)) c.errors.push("stashRef must be the hex commit id of the stash entry (`git rev-parse stash@{0}`)")
+  const stashRef = isHexSha(stashRaw) ? stashRaw : undefined
+  const conventionFiles = c.strs("conventionFiles", { max: 20 })
+  const notes = c.strs("notes", { max: 20 })
+  let baseRef: string | undefined
+  let baseSha: string | undefined
+  let remoteUrl: string | null | undefined
+  let branch: string | undefined
+  let created: boolean | undefined
+  let toolchain: PrepareSubmission["toolchain"]
+  if (stage === "ready" && !blocked) {
+    baseRef = c.str("baseRef", { max: 300 })
+    baseSha = c.str("baseSha", { max: 64 })
+    if (baseSha && !isHexSha(baseSha)) c.errors.push("baseSha must be a hex commit id")
+    const ru = input.remoteUrl
+    if (ru === null) remoteUrl = null
+    else if (ru === undefined) remoteUrl = undefined
+    else if (typeof ru === "string") remoteUrl = ru.trim() || null
+    else c.errors.push("remoteUrl must be a string or null")
+    branch = c.str("branch", { max: 200 })
+    created = c.bool("created", false)
+    if (branch) {
+      if (!branch.startsWith(ctx.branchPrefix)) c.errors.push(`branch must start with "${ctx.branchPrefix}" (got "${branch}")`)
+      if (!isValidBranchName(branch)) c.errors.push(`"${branch}" is not a valid branch name`)
+      if (isProtectedBranch(branch, ctx.baseBranch)) c.errors.push(`"${branch}" is a protected branch name`)
+      if (ctx.existingBranch && branch !== ctx.existingBranch) c.errors.push(`this run already uses branch "${ctx.existingBranch}"; check that one out instead of creating "${branch}"`)
+    }
+    if (dirty && !stashRef) c.errors.push("the checkout is dirty but no stashRef was reported: stop and submit stage \"inspect\" so Fixora can ask the user before anything is stashed")
+    const tc = c.obj("toolchain")
+    if (tc) {
+      const setup: Array<{ command: string; exitCode: number; summary: string }> = []
+      if (tc.setup !== undefined && !Array.isArray(tc.setup)) c.errors.push("toolchain.setup must be an array")
+      for (const raw of Array.isArray(tc.setup) ? tc.setup : []) {
+        if (!isRecord(raw) || typeof raw.command !== "string") continue
+        setup.push({ command: raw.command, exitCode: typeof raw.exitCode === "number" ? raw.exitCode : 0, summary: typeof raw.summary === "string" ? raw.summary : "" })
+      }
+      if (!Array.isArray(tc.ecosystems)) c.errors.push("toolchain.ecosystems must be an array of { id, root }")
+      if (!Array.isArray(tc.checks)) c.errors.push("toolchain.checks must be an array of { kind, command, cwd?, optional? }")
+      toolchain = { ecosystems: tc.ecosystems, checks: tc.checks, setup }
+    }
+  }
+  if (stage === "inspect" && dirty && !status) c.errors.push("stage inspect with a dirty checkout needs the porcelain status text in `status`")
+  if (c.errors.length > 0) return { ok: false, errors: dedupe(c.errors) }
+  return {
+    ok: true,
+    value: { version: 1, runId: ctx.runId, stage: stage!, repoRoot: repoRoot ?? "", previousBranch: previousBranch ?? "", previousHeadSha: previousHeadSha ?? "", dirty, status, dirtyFiles, stashRef, blocked, blockedDetail, baseRef, baseSha, remoteUrl, branch, created, toolchain, conventionFiles, notes },
+  }
+}
+
+// ---------- ticket ----------
+
+export interface TicketSubmission {
+  version: 1
+  runId: string
+  action: "created" | "reused" | "failed"
+  key?: string
+  url?: string
+  error?: string
+}
+
+export function validateTicket(input: unknown, ctx: { runId: string }): Validation<TicketSubmission> {
+  if (!isRecord(input)) return { ok: false, errors: ["root must be an object"] }
+  const c = new Check(input)
+  if (input.version !== 1) c.errors.push("version must be 1")
+  const runId = c.str("runId")
+  if (runId && runId !== ctx.runId) c.errors.push(`runId must be "${ctx.runId}"`)
+  const action = c.oneOf("action", ["created", "reused", "failed"] as const)
+  const key = c.str("key", { required: action !== "failed", max: 50 })
+  if (key && !JIRA_KEY.test(key)) c.errors.push(`key must be a Jira issue key like "APP-123" (got "${key}")`)
+  const url = c.str("url", { required: false, max: 1000 })
+  if (url && !/^https?:\/\//.test(url)) c.errors.push("url must be an http(s) URL")
+  const error = c.str("error", { required: action === "failed", max: 2000 })
+  if (c.errors.length > 0) return { ok: false, errors: dedupe(c.errors) }
+  return { ok: true, value: { version: 1, runId: ctx.runId, action: action!, key, url, error } }
+}
+
+// ---------- publish ----------
+
+export interface PublishContext {
+  runId: string
+  grants: WorkerGrants
+  branch: string
+  remote: string
+}
+
+export interface PublishSubmission {
+  version: 1
+  runId: string
+  committed?: { sha: string; files: string[] }
+  pushed?: { remote: string; branch: string; remoteSha?: string }
+  mr?: { url: string; id?: string; provider: "gitlab-mcp" | "github-mcp" | "glab" | "gh"; status?: "draft" | "open" }
+  mrSkipped?: { reason: string; compareUrl?: string }
+  errors: string[]
+}
+
+export function validatePublish(input: unknown, ctx: PublishContext): Validation<PublishSubmission> {
+  if (!isRecord(input)) return { ok: false, errors: ["root must be an object"] }
+  const c = new Check(input)
+  if (input.version !== 1) c.errors.push("version must be 1")
+  const runId = c.str("runId")
+  if (runId && runId !== ctx.runId) c.errors.push(`runId must be "${ctx.runId}"`)
+  const errors = c.strs("errors", { max: 20 })
+  let committed: PublishSubmission["committed"]
+  const co = c.obj("committed", false)
+  if (co) {
+    if (!ctx.grants.commit) c.errors.push("committed was reported but commit was not granted in this phase")
+    const cc = new Check(co)
+    const sha = cc.str("sha", { max: 64 })
+    const files = cc.strs("files", { max: 200 })
+    if (sha && !isHexSha(sha)) cc.errors.push("sha must be a hex commit id")
+    c.errors.push(...cc.errors.map((e) => `committed.${e}`))
+    if (sha) committed = { sha, files }
+  }
+  let pushed: PublishSubmission["pushed"]
+  const po = c.obj("pushed", false)
+  if (po) {
+    if (!ctx.grants.push) c.errors.push("pushed was reported but push was not granted in this phase")
+    const pc = new Check(po)
+    const remote = pc.str("remote", { max: 100 })
+    const branch = pc.str("branch", { max: 200 })
+    const remoteSha = pc.str("remoteSha", { required: false, max: 64 })
+    if (branch && branch !== ctx.branch) pc.errors.push(`branch must be "${ctx.branch}"`)
+    if (remoteSha && !isHexSha(remoteSha)) pc.errors.push("remoteSha must be a hex commit id")
+    c.errors.push(...pc.errors.map((e) => `pushed.${e}`))
+    if (remote && branch) pushed = { remote, branch, remoteSha }
+  }
+  let mr: PublishSubmission["mr"]
+  const mo = c.obj("mr", false)
+  if (mo) {
+    if (!ctx.grants.mr) c.errors.push("mr was reported but opening a merge request was not granted in this phase")
+    const mc = new Check(mo)
+    const url = mc.str("url", { max: 1000 })
+    const id = mc.str("id", { required: false, max: 50 })
+    const provider = mc.oneOf("provider", ["gitlab-mcp", "github-mcp", "glab", "gh"] as const)
+    const status = mc.oneOf("status", ["draft", "open"] as const, false)
+    if (url && !isMrUrl(url)) mc.errors.push(`url must be the merge request / pull request URL (got "${url}")`)
+    c.errors.push(...mc.errors.map((e) => `mr.${e}`))
+    if (url && provider) mr = { url, id: id ?? url.split("/").pop(), provider, status }
+  }
+  let mrSkipped: PublishSubmission["mrSkipped"]
+  const so = c.obj("mrSkipped", false)
+  if (so) {
+    const sc = new Check(so)
+    const reason = sc.str("reason", { max: 2000 })
+    const compareUrl = sc.str("compareUrl", { required: false, max: 1000 })
+    c.errors.push(...sc.errors.map((e) => `mrSkipped.${e}`))
+    if (reason) mrSkipped = { reason, compareUrl }
+  }
+  if (!committed && !pushed && !mr && !mrSkipped && errors.length === 0) c.errors.push("nothing was reported: include committed / pushed / mr / mrSkipped, or the errors that stopped you")
+  if (c.errors.length > 0) return { ok: false, errors: dedupe(c.errors) }
+  return { ok: true, value: { version: 1, runId: ctx.runId, committed, pushed, mr, mrSkipped, errors } }
+}
+
+// ---------- ops ----------
+
+export const OPS = ["close-loop", "restore", "sync", "close-mr", "jira-comment", "clean", "annotate"] as const
+export type Op = (typeof OPS)[number]
+
+export interface OpsSubmission {
+  version: 1
+  runId?: string
+  op: Op
+  ok: boolean
+  results: Record<string, unknown>
+  errors: string[]
+}
+
+export function validateOps(input: unknown, ctx: { runId?: string; op?: Op }): Validation<OpsSubmission> {
+  if (!isRecord(input)) return { ok: false, errors: ["root must be an object"] }
+  const c = new Check(input)
+  if (input.version !== 1) c.errors.push("version must be 1")
+  const runId = c.str("runId", { required: !!ctx.runId, max: 100 })
+  if (ctx.runId && runId && runId !== ctx.runId) c.errors.push(`runId must be "${ctx.runId}"`)
+  const op = c.oneOf("op", OPS)
+  if (ctx.op && op && op !== ctx.op) c.errors.push(`op must be "${ctx.op}"`)
+  const ok = c.bool("ok")
+  const results = c.obj("results", false) ?? {}
+  const errors = c.strs("errors", { max: 20 })
+  if (ok === false && errors.length === 0) c.errors.push("ok is false: say what failed in errors[]")
+  if (c.errors.length > 0) return { ok: false, errors: dedupe(c.errors) }
+  return { ok: true, value: { version: 1, runId: ctx.runId ?? runId, op: op!, ok: ok!, results, errors } }
+}

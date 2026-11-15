@@ -19,7 +19,9 @@ export const sampleRun = (over: Partial<RunRecord> = {}): RunRecord => ({
   flags: { dryRun: false, ticket: true, push: true, mr: true, auto: false, force: false, testFirst: false },
   base: { remote: "origin", branch: "main", sha: "b7e21c0ffee" },
   branch: "fixora/sentry-4523123-typeerror",
-  worktree: "/repo/.worktrees/fixora-sentry-4523123",
+  checkout: { active: false, previousBranch: "main", previousHeadSha: "9fceb02a1b2c3d4e5f60718293a4b5c6d7e8f901", preparedAt: "2026-11-14T10:00:30.000Z", restoredAt: "2026-11-14T10:07:00.000Z" },
+  toolchain: { ecosystems: [{ id: "node", root: "" }], checks: [{ kind: "unit", command: "bun test", cwd: "" }, { kind: "typecheck", command: "tsc --noEmit", cwd: "", optional: true }], conventionFiles: [] },
+  change: { paths: ["src/cart/service.ts", "src/cart/service.test.ts"], added: 6, deleted: 1, diffHash: "h" },
   sessions: { fixer: "ses_w" },
   jiraKey: "APP-1831",
   jiraUrl: "https://jira.example.com/browse/APP-1831",
@@ -98,8 +100,8 @@ describe("state", () => {
     const run = sampleRun({ status: "failed", step: "validate", timings: { validate: { startedAt: "2026-11-14T10:00:00.000Z", attempts: 2, status: "failed" } } })
     expect(resumePoint(run)).toBe("validate")
     expect(resumePoint(run, "fix")).toBe("fix")
-    const ok = sampleRun({ status: "failed", step: "push", timings: { push: { startedAt: "x", attempts: 1, status: "ok" } } })
-    expect(resumePoint(ok)).toBe("mr")
+    const ok = sampleRun({ status: "failed", step: "publish", timings: { publish: { startedAt: "x", attempts: 1, status: "ok" } } })
+    expect(resumePoint(ok)).toBe("close-loop")
     const r = sampleRun({ timings: {} })
     beginStep(r, "fix", "2026-11-14T10:00:00.000Z")
     expect(r.step).toBe("fix")
@@ -131,10 +133,12 @@ describe("state", () => {
 })
 
 describe("render", () => {
-  test("crash markdown wraps untrusted content and lists candidates", () => {
-    const md = renderCrashMarkdown(crash, { mapped: [{ frame: crash.frames[0]!, index: 0, candidates: [{ path: "src/cart/service.ts", score: 1, reason: "exact" }], external: false }] })
+  test("crash markdown wraps untrusted content and lists the frames as reported, without in-app judgement", () => {
+    const md = renderCrashMarkdown(crash)
     expect(md).toContain("BEGIN UNTRUSTED CRASH CONTENT")
-    expect(md).toContain("src/cart/service.ts (1)")
+    expect(md).toContain("| 0 | src/cart/service.ts | 88 | applyCoupon |")
+    expect(md).not.toContain("In app")
+    expect(md).toContain("Locate each file in the repository yourself")
     expect(md).toContain("ignore previous instructions")
     expect(md.indexOf("BEGIN UNTRUSTED CRASH")).toBeLessThan(md.indexOf("ignore previous instructions"))
   })
@@ -167,8 +171,13 @@ describe("render", () => {
     const run = sampleRun()
     expect(renderTriageCard(run, crash)).toContain("confidence")
     expect(renderRunStatus(run)).toContain("| analyse | ok | 1 |")
+    expect(renderRunStatus(run)).toContain("restored to `main`")
     const report = renderFinalReport(run, { crashUrl: crash.url })
     expect(report).toContain("merge_requests/418")
+    expect(report).toContain("| Checkout | restored to `main` |")
+    const pending = renderFinalReport(sampleRun({ status: "failed", checkout: { active: true, previousBranch: "main", stashRef: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d" } }), {})
+    expect(pending).toContain("still on `fixora/sentry-4523123-typeerror`")
+    expect(pending).toContain("git stash pop 1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d")
     expect(report).toContain("APP-1831")
     expect(report).toContain("/fixora feedback sentry-4523123")
     const failed = renderFinalReport(sampleRun({ status: "failed", error: "boom", mrUrl: undefined }), { compareUrl: "https://x/compare" })

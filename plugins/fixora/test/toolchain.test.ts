@@ -1,77 +1,61 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { describe, expect, test } from "bun:test"
 import { DEFAULTS } from "../src/options.js"
-import { buildCheckPlan, capChecks, detectEcosystems, isTestFile, mergeOverrides, nearestEcosystems, parseCheckOutput } from "../src/toolchain.js"
-import { checkChangedFiles, isToolMissing, summarizeChecks } from "../src/validate.js"
+import { applyOverrides, hasTestRunner, isTestFile, normalizeChecks, normalizeEcosystems, parseCheckOutput, requiredChecks } from "../src/toolchain.js"
 
-let root: string
-beforeAll(async () => {
-  root = await mkdtemp(join(tmpdir(), "fixora-toolchain-"))
-  const put = async (p: string, content = "") => {
-    await mkdir(join(root, p, ".."), { recursive: true })
-    await writeFile(join(root, p), content)
-  }
-  await put("package.json", JSON.stringify({ name: "shop", scripts: { lint: "eslint .", test: "vitest run", typecheck: "tsc --noEmit", "test:integration": "vitest run -c it" } }))
-  await put("pnpm-lock.yaml")
-  await put("tsconfig.json", "{}")
-  await put("apps/mobile/pubspec.yaml", "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n")
-  await put("apps/mobile/integration_test/app_test.dart")
-  await put("apps/mobile/android/gradlew", "#!/bin/sh")
-  await put("services/api/go.mod", "module github.com/acme/shop\n")
-  await put("services/py/pyproject.toml", "[tool.ruff]\nline-length = 100\n")
-  await put("services/net/Shop.sln")
-  await put("node_modules/skip/package.json", "{}")
+describe("normalizeChecks / normalizeEcosystems", () => {
+  test("reads what the prepare phase reported, drops junk, dedupes", () => {
+    const checks = normalizeChecks([
+      { kind: "lint", command: "flutter analyze", cwd: "./apps/mobile/" },
+      { kind: "unit", command: " flutter test ", cwd: "apps/mobile" },
+      { kind: "unit", command: "flutter test", cwd: "apps/mobile" },
+      { kind: "nope", command: "x" },
+      { command: "" },
+      "garbage",
+      { kind: "typecheck", command: "npx tsc --noEmit", optional: true },
+    ])
+    expect(checks).toEqual([
+      { kind: "lint", command: "flutter analyze", cwd: "apps/mobile", optional: false },
+      { kind: "unit", command: "flutter test", cwd: "apps/mobile", optional: false },
+      { kind: "unit", command: "x", cwd: "", optional: false },
+      { kind: "typecheck", command: "npx tsc --noEmit", cwd: "", optional: true },
+    ])
+    expect(normalizeChecks("nope")).toEqual([])
+    expect(normalizeEcosystems([{ id: "Flutter", root: "./apps/mobile/" }, { id: "node", root: "" }, { id: "node", root: "" }, { root: "x" }])).toEqual([
+      { id: "flutter", root: "apps/mobile" },
+      { id: "node", root: "" },
+    ])
+  })
 })
-afterAll(() => rm(root, { recursive: true, force: true }))
 
-describe("detectEcosystems", () => {
-  test("finds root and nested ecosystems with the right commands", async () => {
-    const eco = await detectEcosystems(root)
-    const ids = eco.map((e) => `${e.id}@${e.root}`)
-    expect(ids).toContain("node@")
-    expect(ids).toContain("flutter@apps/mobile")
-    expect(ids).toContain("gradle@apps/mobile/android")
-    expect(ids).toContain("go@services/api")
-    expect(ids).toContain("python@services/py")
-    expect(ids).toContain("dotnet@services/net")
-    expect(ids.some((i) => i.includes("node_modules"))).toBe(false)
-    const node = eco.find((e) => e.id === "node")!
-    expect(node.checks.map((c) => c.command)).toEqual(["pnpm run lint", "pnpm run typecheck", "pnpm run test", "pnpm run test:integration"])
-    expect(node.subset!(["src/x.test.ts"])).toBe("pnpm exec vitest run src/x.test.ts")
-    const flutter = eco.find((e) => e.id === "flutter")!
-    expect(flutter.checks.map((c) => c.command)).toEqual(["flutter analyze", "flutter test", "flutter test integration_test"])
-    expect(flutter.subset!(["test/cart_test.dart"])).toBe("flutter test test/cart_test.dart")
-    const py = eco.find((e) => e.id === "python")!
-    expect(py.checks.map((c) => c.command)).toContain("ruff check .")
-    expect(py.checks.map((c) => c.command)).toContain("pytest -q")
-    const go = eco.find((e) => e.id === "go")!
-    expect(go.subset!(["cart/service_test.go", "cmd/api/main_test.go"])).toBe("go test ./cart/... ./cmd/api/...")
+describe("applyOverrides / requiredChecks / hasTestRunner", () => {
+  const reported = [
+    { kind: "setup" as const, command: "bun install", cwd: "" },
+    { kind: "lint" as const, command: "bun run lint", cwd: "" },
+    { kind: "typecheck" as const, command: "bun run typecheck", cwd: "", optional: true },
+    { kind: "unit" as const, command: "bun test", cwd: "" },
+  ]
+  test("option overrides replace or disable kinds; setup never stays in the plan", () => {
+    const merged = applyOverrides(reported, { ...DEFAULTS.testCommands, unit: "bun test --bail", lint: "" })
+    expect(merged.map((c) => `${c.kind}:${c.command}`)).toEqual(["unit:bun test --bail", "typecheck:bun run typecheck"])
+    expect(applyOverrides(reported, DEFAULTS.testCommands).map((c) => c.command)).toEqual(["bun run lint", "bun run typecheck", "bun test"])
   })
-
-  test("nearestEcosystems picks the deepest root for mapped paths", async () => {
-    const eco = await detectEcosystems(root)
-    expect(nearestEcosystems(eco, ["apps/mobile/lib/x.dart"]).map((e) => e.id)).toEqual(["flutter"])
-    expect(nearestEcosystems(eco, ["apps/mobile/android/app/src/main/A.kt"]).map((e) => e.id)).toEqual(["gradle"])
-    expect(nearestEcosystems(eco, ["src/x.ts"]).map((e) => e.id)).toEqual(["node"])
-    expect(nearestEcosystems(eco, []).map((e) => e.id)).toEqual(["node"])
+  test("required = non-optional, non-setup", () => {
+    expect(requiredChecks(reported).map((c) => c.command)).toEqual(["bun run lint", "bun test"])
+    expect(hasTestRunner({ ecosystems: [], checks: reported, conventionFiles: [] })).toBe(true)
+    expect(hasTestRunner({ ecosystems: [], checks: [reported[1]!], conventionFiles: [] })).toBe(false)
+    expect(hasTestRunner(undefined)).toBe(false)
   })
+})
 
-  test("mergeOverrides replaces or disables kinds", async () => {
-    const eco = (await detectEcosystems(root)).filter((e) => e.id === "node")
-    const merged = mergeOverrides(eco, { ...DEFAULTS.testCommands, unit: "bun test", lint: "" }, 1000)
-    expect(merged.map((c) => `${c.kind}:${c.command}`)).toEqual(["unit:bun test", "typecheck:pnpm run typecheck", "integration:pnpm run test:integration"])
-    expect(merged.every((c) => c.timeoutMs === 1000)).toBe(true)
-  })
-
-  test("isTestFile", async () => {
-    const eco = await detectEcosystems(root)
+describe("isTestFile", () => {
+  test("per ecosystem patterns, generic fallback", () => {
+    const eco = [{ id: "node", root: "" }, { id: "flutter", root: "apps/mobile" }, { id: "go", root: "services/api" }]
     expect(isTestFile("src/cart/service.test.ts", eco)).toBe(true)
     expect(isTestFile("apps/mobile/test/cart_test.dart", eco)).toBe(true)
     expect(isTestFile("services/api/cart/service_test.go", eco)).toBe(true)
     expect(isTestFile("src/cart/service.ts", eco)).toBe(false)
     expect(isTestFile("spec/x_spec.rb", [])).toBe(true)
+    expect(isTestFile("Tests/FooTests.swift", [{ id: "spm", root: "" }])).toBe(true)
   })
 })
 
@@ -84,83 +68,5 @@ describe("parseCheckOutput", () => {
     expect(parseCheckOutput("unit", "ok  \tgithub.com/acme/shop/cart\t0.1s\n--- FAIL: TestX\nFAIL", "")).toMatchObject({ failed: 1 })
     expect(parseCheckOutput("unit", "test result: ok. 7 passed; 0 failed;", "")).toMatchObject({ passed: 7, failed: 0 })
     expect(parseCheckOutput("lint", "", "src/x.ts:1:1 error no-unused-vars").summary).toContain("no-unused-vars")
-  })
-})
-
-describe("checkChangedFiles / summarizeChecks", () => {
-  test("limits and forbidden paths", () => {
-    const limits = { denyPaths: ["docs/**"], maxFiles: 2, maxLines: 50 }
-    expect(checkChangedFiles({ paths: ["src/a.ts"], added: 10, deleted: 2 }, limits)).toEqual([])
-    const problems = checkChangedFiles({ paths: ["src/a.ts", "bun.lock", "docs/x.md"], added: 60, deleted: 0 }, limits)
-    expect(problems.join("\n")).toContain("bun.lock: matches protected pattern")
-    expect(problems.join("\n")).toContain("docs/x.md: matches protected pattern docs/**")
-    expect(problems.join("\n")).toContain("3 files changed (limit 2)")
-    expect(problems.join("\n")).toContain("60 diff lines (limit 50)")
-  })
-  test("summaries and missing tools", () => {
-    const r = { kind: "unit" as const, command: "bun test", cwd: "", exitCode: 0, durationMs: 10, outputTail: "", summary: "3 passed" }
-    expect(summarizeChecks({ diffHash: "x", commands: [r, { ...r, kind: "lint", exitCode: 1, summary: "" }], allPassed: false })).toBe("unit ✓ (3 passed) · lint ✗")
-    expect(isToolMissing({ ...r, exitCode: 127, outputTail: "sh: tsc: command not found" })).toBe(true)
-    expect(isToolMissing({ ...r, exitCode: 1, outputTail: "1 fail" })).toBe(false)
-  })
-})
-
-describe("buildCheckPlan (monorepo scoping)", () => {
-  const eco = (id: string, root: string, checks: Array<[string, string, boolean?]>, subset?: (files: string[]) => string | undefined): import("../src/toolchain.js").Ecosystem =>
-    ({ id: id as never, root, bootstrap: [], checks: checks.map(([kind, command, optional]) => ({ kind: kind as never, command, cwd: root, timeoutMs: 1000, optional })), subset, testFilePatterns: [/_test\.dart$/, /\.test\.ts$/], testDirs: ["test"] })
-  const ecosystems = [
-    eco("flutter", "", [["lint", "flutter analyze"], ["unit", "flutter test"]], (f) => (f.length ? `flutter test ${f.join(" ")}` : undefined)),
-    eco("flutter", "packages/core", [["lint", "flutter analyze"], ["unit", "flutter test"]], (f) => (f.length ? `flutter test ${f.join(" ")}` : undefined)),
-    eco("flutter", "packages/ui", [["lint", "flutter analyze"], ["unit", "flutter test"]]),
-    eco("gradle", "android", [["build", "./gradlew compileDebugKotlin", true], ["unit", "./gradlew testDebugUnitTest"]]),
-    eco("xcode", "ios", [["build", "xcodebuild build", true]]),
-  ]
-  const overrides = { timeoutSec: 600, fullSuiteMaxMinutes: 15 }
-  test("only the package owning the changed files, subset then full suite, no duplicates", () => {
-    const plan = buildCheckPlan({ ecosystems, overrides, changedPaths: ["packages/core/lib/a.dart", "packages/core/test/a_test.dart"], scope: "mapped", timeoutMs: 600000, fullSuiteMaxMinutes: 15 })
-    expect(plan.map((c) => `${c.cwd}: ${c.command}`)).toEqual(["packages/core: flutter analyze", "packages/core: flutter test test/a_test.dart", "packages/core: flutter test"])
-  })
-  test("root-level files run only the root ecosystem, never every nested package or the native builds", () => {
-    const plan = buildCheckPlan({ ecosystems, overrides, changedPaths: ["lib/main.dart"], scope: "mapped", timeoutMs: 600000, fullSuiteMaxMinutes: 15 })
-    expect(plan.map((c) => c.command)).toEqual(["flutter analyze", "flutter test"])
-    expect(nearestEcosystems(ecosystems, []).map((e) => e.root)).toEqual([""])
-    expect(nearestEcosystems(ecosystems, ["docs/x.md"]).map((e) => e.root)).toEqual([""])
-  })
-  test("android changes run the gradle checks; skip scope drops tests; cap keeps priority", () => {
-    const plan = buildCheckPlan({ ecosystems, overrides, changedPaths: ["android/app/src/main/A.kt"], scope: "mapped", timeoutMs: 600000, fullSuiteMaxMinutes: 15 })
-    expect(plan.map((c) => c.command)).toEqual(["./gradlew compileDebugKotlin", "./gradlew testDebugUnitTest"])
-    expect(buildCheckPlan({ ecosystems, overrides, changedPaths: ["android/app/src/main/A.kt"], scope: "skip", timeoutMs: 600000, fullSuiteMaxMinutes: 15 }).map((c) => c.kind)).toEqual(["build"])
-    const many = Array.from({ length: 12 }, (_, i) => ({ kind: (i % 2 ? "build" : "lint") as never, command: `c${i}`, cwd: "", timeoutMs: 1, optional: i > 9 }))
-    const capped = capChecks(many, 8)
-    expect(capped).toHaveLength(8)
-    expect(capped.filter((c) => c.optional)).toHaveLength(0)
-    expect(capped.filter((c) => c.kind === "lint")).toHaveLength(5)
-  })
-})
-
-describe("bootstrap of a fresh worktree", () => {
-  test("flutter needs pub get until packages are resolved; fvm is honoured; node installs when node_modules is missing", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "fixora-bootstrap-"))
-    try {
-      await writeFile(join(dir, "pubspec.yaml"), "name: app\ndependencies:\n  flutter:\n    sdk: flutter\n")
-      await writeFile(join(dir, ".fvmrc"), '{"flutter":"3.24.0"}')
-      await mkdir(join(dir, "web"), { recursive: true })
-      await writeFile(join(dir, "web", "package.json"), JSON.stringify({ name: "web", scripts: { test: "vitest run" }, devDependencies: { vitest: "^2" } }))
-      await writeFile(join(dir, "web", "pnpm-lock.yaml"), "")
-      const eco = await detectEcosystems(dir)
-      const flutter = eco.find((e) => e.id === "flutter")!
-      expect(flutter.bootstrap.map((c) => c.command)).toEqual(["fvm flutter pub get"])
-      expect(flutter.checks.map((c) => c.command)).toEqual(["fvm flutter analyze", "fvm flutter test"])
-      const node = eco.find((e) => e.id === "node")!
-      expect(node.bootstrap.map((c) => c.command)).toEqual(["pnpm install --frozen-lockfile"])
-      const plan = buildCheckPlan({ ecosystems: eco, overrides: { timeoutSec: 600, fullSuiteMaxMinutes: 15 }, changedPaths: ["lib/main.dart"], scope: "mapped", timeoutMs: 600000, fullSuiteMaxMinutes: 15 })
-      expect(plan.map((c) => `${c.kind}:${c.command}`)).toEqual(["setup:fvm flutter pub get", "lint:fvm flutter analyze", "unit:fvm flutter test"])
-      expect(plan[0]!.timeoutMs).toBeGreaterThanOrEqual(15 * 60_000)
-      await mkdir(join(dir, ".dart_tool"), { recursive: true })
-      await writeFile(join(dir, ".dart_tool", "package_config.json"), "{}")
-      expect((await detectEcosystems(dir)).find((e) => e.id === "flutter")!.bootstrap).toEqual([])
-    } finally {
-      await rm(dir, { recursive: true, force: true })
-    }
   })
 })

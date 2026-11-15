@@ -10,6 +10,9 @@ import type { ApprovalKind, RunRecord } from "./types.js"
 export type Decision = "auto" | "ask" | "skip"
 
 export function decideApproval(kind: ApprovalKind, run: RunRecord, opts: FixoraOptions, o: { serviceAvailable: boolean }): { decision: Decision; reason: string } {
+  // Stashing the user's changes and deleting branches are never skipped: they are asked unless auto mode is on.
+  if (kind === "stash") return run.flags.auto || opts.approvals === "auto" ? { decision: "auto", reason: "auto mode" } : { decision: "ask", reason: "uncommitted changes in the checkout" }
+  if (kind === "delete-branch") return { decision: "ask", reason: "remote branch deletion" }
   if (run.flags.dryRun) return { decision: "skip", reason: "dry run" }
   if (kind === "ticket" && !run.flags.ticket) return { decision: "skip", reason: "--no-ticket" }
   if ((kind === "push" || kind === "publish") && !run.flags.push) return { decision: "skip", reason: "--no-push" }

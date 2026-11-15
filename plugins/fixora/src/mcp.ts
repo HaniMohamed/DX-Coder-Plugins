@@ -1,10 +1,9 @@
-// Detects crash sources, Jira and forge MCP servers from the tools the host registered, and calls
-// their tools directly from plugin code. Namespaces are discovered, never hard-coded.
+// Detects crash sources, Jira and forge MCP servers from the tools the host registered (read-only:
+// the plugin lists tools, it never executes them). Namespaces are discovered, never hard-coded.
 
 import type { Plugin } from "@opencode/plugin"
 import yaml from "js-yaml"
 import type { DetectedService, ServiceId, Services } from "./types.js"
-import { describeError } from "./errors.js"
 
 const loadYaml = (text: string): unknown => ((yaml as { safeLoad?: typeof yaml.load }).safeLoad ?? yaml.load)(text, { json: true })
 
@@ -91,6 +90,9 @@ const ANCHOR: Record<ServiceId, string[]> = {
   github: ["createPr"],
 }
 
+/** Capabilities that change state on the remote service (need an explicit grant in the worker). */
+export const WRITE_CAPABILITIES = new Set(["updateIssue", "createNote", "createIssue", "addComment", "transition", "createMr", "updateMr", "createPr", "updatePr"])
+
 function namespaceFor(toolId: string, probe: RegExp): string {
   const m = probe.exec(toolId)
   if (!m) return ""
@@ -149,59 +151,35 @@ export async function detectServices(ctx: Plugin.Context): Promise<Services> {
 
 export const connected = (s: DetectedService | undefined): s is DetectedService => !!s && s.status === "connected"
 
-// ---------- direct tool calls ----------
-
-/** Pending plugin-originated calls: `<sessionID>:<toolId>`. The permission hook auto-allows these. */
-export const pendingCalls = new Set<string>()
-export const pendingKey = (sessionID: string, toolId: string) => `${sessionID}:${toolId}`
-
-/** Pure: allow a permission evaluation when it is a plugin-originated call registered in `pending`. */
-export function decideAutoAllow(event: { sessionID: string; action: string }, pending: Set<string>): "allow" | undefined {
-  return pending.has(pendingKey(event.sessionID, event.action)) ? "allow" : undefined
+export interface ToolSchema {
+  description?: string
+  props: Record<string, unknown>
+  required: string[]
 }
 
-export class ToolCallError extends Error {
-  constructor(
-    readonly toolId: string,
-    message: string,
-  ) {
-    super(`${toolId}: ${message}`)
-    this.name = "ToolCallError"
-  }
+/** Declared input schemas of every host tool, from the (read-only) tool list. */
+export async function toolSchemas(ctx: Plugin.Context): Promise<Map<string, ToolSchema>> {
+  const out = new Map<string, ToolSchema>()
+  const tools = (await ctx.tool.list()) as unknown as Array<{ id: string; description?: string; input?: { properties?: Record<string, unknown>; required?: string[] } }>
+  for (const t of tools) out.set(t.id, { description: t.description, props: t.input?.properties ?? {}, required: t.input?.required ?? [] })
+  return out
 }
 
-const rand = () => Math.random().toString(36).slice(2, 10)
+/** Which service a tool id belongs to, by namespace prefix, plus the capability name when known. */
+export function classifyTool(toolId: string, services: Services): { service: DetectedService; capability?: string } | undefined {
+  const matches = Object.values(services).filter((s): s is DetectedService => !!s && (s.namespace ? toolId === s.namespace || toolId.startsWith(`${s.namespace}_`) : false))
+  const service = matches.sort((a, b) => b.namespace.length - a.namespace.length)[0]
+  if (!service) return undefined
+  const capability = Object.entries(service.capabilities).find(([, id]) => id === toolId)?.[0]
+  return { service, capability }
+}
 
-/**
- * Calls a host-registered tool (usually an MCP tool) from plugin code. The host asserts the
- * `<ns>_<tool>` permission for `sessionID`; `pendingCalls` lets the plugin's own evaluate hook allow it.
- * Returns the structured output when present, else parsed JSON text, else the raw text.
- */
-export async function callTool(ctx: Plugin.Context, toolId: string, input: Record<string, unknown>, o: { sessionID: string; agent?: string; signal?: AbortSignal; timeoutMs?: number }): Promise<unknown> {
-  const tools = await ctx.tool.list()
-  const tool = tools.find((t) => t.id === toolId)
-  if (!tool) throw new ToolCallError(toolId, "tool not found (is the MCP server connected?)")
-  const key = pendingKey(o.sessionID, toolId)
-  pendingCalls.add(key)
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), o.timeoutMs ?? 90_000)
-  o.signal?.addEventListener("abort", () => controller.abort(), { once: true })
-  try {
-    const result = await tool.execute(input as never, {
-      sessionID: o.sessionID as never,
-      agent: (o.agent ?? "build") as never,
-      messageID: `fixora-${rand()}` as never,
-      id: `fixora-${rand()}` as never,
-      signal: controller.signal,
-      progress: async () => {},
-    })
-    return normalizeToolOutput(result)
-  } catch (error) {
-    throw new ToolCallError(toolId, describeError(error))
-  } finally {
-    clearTimeout(timer)
-    pendingCalls.delete(key)
-  }
+/** Does a tool (by capability name or id) change remote state? Unknown ids are judged by their name. */
+export function isWriteTool(toolId: string, capability?: string): boolean {
+  if (capability) return WRITE_CAPABILITIES.has(capability)
+  const name = toolId.toLowerCase()
+  if (/(^|_)(get|search|list|find|read|fetch|describe|batch_get)(_|$)/.test(name)) return false
+  return /(create|update|delete|remove|add|set|transition|note|resolve|assign|merge|close|approve|comment|post|put|patch)/.test(name)
 }
 
 export function normalizeToolOutput(result: unknown): unknown {
@@ -265,11 +243,8 @@ function deepParse(value: unknown, depth: number, key?: string): unknown {
  * Which spelling a tool's input schema uses: firebase-tools ≥ 15 declares `appId` / `issueId` /
  * `pageSize`, older releases `app_id` / `issue_id` / `page_size`. Unknown schema → camelCase.
  */
-/** A tool's declared input properties (JSON schema), empty when unknown. */
-export async function toolInputProps(ctx: Plugin.Context, toolId: string): Promise<Record<string, unknown>> {
-  const tools = await ctx.tool.list()
-  const tool = tools.find((t) => t.id === toolId) as { input?: { properties?: Record<string, unknown> } } | undefined
-  return tool?.input?.properties ?? {}
+export function paramStyleOf(props: Record<string, unknown>): "camel" | "snake" {
+  return Object.keys(props).some((k) => /^(app_id|issue_id|page_size)$/.test(k)) ? "snake" : "camel"
 }
 
 /**
@@ -303,12 +278,6 @@ export function renderToolSchema(toolId: string, tool: { description?: string; i
   }
   if (Object.keys(props).length === 0) L.push("| (no properties declared) | | | |")
   return L.join("\n")
-}
-
-export async function paramStyle(ctx: Plugin.Context, toolId: string): Promise<"camel" | "snake"> {
-  const keys = Object.keys(await toolInputProps(ctx, toolId))
-  if (keys.some((k) => /^(app_id|issue_id|page_size)$/.test(k))) return "snake"
-  return "camel"
 }
 
 function tryJson(text: string): unknown {
@@ -346,7 +315,7 @@ export const INSTALL_SOURCES = `Fixora needs at least one crash source. None is 
 3. No MCP at all: save the stack trace to a file and run  /fixora paste <file>
 
 Jira (mcp-atlassian) and GitLab / GitHub MCP servers are optional: without them Fixora skips the ticket and
-falls back to the glab / gh CLI or a compare URL for the merge request.`
+the agent falls back to the glab / gh CLI or a compare URL for the merge request.`
 
 export const notConnectedInstructions = (s: DetectedService) =>
   `The ${s.id} MCP server "${s.serverName}" is configured but its status is "${s.status}". Connect it from /mcps (check its command/URL and credentials), then re-run /fixora.`
@@ -357,7 +326,7 @@ export const notConnectedInstructions = (s: DetectedService) =>
  * exposed" (e.g. the Firebase MCP server hides its crashlytics_* tools unless started with
  * `--only crashlytics` or inside a folder with a Crashlytics app), or a naming mismatch.
  */
-export function renderDoctor(o: { servers: ServerInfo[]; toolIds: string[]; services: Services; options: { sources: string[]; crashlytics: { appIds: string[] }; jira: { project?: string; parent?: string; issueType: string } }; all?: boolean }): string {
+export function renderDoctor(o: { servers: ServerInfo[]; toolIds: string[]; services: Services; options: { sources: string[]; crashlytics: { appIds: string[] }; jira: { project?: string; parent?: string; issueType: string } }; all?: boolean; warnings?: string[] }): string {
   const L: string[] = ["## Fixora doctor", ""]
   L.push("### MCP servers", "")
   if (o.servers.length === 0) L.push("- none configured (`opencode.jsonc` → `mcp.servers`)")
@@ -379,9 +348,11 @@ export function renderDoctor(o: { servers: ServerInfo[]; toolIds: string[]; serv
     L.push(`- ${id}: server "${s.serverName}" (${s.status}) — ${Object.entries(s.capabilities).map(([k, v]) => `${k}→\`${v}\``).join(", ")}`)
   }
   L.push("", "### Options", "", `- sources: ${o.options.sources.join(", ") || "none"}`, `- crashlytics.appIds: ${o.options.crashlytics.appIds.join(", ") || "none"}`, `- jira: ${o.options.jira.project ? `${o.options.jira.project} / ${o.options.jira.issueType}${o.options.jira.parent ? ` under ${o.options.jira.parent}` : ""}` : "no project (tickets off)"}`)
+  if (o.warnings?.length) L.push("", "### Ignored legacy options", "", ...o.warnings.map((w) => `- ${w}`))
   const fb = o.servers.find((s) => /firebase/i.test(s.name))
   if (fb && statusOf(fb) === "connected" && !o.services.crashlytics) {
     L.push("", "### Likely fix", "", `The Firebase MCP server "${fb.name}" is connected but exposes no \`crashlytics_*\` tools. firebase-tools only enables the Crashlytics feature group when it finds a Flutter / Android / iOS app with the Crashlytics SDK in its working directory, or when started with \`--only crashlytics\`. Change its command to:`, "", "```jsonc", `"${fb.name}": { "type": "local", "command": ["npx", "-y", "firebase-tools@latest", "mcp", "--only", "crashlytics"] }`, "```", "", "then reconnect it from /mcps and run `/fixora doctor` again. Make sure `firebase login` was done for the account that can see the project.")
   }
+  L.push("", "_Fixora runs nothing itself: every git command, check and MCP call is made by the coding agent inside the session's checkout._")
   return L.join("\n")
 }

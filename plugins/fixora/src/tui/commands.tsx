@@ -121,7 +121,7 @@ export async function pickCrash(fx: Fixora, rpc: ReturnType<Fixora["context"]["c
     return
   }
   if (picked.kind !== "crash") return
-  const ok = await fx.context.ui.dialog.confirm({ title: "Fixora", message: `Fix "${truncate(picked.title, 80)}" on the base branch? A worktree, a fix, checks, a review and (after your approval) a push and a draft MR will follow.`, label: { confirm: "Start", cancel: "Not now" } })
+  const ok = await fx.context.ui.dialog.confirm({ title: "Fixora", message: `Fix "${truncate(picked.title, 80)}"? The agent creates a fixora/ branch in this checkout, fixes and tests it, a second session reviews it, and after your approval it pushes and opens a draft MR. Your branch and local changes are restored afterwards.`, label: { confirm: "Start", cancel: "Not now" } })
   if (!ok) return
   await startRuns(fx, rpc, sessionID, [picked.ref])
 }

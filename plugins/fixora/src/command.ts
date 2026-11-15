@@ -15,7 +15,6 @@ export interface Flags {
   testFirst?: boolean
   base?: string
   model?: string
-  review?: "quick" | "session"
   tests?: "full" | "mapped" | "skip"
 }
 
@@ -33,6 +32,7 @@ export type Parsed =
   | { verb: "report"; days: number }
   | { verb: "clean"; runId: string; remote: boolean }
   | { verb: "sync" }
+  | { verb: "reset"; files: boolean }
   | { verb: "doctor"; all: boolean; probe: boolean; tool?: string }
   | { verb: "help" }
 
@@ -48,16 +48,17 @@ export const USAGE = [
   `  /${COMMAND} top [N]                           fix the top N new crashes (default 1)`,
   `  /${COMMAND} batch [--top N] [--min-users N] [--source s] [--minutes M]`,
   `  /${COMMAND} status [<runId>]                  runs table or one run's detail`,
-  `  /${COMMAND} retry <runId> [--from <step>] [--fresh]`,
+  `  /${COMMAND} retry <runId> [--from <step>] [--fresh]   resume a stopped run; --fresh forgets the worker sessions and redoes prepare`,
   `  /${COMMAND} feedback <runId> "<message>"      ask for a change or a question on the fix (same branch, MR updated)`,
   `  /${COMMAND} restart <runId>                   close the MR and start a fresh fix cycle`,
   `  /${COMMAND} fixed <runId> --release <X> [--platform android|ios|web]`,
   `  /${COMMAND} report [--days 30]                funnel, timings, MR status, reopen rate`,
-  `  /${COMMAND} clean <runId> [--remote]          remove the worktree (and the remote branch)`,
+  `  /${COMMAND} clean <runId> [--remote]          restore the checkout, delete the local branch (and, after approval, the remote branch)`,
   `  /${COMMAND} sync                              refresh MR statuses`,
+  `  /${COMMAND} reset [--files]                   forget every run, crash and cache record (after approval); --files also deletes <repo>/.dxcoder/fixora`,
   `  /${COMMAND} doctor [--all] [--probe] [--tool <id>]  MCP servers / tools Fixora detects; --probe calls the crash source; --tool prints a tool's input schema`,
-  "Flags: --dry-run --no-ticket --no-mr --no-push --auto --force --force-triage --test-first --base <branch>",
-  "       --model <providerID/modelID> --review quick|session --tests full|mapped|skip",
+  "Flags: --dry-run --no-ticket --no-mr --no-push --auto --force --test-first --base <branch>",
+  "       --model <providerID/modelID> --tests full|mapped|skip",
 ].join("\n")
 
 interface Tokens {
@@ -65,7 +66,7 @@ interface Tokens {
   flags: Map<string, string | true>
 }
 
-const VALUE_FLAGS = new Set(["from", "base", "model", "review", "tests", "title", "platform", "language", "top", "min-users", "source", "minutes", "release", "days"])
+const VALUE_FLAGS = new Set(["from", "base", "model", "tests", "title", "platform", "language", "top", "min-users", "source", "minutes", "release", "days"])
 
 /** Splits on whitespace, honouring double-quoted strings, `--key value` and `--key=value`. */
 export function tokenize(text: string): Tokens {
@@ -118,8 +119,6 @@ function readFlags(t: Tokens): { flags: Flags; errors: string[] } {
     const v = t.flags.get(k)
     return typeof v === "string" ? v : undefined
   }
-  const review = s("review")
-  if (review && review !== "quick" && review !== "session") errors.push("--review must be quick or session")
   const tests = s("tests")
   if (tests && !["full", "mapped", "skip"].includes(tests)) errors.push("--tests must be full, mapped or skip")
   const model = s("model")
@@ -136,7 +135,6 @@ function readFlags(t: Tokens): { flags: Flags; errors: string[] } {
       testFirst: t.flags.has("test-first") ? true : undefined,
       base: s("base"),
       model,
-      review: review as Flags["review"],
       tests: tests as Flags["tests"],
     },
     errors,
@@ -248,6 +246,8 @@ export function parseCommand(text: string): ParseResult {
     }
     case "sync":
       return { verb: "sync" }
+    case "reset":
+      return { verb: "reset", files: t.flags.has("files") }
     case "doctor":
       return { verb: "doctor", all: t.flags.has("all"), probe: t.flags.has("probe"), tool: typeof t.flags.get("tool") === "string" ? (t.flags.get("tool") as string) : undefined }
     default:

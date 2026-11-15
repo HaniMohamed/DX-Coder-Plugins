@@ -547,7 +547,7 @@ export function GateDialog(props: { fx: Fixora; gate: GateView }) {
   const [full, setFull] = createSignal(false)
   const run = () => fx.state.runs[props.gate.runId]
   const body = () => (p().mrBody ?? "").split("\n")
-  const title = () => (props.gate.kind === "ticket" ? "Create Jira ticket" : props.gate.kind === "mr" ? "Open merge request" : props.gate.kind === "push" ? "Push branch" : "Publish fix")
+  const title = () => (props.gate.kind === "ticket" ? "Create Jira ticket" : props.gate.kind === "mr" ? "Open merge request" : props.gate.kind === "push" ? "Push branch" : props.gate.kind === "stash" ? "Stash local changes" : props.gate.kind === "delete-branch" ? "Delete remote branch" : "Publish fix")
 
   fx.context.keymap.layer(() => ({
     mode: "global",
@@ -654,7 +654,7 @@ export function GateDialog(props: { fx: Fixora; gate: GateView }) {
           </box>
         </scrollbox>
       </Show>
-      <Keys fx={fx} items={[["a", props.gate.kind === "ticket" ? "create ticket" : "approve"], ["r", "reject with feedback"], ...(p().mrBody ? [["v", "full MR body"] as [string, string]] : []), ["esc", "decide later"]]} />
+      <Keys fx={fx} items={[["a", props.gate.kind === "ticket" ? "create ticket" : props.gate.kind === "stash" ? "stash and continue" : "approve"], ["r", "reject with feedback"], ...(p().mrBody ? [["v", "full MR body"] as [string, string]] : []), ["esc", "decide later"]]} />
     </box>
   )
 }

@@ -1,12 +1,12 @@
-// Sentry through its MCP server (official remote server or compatible). Tool outputs vary between
-// server versions (structured JSON vs markdown), so the mapper accepts both.
+// Sentry through its MCP server (official remote server or compatible). The worker session makes
+// the calls this module plans; tool outputs vary between server versions (structured JSON vs
+// markdown), so the mapper accepts both.
 
 import { fingerprintOf } from "../fingerprint.js"
-import { callTool } from "../mcp.js"
 import { sanitizeExtra, sanitizeText, stripControl, symbolicationCheck } from "../normalize.js"
 import { parseStackTrace, type Hints } from "../stacktrace/index.js"
 import type { Crash, CrashSummary, Frame, Language } from "../types.js"
-import { SourceError, type CrashSource, type SourceContext } from "./types.js"
+import { SourceError, type CrashSource, type CrashSubmission, type FetchPlan, type ListResult, type SourceContext, type ToolCall } from "./types.js"
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v)
 const str = (v: unknown) => (typeof v === "string" ? v : typeof v === "number" ? String(v) : undefined)
@@ -215,37 +215,35 @@ export const sentry: CrashSource = {
     if (url && /sentry/i.test(input)) return { id: url[3]!, extra: { org: url[2] ?? url[1]!.split(".")[0]! } }
     return undefined
   },
-  async list(sc, q) {
-    const s = sc.services.sentry!
-    const tool = s.capabilities.searchIssues
+  listPlan(sc, q): ToolCall[] {
+    const tool = sc.services.sentry?.capabilities.searchIssues
     if (!tool) return []
-    const raw = await callTool(sc.ctx, tool, withOrg(sc, { naturalLanguageQuery: `unresolved errors with the most affected users in the last 14 days, top ${q.top}`, query: "is:unresolved level:error", sortBy: "users", limit: q.top }), { sessionID: sc.sessionID, signal: sc.signal })
-    return mapSentryList(raw).filter((c) => (q.minUsers ?? 0) === 0 || (c.userCount ?? 0) >= (q.minUsers ?? 0)).slice(0, q.top)
+    return [{ toolId: tool, namespace: sc.services.sentry?.namespace, input: withOrg(sc, { naturalLanguageQuery: `unresolved errors with the most affected users in the last 14 days, top ${q.top}`, query: "is:unresolved level:error", sortBy: "users", limit: q.top }), label: "sentry" }]
   },
-  async get(sc, id, extra) {
-    const s = sc.services.sentry!
-    const tool = s.capabilities.getIssue
+  mapList(result: ListResult) {
+    return mapSentryList(result.raw)
+  },
+  fetchPlan(sc, id, extra): FetchPlan {
+    const s = sc.services.sentry
+    const tool = s?.capabilities.getIssue
     if (!tool) throw new SourceError("sentry", "the Sentry MCP server exposes no get_issue_details tool")
     const input = withOrg(sc, { issueId: id })
     if (extra?.org) input.organizationSlug = extra.org
-    const raw = await callTool(sc.ctx, tool, input, { sessionID: sc.sessionID, signal: sc.signal })
-    const crash = mapSentryIssue(raw, { id, hints: hintsOf(sc), organization: sc.options.sentry.organization })
-    if (crash.frames.length === 0 && s.capabilities.searchErrors) {
-      // Some server versions return only the issue summary; fetch a sample error event for the trace.
-      try {
-        const events = await callTool(sc.ctx, s.capabilities.searchErrors, withOrg(sc, { naturalLanguageQuery: `latest error event for issue ${id} with full stack trace`, query: `issue:${id}`, limit: 1 }), { sessionID: sc.sessionID, signal: sc.signal })
-        const sample = mapSentryIssue(events, { id, hints: hintsOf(sc) })
-        if (sample.frames.length > 0) return { ...crash, frames: sample.frames, rawStackTrace: sample.rawStackTrace, language: sample.language, fingerprint: sample.fingerprint, symbolication: sample.symbolication, exceptionType: crash.exceptionType ?? sample.exceptionType, message: crash.message ?? sample.message }
-      } catch {
-        // keep the summary-only crash; triage will classify it
-      }
+    const followUps: ToolCall[] = []
+    if (s?.capabilities.searchErrors) followUps.push({ toolId: s.capabilities.searchErrors, namespace: s.namespace, input: withOrg(sc, { naturalLanguageQuery: `latest error event for issue ${id} with full stack trace`, query: `issue:${id}`, limit: 1 }), note: "only when the issue reply carries no stack frames; submit its reply as `events`" })
+    return { primary: [{ toolId: tool, namespace: s?.namespace, input, label: "sentry" }], followUps, note: "Submit the issue reply verbatim as `issue` (object or text). If it has no stack frames, make the follow-up call and submit that reply as `events`." }
+  },
+  mapCrash(sub: CrashSubmission, sc, id) {
+    const crash = mapSentryIssue(sub.issue, { id, hints: hintsOf(sc), organization: sc.options.sentry.organization })
+    if (crash.frames.length === 0 && sub.events !== undefined) {
+      const sample = mapSentryIssue(sub.events, { id, hints: hintsOf(sc) })
+      if (sample.frames.length > 0) return { ...crash, frames: sample.frames, rawStackTrace: sample.rawStackTrace, language: sample.language, fingerprint: sample.fingerprint, symbolication: sample.symbolication, exceptionType: crash.exceptionType ?? sample.exceptionType, message: crash.message ?? sample.message }
     }
     return crash
   },
-  async annotate(sc, id, note) {
-    const s = sc.services.sentry!
-    const tool = s.capabilities.updateIssue
-    if (!tool) return
-    await callTool(sc.ctx, tool, withOrg(sc, { issueId: id, status: "unresolved", note: note.text }), { sessionID: sc.sessionID, signal: sc.signal })
+  annotatePlan(sc, id, note) {
+    const tool = sc.services.sentry?.capabilities.updateIssue
+    if (!tool) return undefined
+    return { toolId: tool, namespace: sc.services.sentry?.namespace, input: withOrg(sc, { issueId: id, status: "unresolved", note: note.text }), label: "sentry" }
   },
 }

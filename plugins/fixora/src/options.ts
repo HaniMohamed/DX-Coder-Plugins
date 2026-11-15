@@ -20,9 +20,9 @@ export interface FixoraOptions {
     agent: string
     model?: ModelRef
     shell: Effect3
-    maxPhaseMinutes: { triage: number; fix: number; review: number }
+    maxPhaseMinutes: { crash: number; prepare: number; triage: number; fix: number; review: number; publish: number; restore: number; list: number }
   }
-  review: { mode: "session" | "quick"; model?: ModelRef }
+  review: { model?: ModelRef }
   testCommands: {
     unit?: string
     integration?: string
@@ -45,11 +45,6 @@ export interface FixoraOptions {
     ticketOnSkip: boolean
     /** Parent issue key (e.g. "DE-62556"); required when issueType is a sub-task. */
     parent?: string
-    url?: string
-    token?: string
-    username?: string
-    password?: string
-    sslVerify?: boolean
   }
   mr: { draft: boolean; labels: string[]; reviewers: string[]; target?: string; forge?: "gitlab" | "github" }
   sourceWriteBack: boolean
@@ -58,7 +53,8 @@ export interface FixoraOptions {
   sentry: { organization?: string; project?: string }
   inAppPackages: string[]
   appPackage?: string
-  worktree: { root?: string; keep: "until-merged" | "always" | "never" }
+  /** How long a crash list fetched by the lister session stays valid for the picker. */
+  crashes: { cacheMinutes: number }
   batch: { top: number; minUsers: number; maxMinutes: number }
   signoff: boolean
   allowSecretPatterns: string[]
@@ -70,8 +66,8 @@ export const DEFAULTS: FixoraOptions = {
   baseBranch: "main",
   remote: "origin",
   branchPrefix: "fixora/",
-  worker: { agent: "build", shell: "allow", maxPhaseMinutes: { triage: 10, fix: 20, review: 10 } },
-  review: { mode: "session" },
+  worker: { agent: "build", shell: "allow", maxPhaseMinutes: { crash: 5, prepare: 10, triage: 10, fix: 20, review: 10, publish: 10, restore: 5, list: 5 } },
+  review: {},
   testCommands: { timeoutSec: 600, fullSuiteMaxMinutes: 15 },
   validate: { denyPaths: [], maxFilesChanged: 10, maxDiffLines: 400, requireTestChange: true },
   maxFixRounds: 3,
@@ -85,7 +81,7 @@ export const DEFAULTS: FixoraOptions = {
   crashlytics: { appIds: [] },
   sentry: {},
   inAppPackages: [],
-  worktree: { keep: "until-merged" },
+  crashes: { cacheMinutes: 5 },
   batch: { top: 5, minUsers: 5, maxMinutes: 90 },
   signoff: false,
   allowSecretPatterns: [],
@@ -205,12 +201,17 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
       model: r.model("worker.model"),
       shell: r.oneOf("worker.shell", ["allow", "deny", "ask"] as const, d.worker.shell),
       maxPhaseMinutes: {
+        crash: r.num("worker.maxPhaseMinutes.crash", d.worker.maxPhaseMinutes.crash, { min: 1 }),
+        prepare: r.num("worker.maxPhaseMinutes.prepare", d.worker.maxPhaseMinutes.prepare, { min: 1 }),
         triage: r.num("worker.maxPhaseMinutes.triage", d.worker.maxPhaseMinutes.triage, { min: 1 }),
         fix: r.num("worker.maxPhaseMinutes.fix", d.worker.maxPhaseMinutes.fix, { min: 1 }),
         review: r.num("worker.maxPhaseMinutes.review", d.worker.maxPhaseMinutes.review, { min: 1 }),
+        publish: r.num("worker.maxPhaseMinutes.publish", d.worker.maxPhaseMinutes.publish, { min: 1 }),
+        restore: r.num("worker.maxPhaseMinutes.restore", d.worker.maxPhaseMinutes.restore, { min: 1 }),
+        list: r.num("worker.maxPhaseMinutes.list", d.worker.maxPhaseMinutes.list, { min: 1 }),
       },
     },
-    review: { mode: r.oneOf("review.mode", ["session", "quick"] as const, d.review.mode), model: r.model("review.model") },
+    review: { model: r.model("review.model") },
     testCommands: {
       unit: r.command("testCommands.unit"),
       integration: r.command("testCommands.integration"),
@@ -244,11 +245,6 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
       })(),
       ticketOnSkip: r.bool("jira.ticketOnSkip", d.jira.ticketOnSkip),
       parent: r.str("jira.parent"),
-      url: r.str("jira.url"),
-      token: r.str("jira.token"),
-      username: r.str("jira.username"),
-      password: r.str("jira.password"),
-      sslVerify: r.present("jira.sslVerify") ? r.bool("jira.sslVerify", true) : undefined,
     },
     mr: {
       draft: r.bool("mr.draft", d.mr.draft),
@@ -262,7 +258,7 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
     sentry: { organization: r.str("sentry.organization"), project: r.str("sentry.project") },
     inAppPackages: r.strs("inAppPackages", d.inAppPackages),
     appPackage: r.str("appPackage"),
-    worktree: { root: r.str("worktree.root"), keep: r.oneOf("worktree.keep", ["until-merged", "always", "never"] as const, d.worktree.keep) },
+    crashes: { cacheMinutes: r.num("crashes.cacheMinutes", d.crashes.cacheMinutes, { min: 0 }) },
     batch: {
       top: r.num("batch.top", d.batch.top, { min: 1, int: true }),
       minUsers: r.num("batch.minUsers", d.batch.minUsers, { min: 0, int: true }),
@@ -283,6 +279,24 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
   if (value.jira.parent && !JIRA_KEY.test(value.jira.parent)) r.errors.push(`jira.parent must be an issue key like "DE-62556" (got ${JSON.stringify(value.jira.parent)})`)
   if (/sub-?task/i.test(value.jira.issueType) && !value.jira.parent) r.errors.push(`jira.issueType ${JSON.stringify(value.jira.issueType)} needs "jira": { "parent": "<story key>" }`)
   return r.errors.length > 0 ? { ok: false, errors: r.errors } : { ok: true, value }
+}
+
+/** Options earlier versions understood but this version ignores (the agent does that work now). */
+const LEGACY_OPTIONS: Array<[path: string, why: string]> = [
+  ["worktree", "runs happen in the checkout the session has open; no worktrees are created"],
+  ["review.mode", "the review is always an independent agent session"],
+  ["jira.url", "Jira is reached only through a Jira MCP server"],
+  ["jira.token", "Jira is reached only through a Jira MCP server"],
+  ["jira.username", "Jira is reached only through a Jira MCP server"],
+  ["jira.password", "Jira is reached only through a Jira MCP server"],
+  ["jira.sslVerify", "Jira is reached only through a Jira MCP server"],
+]
+
+/** Human-readable notes about legacy keys present in the raw options (shown by `/fixora doctor` and once per session). */
+export function legacyOptionWarnings(raw: unknown): string[] {
+  if (!isRecord(raw)) return []
+  const get = (path: string) => path.split(".").reduce<unknown>((acc, key) => (isRecord(acc) ? acc[key] : undefined), raw)
+  return LEGACY_OPTIONS.filter(([path]) => get(path) !== undefined).map(([path, why]) => `\`${path}\` is ignored: ${why}`)
 }
 
 export const JIRA_KEY = /^[A-Z][A-Z0-9_]*-\d+$/

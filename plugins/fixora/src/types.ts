@@ -97,7 +97,7 @@ export interface FixReport {
   rationale: string
   alternativesRejected: Array<{ strategy: string; reason: string }>
   testsAdded: Array<{ file: string; name: string; kind: "regression" | "unit" | "integration" }>
-  commandsRun: Array<{ command: string; exitCode: number; durationMs: number; summary: string }>
+  commandsRun: Array<{ command: string; exitCode: number; durationMs: number; summary: string; kind?: CheckKind; cwd?: string; outputTail?: string }>
   reproduction?: { mode: "test-first" | "fix"; failingBefore?: boolean; passingAfter?: boolean }
   risk: { level: RiskLevel; publicApiChange: boolean; behaviourChange: string; rollback: string }
   notesForReviewer?: string
@@ -131,11 +131,12 @@ export interface ReviewVerdict {
 
 export type CheckKind = "setup" | "syntax" | "lint" | "typecheck" | "unit" | "integration" | "build"
 
+/** A check the worker runs (reported by the prepare phase, merged with option overrides). */
 export interface CheckCommand {
   kind: CheckKind
   command: string
+  /** Repo-relative directory ("" = root). */
   cwd?: string
-  timeoutMs: number
   optional?: boolean
 }
 
@@ -159,12 +160,12 @@ export interface TestReport {
   preExisting?: string[]
 }
 
-export const STEPS = ["detect", "fetch", "map", "branch", "analyse", "ticket", "fix", "validate", "review", "commit", "push", "mr", "close-loop", "done"] as const
+export const STEPS = ["detect", "fetch", "prepare", "analyse", "ticket", "fix", "validate", "review", "publish", "close-loop", "restore", "done"] as const
 export type Step = (typeof STEPS)[number]
 
 export type RunStatus = "running" | "awaiting-approval" | "failed" | "rejected" | "skipped" | "blocked" | "review-exhausted" | "timeout" | "done" | "cancelled"
-export type BlockedReason = "secret" | "limits" | "dirty-worktree" | "forbidden-path"
-export type ApprovalKind = "ticket" | "publish" | "push" | "mr"
+export type BlockedReason = "secret" | "limits" | "dirty-worktree" | "forbidden-path" | "not-a-repo" | "base-missing"
+export type ApprovalKind = "ticket" | "publish" | "push" | "mr" | "stash" | "delete-branch"
 export type ApprovalOutcome = "approved" | "auto" | "rejected" | "skipped"
 
 export interface StepTiming {
@@ -185,6 +186,32 @@ export interface RunFlags {
   testFirst: boolean
 }
 
+/** What the prepare phase reported about the checkout the run works in; restored on every exit path. */
+export interface CheckoutState {
+  /** True while the run's branch is checked out in the user's repository (restore pending). */
+  active: boolean
+  previousBranch?: string
+  previousHeadSha?: string
+  /** Commit id of the stash entry holding the user's uncommitted changes, when any were stashed. */
+  stashRef?: string
+  preparedAt?: string
+  restoredAt?: string
+}
+
+export interface Toolchain {
+  ecosystems: Array<{ id: string; root: string }>
+  checks: CheckCommand[]
+  conventionFiles: string[]
+}
+
+/** The last accepted change set, derived from the status + diff the worker reported. */
+export interface ChangeRecord {
+  paths: string[]
+  added: number
+  deleted: number
+  diffHash: string
+}
+
 export interface RunRecord {
   version: 1
   runId: string
@@ -193,10 +220,10 @@ export interface RunRecord {
   fingerprint: string
   title: string
   originSessionID: string
-  /** Repository root the run works in (the originating session's project, not the plugin's location). */
+  /** Directory the originating session works in (the user's checkout); every worker runs there. */
   repo: string
-  /** Host project id of that repository, used for worktree calls. */
-  projectID?: string
+  /** Git top level of that directory as reported by the prepare phase. */
+  gitRoot?: string
   createdAt: string
   updatedAt: string
   step: Step
@@ -205,9 +232,11 @@ export interface RunRecord {
   blockedReason?: BlockedReason
   skipReason?: string
   flags: RunFlags
-  base: { remote: string; branch: string; sha?: string }
+  base: { remote: string; branch: string; sha?: string; remoteUrl?: string | null }
   branch?: string
-  worktree?: string
+  checkout: CheckoutState
+  toolchain?: Toolchain
+  change?: ChangeRecord
   sessions: { fixer?: string; reviewer?: string }
   jiraKey?: string
   jiraUrl?: string
@@ -251,13 +280,35 @@ export interface CrashIndexEntry {
   ignoreUntil?: string
 }
 
+export type WorkerRole = "fixer" | "reviewer" | "lister"
+export type WorkerPhase = "crashes" | "crash" | "prepare" | "triage" | "ticket" | "fix" | "feedback" | "review" | "publish" | "close-loop" | "restore" | "sync" | "clean"
+
+/** What a worker session may do right now; the plugin tools and the tool hook read this record on every call. */
+export interface WorkerGrants {
+  commit?: boolean
+  push?: boolean
+  mr?: boolean
+  closeMr?: boolean
+  jiraWrite?: boolean
+  sourceWrite?: boolean
+  deleteBranch?: boolean
+}
+
 export interface WorkerInfo {
-  runId: string
-  role: "fixer" | "reviewer"
-  worktree: string
-  phase: "triage" | "fix" | "review" | "feedback"
-  /** The original checkout; paths pointing into it are remapped onto the worktree by the tool hook. */
-  repo?: string
+  /** Absent for the lister. */
+  runId?: string
+  /** Lister: key of the pending crash list request. */
+  requestId?: string
+  role: WorkerRole
+  /** Confinement root: the repository the session works in. */
+  repo: string
+  /** The run folder (`<repo>/.dxcoder/fixora/<runId>`), writable in every phase for analysis / plan notes. */
+  folder?: string
+  phase: WorkerPhase
+  grants?: WorkerGrants
+  baseBranch?: string
+  /** The only branch the worker may push or delete. */
+  branch?: string
 }
 
 export type ServiceId = "sentry" | "crashlytics" | "jira" | "gitlab" | "github"
@@ -274,12 +325,5 @@ export interface DetectedService {
 }
 
 export type Services = Partial<Record<ServiceId, DetectedService>>
-
-export interface MappedFrame {
-  frame: Frame
-  index: number
-  candidates: Array<{ path: string; score: number; reason: string }>
-  external: boolean
-}
 
 export type Validation<T> = { ok: true; value: T } | { ok: false; errors: string[] }

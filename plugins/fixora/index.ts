@@ -3,22 +3,20 @@ import matter from "gray-matter"
 import { readFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import { COMMAND, parseCommand, USAGE, type Flags } from "./src/command.js"
-import { prepareRun, presentList, refreshServices, runClean, runFeedback, runFix, runFixed, runList, runPaste, runReport, runRestart, runRetry, runStatus, runSync, runTop, startPipeline, runDoctor } from "./src/flows.js"
+import { describeError } from "./src/errors.js"
+import { prepareRun, presentList, refreshServices, runClean, runDoctor, runFeedback, runFix, runFixed, runList, runPaste, runReport, runReset, runRestart, runRetry, runStatus, runSync, runTop, startPipeline, warnLegacyOnce } from "./src/flows.js"
 import { ackGate, decideGate } from "./src/gate.js"
-import { decideAutoAllow, pendingCalls } from "./src/mcp.js"
 import { DEFAULTS, readOptions, type FixoraOptions } from "./src/options.js"
-import { guardWorkerShell, guardWorkerWrite, PATH_TOOLS, remapToWorktree, SHELL_TOOLS, WRITE_TOOLS } from "./src/permissions.js"
+import { guardWorkerTool, SHELL_TOOLS, WRITE_TOOLS } from "./src/permissions.js"
 import { describeToolCall, FixoraStop, notify, progress, tell, type Runtime } from "./src/progress.js"
 import { FixoraRpc, prunedHandlers } from "./src/rpc.js"
 import { funnel, listCrashIndex, listRuns, loadRun, loadWorker } from "./src/state.js"
 import { registerPluginTools } from "./src/tools.js"
-import { detectEcosystems } from "./src/toolchain.js"
 import type { RunRecord } from "./src/types.js"
-import { describeError } from "./src/errors.js"
 
 export { parseCommand }
 
-const SKILLS = ["fixora-triage", "fixora-fix", "fixora-review"]
+const SKILLS = ["fixora-crashes", "fixora-prepare", "fixora-triage", "fixora-fix", "fixora-review", "fixora-publish", "fixora-ops"]
 
 const DEFAULT_FLAGS: Flags = { dryRun: false, ticket: true, mr: true, push: true, auto: false, force: false, forceTriage: false }
 
@@ -35,7 +33,6 @@ const summary = (r: RunRecord) => ({
   mrUrl: r.mrUrl,
   mrStatus: r.mrStatus,
   branch: r.branch,
-  worktree: r.worktree,
   originSessionID: r.originSessionID,
   fixerSessionID: r.sessions.fixer,
   createdAt: r.createdAt,
@@ -80,7 +77,7 @@ export default Plugin.define({
       })
     }
 
-    // RPC contract for a TUI (pass 2). Events are emitted from progress.ts through rt.emit.
+    // RPC contract for the TUI. Events are emitted from progress.ts through rt.emit.
     try {
       // Every reply is pruned of undefined keys: the host validates outputs in-process and rejects them.
       const register: typeof ctx.rpc.register = (definition, handlers) => ctx.rpc.register(definition, prunedHandlers(handlers as never) as never)
@@ -90,9 +87,10 @@ export default Plugin.define({
           return { sources: Object.values(rt.services).filter(Boolean).map((s) => ({ id: s!.id, status: s!.status, serverName: s!.serverName })) }
         },
         "crashes.list": async (input) => {
-          const i = input as { source?: string; top?: number; minUsers?: number; sessionID?: string }
+          const i = input as { source?: string; top?: number; minUsers?: number; sessionID?: string; refresh?: boolean }
           try {
-            const list = await runList(rt, { sessionID: i.sessionID ?? "", top: i.top, minUsers: i.minUsers, source: i.source as never })
+            rt.opts = readOpts()
+            const list = await runList(rt, { sessionID: i.sessionID ?? "", top: i.top, minUsers: i.minUsers, source: i.source as never, refresh: i.refresh })
             return { crashes: list.crashes, errors: list.errors }
           } catch (error) {
             return { crashes: [], errors: [describeError(error)] }
@@ -149,9 +147,9 @@ export default Plugin.define({
         },
         "run.cancel": async (input) => {
           const i = input as { runId: string }
-          const controller = rt.inflight.get(i.runId)
-          controller?.abort()
-          return { cancelled: !!controller }
+          const inflight = rt.inflight.get(i.runId)
+          inflight?.controller.abort()
+          return { cancelled: !!inflight }
         },
         "run.ack": async (input) => {
           const i = input as { runId: string; gateId: string }
@@ -190,24 +188,8 @@ export default Plugin.define({
     }
 
     // Plugin tools: structured submissions from workers + fixora_start for the interactive picker.
-    const ecosystemCache = new Map<string, Awaited<ReturnType<typeof detectEcosystems>>>()
     await registerPluginTools(ctx, {
-      options: () => rt.opts,
-      ecosystems: async (runId) => {
-        const cached = ecosystemCache.get(runId)
-        if (cached) return cached
-        const run = await loadRun(ctx, runId)
-        if (!run?.worktree) return []
-        const eco = await detectEcosystems(run.worktree)
-        ecosystemCache.set(runId, eco)
-        return eco
-      },
-      hasTestRunner: async (runId) => {
-        const run = await loadRun(ctx, runId)
-        if (!run?.worktree) return false
-        const eco = await detectEcosystems(run.worktree)
-        return eco.some((e) => e.checks.some((c) => c.kind === "unit"))
-      },
+      rt: () => rt,
       isWorkerSession: async (sessionID) => !!(await loadWorker(ctx, sessionID)),
       start: async ({ sessionID, refs, flags }) => {
         rt.opts = readOpts()
@@ -226,66 +208,49 @@ export default Plugin.define({
       },
     })
 
-    // Confine worker sessions: writes only inside their worktree (and only in the fix phase), no
-    // dangerous shell commands, nothing outside the worktree.
-    const workers = new Map<string, Awaited<ReturnType<typeof loadWorker>> | null>()
-    const workerOf = async (sessionID: string) => {
-      let w = workers.get(sessionID)
-      if (w === undefined) {
-        w = (await loadWorker(ctx, sessionID)) ?? null
-        workers.set(sessionID, w)
-      }
-      return w
-    }
+    // Confine worker sessions per phase: which files, git verbs, MCP tools and CLIs are allowed right now.
+    // The worker record is re-read on every call because phases and grants change between prompts.
     await ctx.tool.hook("execute.before", async (event) => {
-      if (!WRITE_TOOLS.has(event.tool) && !SHELL_TOOLS.has(event.tool) && !PATH_TOOLS.has(event.tool)) return
-      // Phase changes are frequent; re-read the worker record for writes so the triage phase stays read-only.
-      const w = WRITE_TOOLS.has(event.tool) ? ((await loadWorker(ctx, event.sessionID)) ?? null) : await workerOf(event.sessionID)
+      const w = await loadWorker(ctx, event.sessionID)
       if (!w) return
-      // Absolute paths into the original checkout (from local-build stack traces) are redirected to the worktree.
-      if (PATH_TOOLS.has(event.tool)) {
-        const remapped = remapToWorktree(event.input, { repo: w.repo, worktree: w.worktree })
-        if (remapped !== event.input) event.input = remapped
-      }
-      if (!WRITE_TOOLS.has(event.tool) && !SHELL_TOOLS.has(event.tool)) return
-      const problem = WRITE_TOOLS.has(event.tool)
-        ? guardWorkerWrite({ tool: event.tool, input: event.input, worktree: w.worktree, directory: w.worktree, phase: w.phase, extraDeny: rt.opts.validate.denyPaths })
-        : guardWorkerShell({ tool: event.tool, input: event.input, worktree: w.worktree, role: w.role })
+      const run = w.runId && (WRITE_TOOLS.has(event.tool) || SHELL_TOOLS.has(event.tool)) ? await loadRun(ctx, w.runId) : undefined
+      const problem = guardWorkerTool({ tool: event.tool, input: event.input, worker: w, services: rt.services, extraDeny: rt.opts.validate.denyPaths, checks: run?.toolchain?.checks })
       if (problem) throw new Error(problem)
     })
 
     // Live worker activity: every tool call a Fixora worker session makes becomes a progress line
-    // ("reading lib/cart/service.dart", "$ flutter test …") so long analyse/fix/review phases are not silent.
+    // ("reading lib/cart/service.dart", "$ flutter test …") so long phases are not silent.
     void (async () => {
       const lastAt = new Map<string, number>()
+      const workers = new Map<string, { runId?: string; role: string; at: number }>()
       try {
         for await (const event of await ctx.event.subscribe()) {
           const e = event as { type?: string; data?: { sessionID?: string; input?: Record<string, unknown> } }
           if (e.type !== "session.tool.called" || !e.data?.sessionID) continue
-          const w = await workerOf(e.data.sessionID)
-          if (!w) continue
+          let w = workers.get(e.data.sessionID)
+          if (!w || Date.now() - w.at > 30_000) {
+            const info = await loadWorker(ctx, e.data.sessionID)
+            if (!info) continue
+            w = { runId: info.runId, role: info.role, at: Date.now() }
+            workers.set(e.data.sessionID, w)
+          }
+          if (!w.runId) continue
           const now = Date.now()
           if (now - (lastAt.get(w.runId) ?? 0) < 700) continue
           lastAt.set(w.runId, now)
           const run = await loadRun(ctx, w.runId)
           if (!run || (run.status !== "running" && run.status !== "awaiting-approval")) continue
-          await progress(rt, run, `${w.role === "reviewer" ? "reviewer" : "worker"}: ${describeToolCall(e.data.input)}`, { quiet: true })
+          await progress(rt, run, `${w.role === "reviewer" ? "reviewer" : "agent"}: ${describeToolCall(e.data.input)}`, { quiet: true })
         }
       } catch {
         // event stream unavailable on this host: the panel still shows stage-level progress
       }
     })()
 
-    // Plugin-originated MCP calls (crash fetch, Jira, MR) are pre-registered in `pendingCalls` and
-    // allowed here; everything else keeps the session's rules.
-    await ctx.permission.hook("evaluate", (event) => {
-      if (decideAutoAllow({ sessionID: event.sessionID, action: event.action }, pendingCalls) === "allow") event.effect = "allow"
-    })
-
     await ctx.command.transform((editor) => {
       editor.add({
         name: COMMAND,
-        description: "Fix production crashes: pick a crash from Sentry / Crashlytics (or paste a trace), find the root cause on the base branch, fix and test it in a worktree, review it, and open a draft MR (with a Jira ticket when available)",
+        description: "Fix production crashes: pick a crash from Sentry / Crashlytics (or paste a trace); the coding agent then finds the root cause in this checkout, fixes and tests it on a fixora/ branch, a second agent session reviews it, and after your approval the agent pushes and opens a draft MR (with a Jira ticket when available). Your branch and local changes are restored afterwards.",
         execute: async (input) => {
           const sessionID = input.sessionID
           const parsed = parseCommand(input.prompt.text)
@@ -295,6 +260,7 @@ export default Plugin.define({
           }
           try {
             rt.opts = readOpts()
+            await warnLegacyOnce(rt, sessionID)
             switch (parsed.verb) {
               case "help":
                 await tell(ctx, sessionID, "fixora usage", `\`\`\`\n${USAGE}\n\`\`\``)
@@ -343,6 +309,9 @@ export default Plugin.define({
                 break
               case "sync":
                 await runSync(rt, { sessionID })
+                break
+              case "reset":
+                await runReset(rt, { sessionID, files: parsed.files })
                 break
               case "doctor":
                 await runDoctor(rt, { sessionID, all: parsed.all, probe: parsed.probe, tool: parsed.tool })

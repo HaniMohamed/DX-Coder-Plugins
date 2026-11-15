@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "dxcoder-plugin-fixora",
-  "version": "0.2.14",
-  "description": "Turn production crashes (Sentry, Firebase Crashlytics, pasted stack traces) into reviewed, tested draft merge requests using the DXcoder coding agent",
+  "version": "0.3.6",
+  "description": "Turn production crashes (Sentry, Firebase Crashlytics, pasted stack traces) into reviewed, tested draft merge requests; the DXcoder coding agent does every git, check and MCP action inside the checkout you have open",
   "type": "module",
   "private": true,
   "exports": {

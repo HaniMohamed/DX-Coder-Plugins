@@ -101,17 +101,15 @@ export interface TuiState {
 export const STAGE_TITLES: Record<Step, string> = {
   detect: "Detect",
   fetch: "Fetch crash",
-  map: "Map stack trace",
-  branch: "Worktree + branch",
+  prepare: "Prepare checkout",
   analyse: "Root cause",
   ticket: "Jira ticket",
   fix: "Fix",
   validate: "Checks",
   review: "Review",
-  commit: "Commit",
-  push: "Push",
-  mr: "Merge request",
+  publish: "Commit · push · MR",
   "close-loop": "Link",
+  restore: "Restore checkout",
   done: "Done",
 }
 

@@ -1,265 +1,45 @@
-// Git helpers (Bun.spawn). The plugin owns every git side effect: never force, never the base branch.
-
-export interface GitResult {
-  code: number
-  stdout: string
-  stderr: string
-}
-
-export class GitError extends Error {
-  constructor(
-    readonly args: string[],
-    readonly result: GitResult,
-  ) {
-    super(`git ${args.join(" ")} failed (${result.code}): ${result.stderr.trim() || result.stdout.trim()}`.slice(0, 2000))
-    this.name = "GitError"
-  }
-}
-
-// ---------- login-shell process runner ----------
-// Every external command (git, test runners, glab/gh) runs through the user's login shell so PATH,
-// credential helpers, SSH agent and tool managers (nvm, asdf, fvm…) match what works in a terminal.
-
-const HOME = process.env.HOME ?? ""
-const EXTRA_PATH = [`${HOME}/.bun/bin`, `${HOME}/.local/bin`, `${HOME}/.cargo/bin`, `${HOME}/go/bin`, `${HOME}/.pub-cache/bin`, "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-
-export function loginShell(): string {
-  const shell = process.env.SHELL ?? ""
-  return /\/(zsh|bash|fish)$/.test(shell) ? shell : "/bin/sh"
-}
-
-export const shellQuote = (arg: string) => (/^[A-Za-z0-9_./:@%+=,-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`)
-
-export function shellEnv(extra: Record<string, string> = {}): Record<string, string> {
-  const current = (process.env.PATH ?? "").split(":").filter(Boolean)
-  const path = [...current, ...EXTRA_PATH.filter((p) => !current.includes(p))].join(":")
-  const env: Record<string, string> = {}
-  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v
-  return { ...env, PATH: path, GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat", NO_COLOR: "1", FORCE_COLOR: "0", ...extra }
-}
-
-export interface ShellResult {
-  code: number
-  stdout: string
-  stderr: string
-  timedOut: boolean
-}
-
-/** Runs one shell command line (already quoted) through the login shell with a timeout. */
-export async function spawnShell(command: string, o: { cwd: string; timeoutMs?: number; env?: Record<string, string>; signal?: AbortSignal }): Promise<ShellResult> {
-  const proc = Bun.spawn([loginShell(), "-l", "-c", command], { cwd: o.cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore", env: shellEnv(o.env) })
-  let timedOut = false
-  const timer = setTimeout(() => {
-    timedOut = true
-    proc.kill()
-  }, o.timeoutMs ?? 120_000)
-  const onAbort = () => proc.kill()
-  o.signal?.addEventListener("abort", onAbort, { once: true })
-  const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited])
-  clearTimeout(timer)
-  o.signal?.removeEventListener("abort", onAbort)
-  return { code, stdout, stderr, timedOut }
-}
-
-/** Like spawnShell, but reports every output line as it arrives (for live progress). */
-export async function spawnShellStream(command: string, o: { cwd: string; timeoutMs?: number; env?: Record<string, string>; signal?: AbortSignal; onLine: (line: string, stream: "stdout" | "stderr") => void }): Promise<ShellResult> {
-  const proc = Bun.spawn([loginShell(), "-l", "-c", command], { cwd: o.cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore", env: shellEnv(o.env) })
-  let timedOut = false
-  const timer = setTimeout(() => {
-    timedOut = true
-    proc.kill()
-  }, o.timeoutMs ?? 120_000)
-  const onAbort = () => proc.kill()
-  o.signal?.addEventListener("abort", onAbort, { once: true })
-  const read = async (stream: ReadableStream<Uint8Array> | null, name: "stdout" | "stderr") => {
-    if (!stream) return ""
-    const decoder = new TextDecoder()
-    let all = ""
-    let pending = ""
-    for await (const chunk of stream as unknown as AsyncIterable<Uint8Array>) {
-      const text = decoder.decode(chunk, { stream: true })
-      all += text
-      pending += text
-      let nl = pending.indexOf("\n")
-      while (nl >= 0) {
-        const line = pending.slice(0, nl).replace(/\r$/, "")
-        pending = pending.slice(nl + 1)
-        if (line.trim()) o.onLine(line, name)
-        nl = pending.indexOf("\n")
-      }
-    }
-    if (pending.trim()) o.onLine(pending.replace(/\r$/, ""), name)
-    return all
-  }
-  const [stdout, stderr, code] = await Promise.all([read(proc.stdout as never, "stdout"), read(proc.stderr as never, "stderr"), proc.exited])
-  clearTimeout(timer)
-  o.signal?.removeEventListener("abort", onAbort)
-  return { code, stdout, stderr, timedOut }
-}
-
-export async function runGit(cwd: string, args: string[], o: { timeoutMs?: number; allowFail?: boolean; env?: Record<string, string> } = {}): Promise<GitResult> {
-  const r = await spawnShell(`git ${args.map(shellQuote).join(" ")}`, { cwd, timeoutMs: o.timeoutMs, env: { LC_ALL: "C", ...o.env } })
-  const result = { code: r.timedOut ? 124 : r.code, stdout: r.stdout, stderr: r.timedOut ? `${r.stderr}\n(timed out after ${Math.round((o.timeoutMs ?? 120_000) / 1000)}s)` : r.stderr }
-  if (result.code !== 0 && !o.allowFail) throw new GitError(args, result)
-  return result
-}
+// Git helpers (pure). The plugin never runs git itself: the worker sessions do, and these functions
+// validate what they report (branch names, push safety, porcelain status) and build names / URLs.
 
 export interface ChangedFile {
   path: string
   status: "added" | "modified" | "deleted" | "renamed" | "untracked"
 }
 
-export const git = {
-  async isRepo(cwd: string) {
-    return (await runGit(cwd, ["rev-parse", "--is-inside-work-tree"], { allowFail: true })).code === 0
-  },
-  async topLevel(cwd: string) {
-    return (await runGit(cwd, ["rev-parse", "--show-toplevel"])).stdout.trim()
-  },
-  async remoteUrl(cwd: string, remote: string): Promise<string | undefined> {
-    const r = await runGit(cwd, ["remote", "get-url", remote], { allowFail: true })
-    return r.code === 0 ? r.stdout.trim() : undefined
-  },
-  async fetch(cwd: string, remote: string, branch: string) {
-    await runGit(cwd, ["fetch", "--quiet", remote, branch], { timeoutMs: 300_000 })
-  },
-  async headSha(cwd: string, ref = "HEAD"): Promise<string | undefined> {
-    const r = await runGit(cwd, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { allowFail: true })
-    return r.code === 0 ? r.stdout.trim() : undefined
-  },
-  async branchExists(cwd: string, name: string, remote?: string) {
-    const ref = remote ? `refs/remotes/${remote}/${name}` : `refs/heads/${name}`
-    return (await runGit(cwd, ["show-ref", "--verify", "--quiet", ref], { allowFail: true })).code === 0
-  },
-  async remoteBranchSha(cwd: string, remote: string, name: string): Promise<string | undefined> {
-    const r = await runGit(cwd, ["ls-remote", "--heads", remote, name], { allowFail: true, timeoutMs: 60_000 })
-    const sha = r.stdout.trim().split(/\s+/)[0]
-    return r.code === 0 && sha ? sha : undefined
-  },
-  async currentBranch(cwd: string) {
-    return (await runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim()
-  },
-  async checkoutNewBranch(cwd: string, name: string, startRef: string) {
-    await runGit(cwd, ["checkout", "--quiet", "-b", name, startRef])
-  },
-  async checkout(cwd: string, name: string) {
-    await runGit(cwd, ["checkout", "--quiet", name])
-  },
-  async lsFiles(cwd: string): Promise<string[]> {
-    const r = await runGit(cwd, ["ls-files", "-z"], { timeoutMs: 120_000 })
-    return r.stdout.split("\0").filter(Boolean)
-  },
-  /** Files tracked at a ref (base branch), independent of the working tree. */
-  async lsTree(cwd: string, ref: string): Promise<string[]> {
-    const r = await runGit(cwd, ["ls-tree", "-r", "-z", "--name-only", "--full-tree", ref], { timeoutMs: 120_000 })
-    return r.stdout.split("\0").filter(Boolean)
-  },
-  async fileExistsAt(cwd: string, ref: string, path: string): Promise<boolean> {
-    return (await runGit(cwd, ["cat-file", "-e", `${ref}:${path}`], { allowFail: true })).code === 0
-  },
-  async statusPorcelain(cwd: string): Promise<ChangedFile[]> {
-    const r = await runGit(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-    const out: ChangedFile[] = []
-    const parts = r.stdout.split("\0")
-    for (let i = 0; i < parts.length; i++) {
-      const entry = parts[i]!
-      if (!entry) continue
-      const x = entry[0]!
-      const y = entry[1]!
-      let path = entry.slice(3)
-      let status: ChangedFile["status"] = "modified"
-      if (x === "?" && y === "?") status = "untracked"
-      else if (x === "A" || y === "A") status = "added"
-      else if (x === "D" || y === "D") status = "deleted"
-      else if (x === "R" || y === "R") {
-        status = "renamed"
-        // rename entries carry the old path as the next NUL-separated field
-        i++
-      }
-      out.push({ path: path.replace(/\\/g, "/"), status })
+export const isHexSha = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{7,64}$/i.test(v)
+
+/**
+ * Parses `git status --porcelain=v1` output, NUL- or newline-separated (`-z` or plain). Rename
+ * entries ("R  new -> old" / NUL-separated pairs) keep the new path; directories are dropped.
+ */
+export function parsePorcelain(text: string): ChangedFile[] {
+  const out: ChangedFile[] = []
+  const nul = text.includes("\0")
+  const parts = nul ? text.split("\0") : text.split(/\r?\n/)
+  for (let i = 0; i < parts.length; i++) {
+    const entry = parts[i]!
+    if (entry.length < 4) continue
+    const x = entry[0]!
+    const y = entry[1]!
+    let path = entry.slice(3)
+    let status: ChangedFile["status"] = "modified"
+    if (x === "?" && y === "?") status = "untracked"
+    else if (x === "!" && y === "!") continue
+    else if (x === "A" || y === "A") status = "added"
+    else if (x === "D" || y === "D") status = "deleted"
+    else if (x === "R" || y === "R" || x === "C" || y === "C") {
+      status = "renamed"
+      if (nul) i++ // the old path follows as its own NUL-separated field
+      else if (path.includes(" -> ")) path = path.split(" -> ").pop()!
     }
-    return out
-  },
-  async diff(cwd: string, o: { base?: string; stat?: boolean; paths?: string[] } = {}) {
-    const args = ["diff", "--no-color", "--no-ext-diff"]
-    if (o.stat) args.push("--numstat")
-    if (o.base) args.push(o.base)
-    if (o.paths?.length) args.push("--", ...o.paths)
-    return (await runGit(cwd, args)).stdout
-  },
-  /** Working tree diff including untracked files (as added), against the index/base. */
-  async fullDiff(cwd: string, base?: string, paths?: string[]): Promise<string> {
-    await runGit(cwd, ["add", "--intent-to-add", "--all"], { allowFail: true })
-    if (paths && paths.length === 0) return ""
-    const d = await git.diff(cwd, { base, paths })
-    return d
-  },
-  async numstat(cwd: string, base?: string, paths?: string[]): Promise<Array<{ path: string; added: number; deleted: number }>> {
-    await runGit(cwd, ["add", "--intent-to-add", "--all"], { allowFail: true })
-    if (paths && paths.length === 0) return []
-    const out = await git.diff(cwd, { base, stat: true, paths })
-    return out
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => {
-        const [a, d, ...rest] = l.split("\t")
-        return { path: rest.join("\t"), added: a === "-" ? 0 : Number(a), deleted: d === "-" ? 0 : Number(d) }
-      })
-  },
-  async add(cwd: string, paths: string[]) {
-    if (paths.length === 0) return
-    await runGit(cwd, ["add", "--", ...paths])
-  },
-  async commit(cwd: string, messageFile: string, o: { signoff?: boolean } = {}): Promise<string> {
-    const args = ["commit", "--quiet", "-F", messageFile]
-    if (o.signoff) args.push("--signoff")
-    await runGit(cwd, args, { timeoutMs: 300_000 })
-    return (await git.headSha(cwd)) ?? ""
-  },
-  async push(cwd: string, remote: string, branch: string, o: { base: string; forceWithLease?: string }) {
-    const args = ["push", "--quiet", "-u", remote, `${branch}:refs/heads/${branch}`]
-    if (o.forceWithLease) args.splice(1, 0, `--force-with-lease=refs/heads/${branch}:${o.forceWithLease}`)
-    assertSafePush(branch, o.base, args)
-    await runGit(cwd, args, { timeoutMs: 300_000 })
-  },
-  async deleteRemoteBranch(cwd: string, remote: string, branch: string, base: string) {
-    if (isProtectedBranch(branch, base)) throw new Error(`refusing to delete protected branch ${branch}`)
-    await runGit(cwd, ["push", "--quiet", remote, "--delete", branch], { timeoutMs: 120_000 })
-  },
-  async log(cwd: string, o: { path?: string; n?: number; follow?: boolean; format?: string; ref?: string } = {}): Promise<string> {
-    const args = ["log", `-n${o.n ?? 10}`, `--format=${o.format ?? "%h %ad %an %s"}`, "--date=short"]
-    if (o.follow) args.push("--follow")
-    if (o.ref) args.push(o.ref)
-    if (o.path) args.push("--", o.path)
-    return (await runGit(cwd, args, { allowFail: true })).stdout
-  },
-  async blame(cwd: string, path: string, line: number, context = 3): Promise<string> {
-    const from = Math.max(1, line - context)
-    const r = await runGit(cwd, ["blame", "--date=short", "-L", `${from},${line + context}`, "--", path], { allowFail: true })
-    return r.code === 0 ? r.stdout : ""
-  },
-  async commitExists(cwd: string, sha: string) {
-    return (await runGit(cwd, ["cat-file", "-e", `${sha}^{commit}`], { allowFail: true })).code === 0
-  },
-  /** Finds where a path that no longer exists was renamed to (most recent rename first, chained). */
-  async renamedTo(cwd: string, oldPath: string, ref: string): Promise<string | undefined> {
-    const r = await runGit(cwd, ["log", "-M", "--diff-filter=R", "--name-status", "--format=", "-n", "200", ref], { allowFail: true })
-    if (r.code !== 0) return undefined
-    const renames = [...r.stdout.matchAll(/^R\d*\t([^\t\n]+)\t([^\t\n]+)$/gm)].map((m) => ({ from: m[1]!, to: m[2]! }))
-    // Newest first in the log; walk from the oldest rename of oldPath forward through chained renames.
-    let current = oldPath
-    for (let i = renames.length - 1; i >= 0; i--) if (renames[i]!.from === current) current = renames[i]!.to
-    return current === oldPath ? undefined : current
-  },
-  /** Clean apart from changes that setup tools generate (lockfiles, caches); `ignore` decides which. */
-  async isClean(cwd: string, ignore?: (path: string) => boolean) {
-    return (await git.statusPorcelain(cwd)).filter((f) => !ignore?.(f.path)).length === 0
-  },
-  async tagsContaining(cwd: string, sha: string): Promise<string[]> {
-    const r = await runGit(cwd, ["tag", "--contains", sha], { allowFail: true })
-    return r.code === 0 ? r.stdout.split("\n").filter(Boolean) : []
-  },
+    path = path.replace(/\\/g, "/").replace(/^"(.*)"$/, "$1")
+    if (!path || path.endsWith("/")) continue
+    out.push({ path, status })
+  }
+  return out
 }
+
+export const shellQuote = (arg: string) => (/^[A-Za-z0-9_./:@%+=,-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`)
 
 export function isProtectedBranch(branch: string, base: string): boolean {
   return branch === base || /^(main|master|develop|development|trunk|release\/.*|hotfix\/.*)$/.test(branch)
@@ -268,9 +48,11 @@ export function isProtectedBranch(branch: string, base: string): boolean {
 /** Refuses pushes that could damage shared branches. */
 export function assertSafePush(branch: string, base: string, args: string[]): void {
   if (isProtectedBranch(branch, base)) throw new Error(`refusing to push to protected branch "${branch}"`)
-  if (args.some((a) => a === "--force" || a === "-f" || a === "--delete" || a === "--mirror" || a === "--all" || a === "--tags")) throw new Error("refusing to force-push or delete")
-  if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(branch) || branch.includes("..") || branch.endsWith("/") || branch.endsWith(".lock")) throw new Error(`invalid branch name "${branch}"`)
+  if (args.some((a) => a === "--force" || a === "-f" || a === "--delete" || a === "--mirror" || a === "--all" || a === "--tags" || a.startsWith("--force-with-lease"))) throw new Error("refusing to force-push or delete")
+  if (!isValidBranchName(branch)) throw new Error(`invalid branch name "${branch}"`)
 }
+
+export const isValidBranchName = (branch: string) => /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(branch) && !branch.includes("..") && !branch.endsWith("/") && !branch.endsWith(".lock") && !branch.includes("//")
 
 export function slug(text: string, max = 40): string {
   const s = text
@@ -299,7 +81,7 @@ export interface ParsedRemote {
 export function parseRemote(url: string, forgeHint?: "gitlab" | "github"): ParsedRemote | undefined {
   let host: string | undefined
   let path: string | undefined
-  let m = /^(?:ssh:\/\/)?(?:[\w.-]+@)?([\w.-]+)(?::\d+)?[:/](.+?)(?:\.git)?\/?$/.exec(url.trim())
+  const m = /^(?:ssh:\/\/)?(?:[\w.-]+@)?([\w.-]+)(?::\d+)?[:/](.+?)(?:\.git)?\/?$/.exec(url.trim())
   const http = /^https?:\/\/(?:[^@/]+@)?([\w.-]+)(?::\d+)?\/(.+?)(?:\.git)?\/?$/.exec(url.trim())
   if (http) {
     host = http[1]

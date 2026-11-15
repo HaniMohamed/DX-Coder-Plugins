@@ -2,20 +2,38 @@
 // verbatim, and RPC events for a TUI. Works identically whether or not a TUI is attached.
 
 import type { Plugin } from "@opencode/plugin"
+import type { ToolSchema } from "./mcp.js"
 import type { FixoraOptions } from "./options.js"
+import type { SourceContext } from "./sources/types.js"
 import { beginStep, endStep, saveRun } from "./state.js"
 import type { RunRecord, Services, Step, StepTiming } from "./types.js"
 
 export type Emit = (name: string, data: Record<string, unknown>) => Promise<void>
 
+export interface Inflight {
+  controller: AbortController
+  /** Resolves when the pipeline (including the restore phase) has finished. */
+  done: Promise<RunRecord>
+}
+
 export interface Runtime {
   ctx: Plugin.Context
   opts: FixoraOptions
   services: Services
+  /** Declared input schemas of the host's tools (refreshed with the services). */
+  schemas?: Map<string, ToolSchema>
   emit: Emit
   /** In-flight pipelines by runId, for cancel/restart. */
-  inflight: Map<string, AbortController>
+  inflight: Map<string, Inflight>
+  /** How often a run waiting for the repository lock polls (tests shorten it). */
+  lockPollMs?: number
+  /** Legacy-option warnings were shown once in this process. */
+  warnedLegacy?: boolean
 }
+
+export const toolProps = (rt: Runtime, toolId: string): Record<string, unknown> => rt.schemas?.get(toolId)?.props ?? {}
+
+export const sourceContext = (rt: Runtime): SourceContext => ({ options: rt.opts, services: rt.services, toolProps: (id) => toolProps(rt, id) })
 
 /** Expected stop: the message is shown to the user as-is. */
 export class FixoraStop extends Error {
@@ -97,6 +115,13 @@ export function describeToolCall(input: Record<string, unknown> | undefined): st
   if (input.runId !== undefined && input.classification !== undefined) return "submitting the root cause"
   if (input.runId !== undefined && input.filesChanged !== undefined) return "submitting the fix report"
   if (input.runId !== undefined && input.verdict !== undefined) return "submitting the review"
+  if (input.requestId !== undefined && input.results !== undefined) return "submitting the crash list"
+  if (input.runId !== undefined && input.issue !== undefined) return "submitting the fetched crash"
+  if (input.runId !== undefined && input.stage !== undefined) return "reporting the checkout"
+  if (input.runId !== undefined && (input.committed !== undefined || input.pushed !== undefined || input.mr !== undefined || input.mrSkipped !== undefined)) return "reporting the publish result"
+  if (input.runId !== undefined && input.action !== undefined) return "reporting the ticket"
+  if (input.op !== undefined && input.ok !== undefined) return `finishing ${String(input.op)}`
+  if (typeof input.toolId === "string" || (typeof input.appId === "string" && input.issueId !== undefined)) return "calling the crash source"
   if (str("question")) return "asking you a question"
   return "working"
 }

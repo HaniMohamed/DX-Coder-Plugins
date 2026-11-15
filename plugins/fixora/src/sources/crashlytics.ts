@@ -6,16 +6,16 @@
 // answers with YAML text whose nested documents are YAML strings again; `exceptions` / `threads` /
 // `errors` of an event are pre-formatted text ("Type: message" + "at symbol (file:line)" lines).
 // Older releases took snake_case inputs and answered with JSON. Both are handled: the input spelling
-// is read from the tool's schema and the output goes through `parseToolText`.
+// is read from the tool's schema and the output goes through `parseToolText`. The calls themselves
+// are planned here and made by the worker session.
 
 import { fingerprintOf } from "../fingerprint.js"
-import { callTool, paramStyle, parseToolText } from "../mcp.js"
+import { paramStyleOf, parseToolText } from "../mcp.js"
 import { sanitizeExtra, sanitizeText, stripControl, symbolicationCheck } from "../normalize.js"
 import { parseStackTrace, type Hints } from "../stacktrace/index.js"
 import type { Crash, CrashSummary, Frame, Language } from "../types.js"
 import { stackFromMarkdown } from "./sentry.js"
-import { SourceError, type CrashSource, type SourceContext } from "./types.js"
-import { describeError } from "../errors.js"
+import { SourceError, type CrashSource, type CrashSubmission, type FetchPlan, type ListResult, type SourceContext, type ToolCall } from "./types.js"
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v)
 const str = (v: unknown) => (typeof v === "string" ? v : typeof v === "number" ? String(v) : undefined)
@@ -282,7 +282,7 @@ export const crashlyticsRef = (id: string, appId?: string) => (appId ? `crashlyt
 const REF = /^crashlytics:([A-Za-z0-9_-]+)(?:@(\d+:\d+:[a-z]+:[a-f0-9]+))?$/i
 
 /** Input for a Crashlytics tool in the spelling its schema declares. */
-function args(style: "camel" | "snake", fields: { appId: string; issueId?: string; pageSize?: number; names?: string[]; note?: string; filter?: Record<string, unknown>; report?: string }): Record<string, unknown> {
+export function args(style: "camel" | "snake", fields: { appId: string; issueId?: string; pageSize?: number; names?: string[]; note?: string; filter?: Record<string, unknown>; report?: string }): Record<string, unknown> {
   const k = (camel: string, snake: string) => (style === "camel" ? camel : snake)
   const out: Record<string, unknown> = { [k("appId", "app_id")]: fields.appId }
   if (fields.issueId !== undefined) out[k("issueId", "issue_id")] = fields.issueId
@@ -304,6 +304,8 @@ function args(style: "camel" | "snake", fields: { appId: string; issueId?: strin
 
 const TOP_ISSUES_WINDOW_DAYS = 14
 
+const styleFor = (sc: SourceContext, toolId: string | undefined) => paramStyleOf(toolId ? sc.toolProps(toolId) : {})
+
 export const crashlytics: CrashSource = {
   id: "crashlytics",
   available: (services, options) => options.sources.includes("crashlytics") && !!services.crashlytics && services.crashlytics.status === "connected" && !!(services.crashlytics.capabilities.getIssue || services.crashlytics.capabilities.batchGetEvents),
@@ -315,115 +317,64 @@ export const crashlytics: CrashSource = {
     if (url) return { id: url[3]!, extra: { appId: url[2]!, project: url[1]! } }
     return undefined
   },
-  async list(sc, q) {
+  listPlan(sc, q): ToolCall[] {
     const s = sc.services.crashlytics!
-    const appIds = appIdsOf(sc)
-    const multi = appIds.length > 1
-    const out: CrashSummary[] = []
-    const errors: string[] = []
     const toolId = s.capabilities.getReport ?? s.capabilities.listTopIssues
     if (!toolId) return []
-    const style = await paramStyle(sc.ctx, toolId)
+    const style = styleFor(sc, toolId)
     const now = Date.now()
-    // Each report call takes several seconds; query the apps in parallel so the picker stays within RPC limits.
-    const results = await Promise.all(
-      appIds.map(async (appId) => {
-        try {
-          const raw = s.capabilities.getReport
-            ? await callTool(
-                sc.ctx,
-                s.capabilities.getReport,
-                args(style, { appId, report: "topIssues", pageSize: q.top, filter: { issueErrorTypes: ["FATAL"], intervalStartTime: new Date(now - TOP_ISSUES_WINDOW_DAYS * 86_400_000).toISOString(), intervalEndTime: new Date(now).toISOString() } }),
-                { sessionID: sc.sessionID, signal: sc.signal },
-              )
-            : await callTool(sc.ctx, toolId, { ...args(style, { appId }), issue_count: q.top, issue_type: "FATAL" }, { sessionID: sc.sessionID, signal: sc.signal })
-          return { appId, raw }
-        } catch (error) {
-          return { appId, error: `${platformOfAppId(appId) ?? appId}: ${describeError(error)}` }
-        }
-      }),
-    )
-    for (const r of results) {
-      if ("error" in r && r.error) {
-        errors.push(r.error)
-        continue
-      }
-      const platform = platformOfAppId(r.appId)
-      for (const c of mapCrashlyticsList((r as { raw: unknown }).raw)) out.push({ ...c, platform, appId: r.appId, ref: crashlyticsRef(c.id, multi ? r.appId : undefined), url: c.url ?? consoleUrl(r.appId, c.id) })
-    }
-    if (out.length === 0 && errors.length > 0) throw new SourceError("crashlytics", errors.join("; "))
-    return out
-      .filter((c) => (q.minUsers ?? 0) === 0 || (c.userCount ?? 0) >= (q.minUsers ?? 0))
-      .sort((a, b) => (b.userCount ?? 0) - (a.userCount ?? 0) || (b.eventCount ?? 0) - (a.eventCount ?? 0))
-      .slice(0, q.top)
+    return appIdsOf(sc).map((appId) => ({
+      toolId,
+      namespace: s.namespace,
+      appId,
+      label: platformOfAppId(appId) ?? appId,
+      input: s.capabilities.getReport
+        ? args(style, { appId, report: "topIssues", pageSize: q.top, filter: { issueErrorTypes: ["FATAL"], intervalStartTime: new Date(now - TOP_ISSUES_WINDOW_DAYS * 86_400_000).toISOString(), intervalEndTime: new Date(now).toISOString() } })
+        : { ...args(style, { appId }), issue_count: q.top, issue_type: "FATAL" },
+    }))
   },
-  async get(sc, id, extra) {
+  mapList(result: ListResult, _sc, o) {
+    const appId = result.appId
+    const platform = platformOfAppId(appId)
+    return mapCrashlyticsList(result.raw).map((c) => ({ ...c, platform, appId, ref: crashlyticsRef(c.id, o.multiApp ? appId : undefined), url: c.url ?? (appId ? consoleUrl(appId, c.id) : undefined) }))
+  },
+  fetchPlan(sc, id, extra): FetchPlan {
     const s = sc.services.crashlytics!
     const candidates = appIdsOf(sc, extra)
-    const style = await paramStyle(sc.ctx, s.capabilities.getIssue ?? s.capabilities.batchGetEvents ?? s.capabilities.listEvents ?? "")
-    // Without an app in the reference, probe the configured apps in order and keep the first that knows the issue.
-    let appId = candidates[0]!
-    let issue: unknown
-    const failures: string[] = []
-    for (const candidate of candidates) {
-      if (!s.capabilities.getIssue) break
-      try {
-        issue = parseToolText(await callTool(sc.ctx, s.capabilities.getIssue, args(style, { appId: candidate, issueId: id }), { sessionID: sc.sessionID, signal: sc.signal }))
-        if (candidates.length === 1 || hasIssue(issue)) {
-          appId = candidate
-          break
-        }
-        failures.push(`${platformOfAppId(candidate) ?? candidate}: not found`)
-        issue = undefined
-      } catch (error) {
-        if (candidates.length === 1) throw error
-        failures.push(`${platformOfAppId(candidate) ?? candidate}: ${describeError(error)}`)
-      }
-    }
-    if (candidates.length > 1 && issue === undefined && s.capabilities.getIssue) throw new SourceError("crashlytics", `issue ${id} was not found in any configured app (${failures.join("; ")})`)
-    let events: unknown
-    const call = (toolId: string, input: Record<string, unknown>) => callTool(sc.ctx, toolId, input, { sessionID: sc.sessionID, signal: sc.signal }).then(parseToolText)
-    const sample = sampleEventOf(issue) ?? (isRecord(issue) && typeof issue.name === "string" && style === "snake" ? `${issue.name}/events/latest` : undefined)
-    if (s.capabilities.batchGetEvents && sample) events = await call(s.capabilities.batchGetEvents, args(style, { appId, names: [sample], issueId: style === "snake" ? id : undefined, pageSize: style === "snake" ? 1 : undefined })).catch(() => undefined)
-    if (events === undefined && s.capabilities.listEvents) events = await call(s.capabilities.listEvents, args(style, { appId, pageSize: 1, filter: { issueId: id } })).catch(() => undefined)
-    if (events === undefined && s.capabilities.getSampleCrash) events = await call(s.capabilities.getSampleCrash, { ...args(style, { appId, issueId: id }), variant_count: 1 }).catch(() => undefined)
+    const style = styleFor(sc, s.capabilities.getIssue ?? s.capabilities.batchGetEvents ?? s.capabilities.listEvents)
+    const primary: ToolCall[] = []
+    if (s.capabilities.getIssue) for (const appId of candidates) primary.push({ toolId: s.capabilities.getIssue, namespace: s.namespace, appId, label: platformOfAppId(appId) ?? appId, input: args(style, { appId, issueId: id }) })
+    const followUps: ToolCall[] = []
+    const appPlaceholder = candidates.length > 1 ? "<appId of the app whose reply described the issue>" : candidates[0]!
+    if (s.capabilities.batchGetEvents) followUps.push({ toolId: s.capabilities.batchGetEvents, namespace: s.namespace, input: args(style, { appId: appPlaceholder, names: ["<the issue reply's sampleEvent resource name, e.g. projects/…/events/…>"], issueId: style === "snake" ? id : undefined, pageSize: style === "snake" ? 1 : undefined }), note: "first choice: the sample event named by the issue reply" })
+    if (s.capabilities.listEvents) followUps.push({ toolId: s.capabilities.listEvents, namespace: s.namespace, input: args(style, { appId: appPlaceholder, pageSize: 1, filter: { issueId: id } }), note: "when the issue reply names no sample event" })
+    if (s.capabilities.getSampleCrash) followUps.push({ toolId: s.capabilities.getSampleCrash, namespace: s.namespace, input: { ...args(style, { appId: appPlaceholder, issueId: id }), variant_count: 1 }, note: "last resort" })
+    const note = [
+      candidates.length > 1 ? `The issue may live in any of ${candidates.length} Firebase apps: make the primary calls in order and stop at the first reply that describes the issue (an id / title, not "not found"). Report that app as \`appId\`.` : `Report \`appId\` as ${candidates[0]}.`,
+      "Submit the issue reply verbatim as `issue`. Then make ONE follow-up call (first that applies) and submit its reply verbatim as `events`: the stack frames live in the sample event, not in the issue.",
+      "Replace the <placeholders> in the follow-up inputs with values from the issue reply; keep every other field exactly as given.",
+    ].join(" ")
+    return { primary, followUps, note }
+  },
+  mapCrash(sub: CrashSubmission, sc, id, extra) {
+    const candidates = appIdsOf(sc, extra)
+    const appId = sub.appId ?? (candidates.length === 1 ? candidates[0] : undefined)
+    if (!appId) throw new SourceError("crashlytics", `several Firebase apps are configured (${candidates.map((c) => platformOfAppId(c) ?? c).join(", ")}): report the \`appId\` whose reply described the issue`)
+    if (!candidates.includes(appId)) throw new SourceError("crashlytics", `appId ${appId} is not one of the configured apps`)
+    const issue = parseToolText(sub.issue)
+    if (sub.issue !== undefined && !hasIssue(issue)) throw new SourceError("crashlytics", `the issue reply does not describe issue ${id} (${typeof issue === "string" ? issue.slice(0, 160) : "no id / title"}); try the other configured apps or check the issue id`)
+    const events = sub.events === undefined ? undefined : parseToolText(sub.events)
     return mapCrashlyticsIssue(issue, events, { id, appId, hints: hintsOf(sc) })
   },
-  async probe(sc) {
+  annotatePlan(sc, id, note, extra) {
     const s = sc.services.crashlytics!
-    const toolId = s.capabilities.getReport ?? s.capabilities.listTopIssues
-    const out: Array<{ label?: string; toolId: string; input: Record<string, unknown>; raw?: unknown; parsedCount?: number; error?: string }> = []
-    if (!toolId) return [{ toolId: "(none)", input: {}, error: "no crashlytics_get_report / list_top_issues tool" }]
-    let appIds: string[]
-    try {
-      appIds = appIdsOf(sc)
-    } catch (error) {
-      return [{ toolId, input: {}, error: describeError(error) }]
-    }
-    const style = await paramStyle(sc.ctx, toolId)
-    const now = Date.now()
-    for (const appId of appIds) {
-      const input = s.capabilities.getReport
-        ? args(style, { appId, report: "topIssues", pageSize: 3, filter: { issueErrorTypes: ["FATAL"], intervalStartTime: new Date(now - TOP_ISSUES_WINDOW_DAYS * 86_400_000).toISOString(), intervalEndTime: new Date(now).toISOString() } })
-        : { ...args(style, { appId }), issue_count: 3, issue_type: "FATAL" }
-      try {
-        const raw = await callTool(sc.ctx, toolId, input, { sessionID: sc.sessionID, signal: sc.signal })
-        out.push({ label: platformOfAppId(appId) ?? appId, toolId, input, raw, parsedCount: mapCrashlyticsList(raw).length })
-      } catch (error) {
-        out.push({ label: platformOfAppId(appId) ?? appId, toolId, input, error: describeError(error) })
-      }
-    }
-    return out
-  },
-  async annotate(sc, id, note, extra) {
-    const s = sc.services.crashlytics!
-    if (!s.capabilities.createNote) return
-    const style = await paramStyle(sc.ctx, s.capabilities.createNote)
-    await callTool(sc.ctx, s.capabilities.createNote, args(style, { appId: appIdsOf(sc, extra)[0]!, issueId: id, note: note.text }), { sessionID: sc.sessionID, signal: sc.signal })
+    if (!s.capabilities.createNote) return undefined
+    const appId = extra?.appId ?? appIdsOf(sc, extra)[0]!
+    return { toolId: s.capabilities.createNote, namespace: s.namespace, appId, input: args(styleFor(sc, s.capabilities.createNote), { appId, issueId: id, note: note.text }) }
   },
 }
 
-const consoleUrl = (appId: string, id: string) => `https://console.firebase.google.com/project/_/crashlytics/app/${appId}/issues/${id}`
+export const consoleUrl = (appId: string, id: string) => `https://console.firebase.google.com/project/_/crashlytics/app/${appId}/issues/${id}`
 
 /** A `crashlytics_get_issue` result that actually describes an issue (not an empty / error payload). */
 export function hasIssue(raw: unknown): boolean {

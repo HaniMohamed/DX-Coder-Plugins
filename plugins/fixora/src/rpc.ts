@@ -24,7 +24,6 @@ export const RunSummarySchema = obj(
     mrUrl: S,
     mrStatus: S,
     branch: S,
-    worktree: S,
     originSessionID: S,
     fixerSessionID: S,
     createdAt: S,
@@ -56,6 +55,7 @@ export const GatePreviewSchema = obj({
   mrProvider: S,
   jiraKey: S,
   jira: obj({ project: S, issueType: S, summary: S }),
+  stash: obj({ files: N, status: S }),
   previewPath: S,
   crashUrl: S,
 })
@@ -64,7 +64,7 @@ export const FixoraRpc = Rpc.define({
   id: "gosi.fixora",
   methods: {
     "sources.list": { input: obj({}), output: obj({ sources: arr(obj({ id: S, status: S, serverName: S, hint: S }, ["id", "status"])) }) },
-    "crashes.list": { input: obj({ source: S, top: N, minUsers: N, sessionID: S }), output: obj({ crashes: arr(CrashSummarySchema), errors: arr(S) }), errors: { source_unavailable: obj({ message: S }) } },
+    "crashes.list": { input: obj({ source: S, top: N, minUsers: N, sessionID: S, refresh: B }), output: obj({ crashes: arr(CrashSummarySchema), errors: arr(S) }), errors: { source_unavailable: obj({ message: S }) } },
     "runs.list": { input: obj({ status: arr(S), limit: N }), output: obj({ runs: arr(RunSummarySchema) }) },
     "runs.get": { input: obj({ runId: S }, ["runId"]), output: obj({ run: any }), errors: { not_found: obj({ runId: S }) } },
     "run.start": { input: obj({ ref: S, sessionID: S, flags: any }, ["ref", "sessionID"]), output: obj({ runId: S }), errors: { busy: obj({ runId: S }), invalid_ref: obj({ ref: S }) } },
@@ -108,7 +108,6 @@ export interface RunSummary {
   mrUrl?: string
   mrStatus?: string
   branch?: string
-  worktree?: string
   originSessionID?: string
   fixerSessionID?: string
   createdAt: string
@@ -135,6 +134,7 @@ export interface GatePreview {
   mrProvider?: string
   jiraKey?: string
   jira?: { project?: string; issueType?: string; summary?: string }
+  stash?: { files?: number; status?: string }
   previewPath?: string
   crashUrl?: string
 }
