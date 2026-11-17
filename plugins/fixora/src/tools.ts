@@ -12,7 +12,8 @@ import { validateFix, validateOps, validatePrepare, validatePublish, validateRev
 import { duplicateMessage, indexCrash } from "./crashindex.js"
 import { describeError } from "./errors.js"
 import { FORBIDDEN_GLOBS, forbiddenReason } from "./permissions.js"
-import { sourceContext, stageBegin, stageEnd, type Runtime } from "./progress.js"
+import { sourceContext, stageBegin, stageEnd, stageMark, type Runtime } from "./progress.js"
+import { retitleWorker } from "./worker.js"
 import { renderCrashMarkdown, renderProject } from "./render.js"
 import { interpretCrashList, sourceById } from "./sources/index.js"
 import type { ListResult } from "./sources/types.js"
@@ -33,7 +34,7 @@ export interface CrashListRecord {
   requestId: string
   originSessionID: string
   createdAt: string
-  query: { top: number; minUsers?: number; source?: Source }
+  query: { top: number; minUsers?: number; source?: Source; platform?: string }
   plans: Array<{ source: Source; calls: Array<{ toolId: string; input: Record<string, unknown>; appId?: string; label?: string }> }>
   planErrors: string[]
   result?: { crashes: CrashSummary[]; errors: string[]; raw?: unknown; at: string }
@@ -272,6 +273,7 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         await mkdir(run.folder, { recursive: true })
         await persist(run.folder, "crash.json", crash)
         run.title = crash.title
+        await retitleWorker(rt, run)
         run.fingerprint = crash.fingerprint
         run.meta = { ...run.meta, crashUrl: crash.url ?? null, platform: crash.platform ?? null, appVersion: crash.appVersion ?? null, language: crash.language, symbolication: crash.symbolication, userCount: crash.userCount ?? null, eventCount: crash.eventCount ?? null, crashFetchedAt: now() }
         if (crash.appId && extra?.appId !== crash.appId) run.meta.refExtra = JSON.stringify({ ...extra, appId: crash.appId })
@@ -417,6 +419,9 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
           run.meta = { ...run.meta, ticketAction: t.action, ticketError: null }
         }
         received(run)
+        // The ticket row of the panel: the ticket is made inside the prepare or publish turn, so no stage of its own runs.
+        await stageMark(deps.rt(), run, "ticket", t.action === "failed" ? "failed" : "ok", t.action === "failed" ? `not created: ${(t.error ?? "unknown error").slice(0, 120)}` : `${t.key} ${t.action}`)
+        if (t.action !== "failed") await retitleWorker(deps.rt(), run)
         await saveRun(ctx, run)
         if (w.info.phase === "prepare") {
           const branch = plannedBranch(run)

@@ -133,6 +133,8 @@ export interface ListInput {
   top?: number
   minUsers?: number
   source?: Source
+  /** Only this platform's Firebase app(s): "android", "ios" or "web". */
+  platform?: string
   refresh?: boolean
   /** Diagnostic: keep raw replies and never use the cache. */
   probe?: boolean
@@ -147,7 +149,7 @@ export async function runList(rt: Runtime, input: ListInput): Promise<{ crashes:
     const hint = configured.length ? `\n\nConfigured but not connected: ${configured.map((s) => `${s!.id} ("${s!.serverName}", ${s!.status})`).join(", ")} — connect from /mcps.` : ""
     throw new FixoraStop(`${INSTALL_SOURCES}${hint}`)
   }
-  const query = { top: input.top ?? rt.opts.batch.top * 2, minUsers: input.minUsers, source: input.source }
+  const query = { top: input.top ?? rt.opts.batch.top * 2, minUsers: input.minUsers, source: input.source, platform: input.platform }
   const where = await sessionRepo(rt.ctx, input.sessionID)
   const listerKey = keys.lister(input.sessionID)
   const listerRecord = (await getJson<{ sessionID?: string; lastRequestId?: string }>(rt.ctx, listerKey)) ?? {}
@@ -155,7 +157,7 @@ export async function runList(rt: Runtime, input: ListInput): Promise<{ crashes:
   if (!input.refresh && !input.probe && listerRecord.lastRequestId) {
     const cached = await getJson<CrashListRecord>(rt.ctx, keys.crashes(listerRecord.lastRequestId))
     const fresh = cached?.result && Date.now() - Date.parse(cached.result.at) < rt.opts.crashes.cacheMinutes * 60_000
-    if (cached && fresh && cached.query.top === query.top && cached.query.minUsers === query.minUsers && cached.query.source === query.source) record = cached
+    if (cached && fresh && cached.query.top === query.top && cached.query.minUsers === query.minUsers && cached.query.source === query.source && cached.query.platform === query.platform) record = cached
   }
   if (!record) {
     const sc = sourceContext(rt)
@@ -180,7 +182,7 @@ export async function runList(rt: Runtime, input: ListInput): Promise<{ crashes:
   const errors = [...record.result!.errors]
   const table = renderCrashTable(crashes)
   const hint = errors.length && crashes.length === 0 ? "\n\nEvery source call failed. HTML / 5xx / \"Unable to parse JSON\" errors are usually transient on the Google side or a proxy: run `/fixora` again, or `/fixora doctor --probe` to see the raw replies. 401 / 403 mean the MCP server's account cannot read this project." : ""
-  const markdown = [`### Fixora · top crashes (${sources.map((s) => s.id).join(", ")})`, "", table, ...(errors.length ? ["", `Errors: ${errors.join("; ")}${hint}`] : [])].join("\n")
+  const markdown = [`### Fixora · top crashes (${sources.map((s) => s.id).join(", ")}${query.platform ? `, ${query.platform} only` : ""})`, "", table, ...(errors.length ? ["", `Errors: ${errors.join("; ")}${hint}`] : [])].join("\n")
   const file = join(where.repo, ".dxcoder", "fixora", "crashes.md")
   await mkdir(join(where.repo, ".dxcoder", "fixora"), { recursive: true })
   await writeFile(file, `${markdown}\n`)
@@ -297,8 +299,8 @@ export async function runPaste(rt: Runtime, input: { sessionID: string; file: st
   return startPipeline(rt, run, { from: "detect" })
 }
 
-export async function runTop(rt: Runtime, input: { sessionID: string; count: number; minUsers?: number; source?: Source; maxMinutes?: number; flags: Flags }): Promise<{ started: string[]; errors: string[] }> {
-  const list = await runList(rt, { sessionID: input.sessionID, top: input.count * 3, minUsers: input.minUsers, source: input.source })
+export async function runTop(rt: Runtime, input: { sessionID: string; count: number; minUsers?: number; source?: Source; platform?: string; maxMinutes?: number; flags: Flags }): Promise<{ started: string[]; errors: string[] }> {
+  const list = await runList(rt, { sessionID: input.sessionID, top: input.count * 3, minUsers: input.minUsers, source: input.source, platform: input.platform })
   const candidates = list.crashes.filter((c) => isFixCandidate(c.state)).slice(0, input.count)
   if (candidates.length === 0) throw new FixoraStop(`No new crashes to fix: ${describeTally(tallyFixes(list.crashes))}. Run \`/fixora\` to see the links, or \`/fixora fix <ref> --force\` to fix one again.`)
   await notify(rt.ctx, input.sessionID, `fixora: fixing ${candidates.length} crash(es) one after the other: ${candidates.map((c) => c.ref ?? `${c.source}:${c.id}`).join(", ")}`)

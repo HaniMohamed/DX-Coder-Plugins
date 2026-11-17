@@ -9,25 +9,30 @@ import type { ApprovalKind, RunRecord } from "./types.js"
 
 export type Decision = "auto" | "ask" | "skip"
 
+/**
+ * Pure. The Jira ticket never asks: it is created whenever Jira is connected and `--no-ticket` is
+ * not set (the branch name may need its key before the analysis runs). Publishing (push + MR) is
+ * approved by confidence: `approvals: "confidence"` (default) asks only below
+ * `confidence.autoApprove`, `"publish"` always asks, `"auto"` (or `--auto`) never asks. Stashing the
+ * user's changes asks unless auto mode; deleting a remote branch always asks.
+ */
 export function decideApproval(kind: ApprovalKind, run: RunRecord, opts: FixoraOptions, o: { serviceAvailable: boolean }): { decision: Decision; reason: string } {
-  // Stashing the user's changes and deleting branches are never skipped: they are asked unless auto mode is on.
-  if (kind === "stash") return run.flags.auto || opts.approvals === "auto" ? { decision: "auto", reason: "auto mode" } : { decision: "ask", reason: "uncommitted changes in the checkout" }
+  const autoMode = run.flags.auto || opts.approvals === "auto"
+  if (kind === "stash") return autoMode ? { decision: "auto", reason: "auto mode" } : { decision: "ask", reason: "uncommitted changes in the checkout" }
   if (kind === "delete-branch") return { decision: "ask", reason: "remote branch deletion" }
   if (run.flags.dryRun) return { decision: "skip", reason: "dry run" }
   if (kind === "ticket" && !run.flags.ticket) return { decision: "skip", reason: "--no-ticket" }
   if ((kind === "push" || kind === "publish") && !run.flags.push) return { decision: "skip", reason: "--no-push" }
   if (kind === "mr" && !run.flags.mr) return { decision: "skip", reason: "--no-mr" }
   if (!o.serviceAvailable) return { decision: "skip", reason: kind === "ticket" ? "no Jira connection" : "no remote / forge" }
-  if (kind !== "ticket") {
-    const confidence = run.triage?.confidence ?? 0
-    const review = run.reviews[run.reviews.length - 1]
-    const tests = run.tests?.allPassed ?? false
-    const risk = run.fix?.risk.level ?? run.triage?.risk.level ?? "high"
-    const autoOk = confidence >= opts.confidence.autoApprove && tests && review?.verdict !== "reject" && review !== undefined && risk === "low"
-    if ((run.flags.auto || opts.approvals === "auto") && autoOk) return { decision: "auto", reason: `confidence ${Math.round(confidence * 100)}% ≥ ${Math.round(opts.confidence.autoApprove * 100)}%, checks green, review ${review.verdict}, risk low` }
-    if (run.flags.auto || opts.approvals === "auto") return { decision: "ask", reason: `auto-approve criteria not met (confidence ${Math.round(confidence * 100)}%, tests ${tests ? "green" : "red"}, review ${review?.verdict ?? "none"}, risk ${risk})` }
-  } else if (run.flags.auto || opts.approvals === "auto") return { decision: "auto", reason: "auto mode" }
-  return { decision: "ask", reason: `approvals=${opts.approvals}` }
+  if (kind === "ticket") return { decision: "auto", reason: "the Jira ticket needs no approval" }
+  if (autoMode) return { decision: "auto", reason: "auto mode" }
+  if (opts.approvals === "publish") return { decision: "ask", reason: "approvals=publish" }
+  const confidence = run.triage?.confidence ?? 0
+  const threshold = opts.confidence.autoApprove
+  const pct = (x: number) => `${Math.round(x * 100)}%`
+  if (confidence >= threshold) return { decision: "auto", reason: `confidence ${pct(confidence)} ≥ ${pct(threshold)}` }
+  return { decision: "ask", reason: `confidence ${pct(confidence)} below ${pct(threshold)}` }
 }
 
 export class ApprovalRejected extends Error {

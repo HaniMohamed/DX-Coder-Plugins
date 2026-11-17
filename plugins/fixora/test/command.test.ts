@@ -66,6 +66,13 @@ describe("parseCommand", () => {
     expect(err("top 50")).toContain("between 1 and 20")
     expect(ok("batch --top 5 --min-users 10 --source sentry --minutes 30")).toMatchObject({ verb: "batch", top: 5, minUsers: 10, source: "sentry", minutes: 30 })
     expect(err("batch --source jira")).toContain("--source must be")
+    expect(ok("list --platform ios")).toMatchObject({ verb: "list", platform: "ios" })
+    expect(ok("list --platform=Android")).toMatchObject({ verb: "list", platform: "android" })
+    expect(ok("list")).toEqual(expect.not.objectContaining({ platform: expect.anything() }))
+    expect(ok("top 2 --platform ios")).toMatchObject({ verb: "top", count: 2, platform: "ios" })
+    expect(ok("batch --top 3 --platform web")).toMatchObject({ verb: "batch", top: 3, platform: "web" })
+    expect(err("list --platform windows")).toContain("--platform must be android, ios, web")
+    expect(err("list --platform")).toContain("--platform must be")
   })
 
   test("status, retry, feedback, restart, fixed, report, clean, sync, help", () => {

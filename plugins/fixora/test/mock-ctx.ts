@@ -107,6 +107,11 @@ export function mockCtx(o: { directory: string; options?: Record<string, unknown
         return {}
       },
       wait: async () => {},
+      update: async (input: { sessionID: string; title?: string }) => {
+        const s = sessions.get(input.sessionID)
+        if (!s) throw new Error(`no session ${input.sessionID}`)
+        if (input.title !== undefined) s.title = input.title
+      },
       synthetic: async (input: Synthetic) => void synthetics.push(input),
       interrupt: async (input: { sessionID: string }) => {
         const s = sessions.get(input.sessionID)

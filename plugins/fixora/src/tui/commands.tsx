@@ -68,7 +68,7 @@ export interface Loaded {
 }
 
 /** Loads the sources and the top crashes into the store (shared by the picker and the crashes view). */
-export async function loadCrashes(fx: Fixora, rpc: Rpc, sessionID: string, o: { refresh?: boolean } = {}): Promise<Loaded> {
+export async function loadCrashes(fx: Fixora, rpc: Rpc, sessionID: string, o: { refresh?: boolean; platform?: string } = {}): Promise<Loaded> {
   fx.mutate((d) => {
     d.crashesLoading = true
     d.crashesError = undefined
@@ -79,7 +79,7 @@ export async function loadCrashes(fx: Fixora, rpc: Rpc, sessionID: string, o: { 
   try {
     const s = (await rpc["sources.list"]({})) as { sources: Loaded["sources"] }
     sources = s.sources
-    const list = (await rpc["crashes.list"]({ sessionID, top: 25, ...(o.refresh ? { refresh: true } : {}) })) as { crashes: CrashRow[]; errors?: string[] }
+    const list = (await rpc["crashes.list"]({ sessionID, top: 25, ...(o.refresh ? { refresh: true } : {}), ...(o.platform ? { platform: o.platform } : {}) })) as { crashes: CrashRow[]; errors?: string[] }
     crashes = list.crashes
     errors.push(...(list.errors ?? []))
   } catch (error) {
@@ -125,12 +125,12 @@ export async function fixTop(fx: Fixora, rpc: Rpc, sessionID: string, rows: Cras
 }
 
 /** The /fixora picker: lists crashes from every connected source and starts runs. */
-export async function pickCrash(fx: Fixora, rpc: Rpc): Promise<void> {
+export async function pickCrash(fx: Fixora, rpc: Rpc, o: { platform?: string } = {}): Promise<void> {
   const sessionID = await ensureSession(fx)
   if (!sessionID) return
   const toast = fx.context.ui.toast
   const loading = setTimeout(() => toast.show({ message: "Fixora: loading crashes…", variant: "info", duration: 1500 }), 400)
-  const { crashes, sources, errors } = await loadCrashes(fx, rpc, sessionID).finally(() => clearTimeout(loading))
+  const { crashes, sources, errors } = await loadCrashes(fx, rpc, sessionID, { platform: o.platform }).finally(() => clearTimeout(loading))
   const options = crashes.map(crashOption)
   const unavailable = sources.filter((s) => s.status !== "connected" && (s.id === "sentry" || s.id === "crashlytics"))
   for (const s of unavailable) options.push({ title: `${sourceLabel[s.id] ?? s.id} (${s.status}) — connect it from /mcps`, value: { kind: "source" as const, id: s.id } as never, description: s.serverName, footer: "", category: "Other", disabled: true })
@@ -203,4 +203,11 @@ export function parseSlash(input: string | undefined): { verb: string; rest: str
   const text = (input ?? "").trim()
   const [verb = "", ...rest] = text.split(/\s+/)
   return { verb: verb.toLowerCase(), rest: rest.join(" ") }
+}
+
+/** `--platform ios` / `--platform=ios` in a slash command's rest; the rest without it comes back too. */
+export function platformFlag(rest: string): { platform?: string; rest: string } {
+  const m = /(?:^|\s)--platform(?:=|\s+)(\S+)/i.exec(rest)
+  if (!m) return { rest }
+  return { platform: m[1]!.toLowerCase(), rest: rest.replace(m[0], " ").trim() }
 }

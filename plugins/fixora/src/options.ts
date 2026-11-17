@@ -42,7 +42,7 @@ export interface FixoraOptions {
   maxFixRounds: number
   maxReviewRounds: number
   confidence: { minToFix: number; minToPublish: number; autoApprove: number }
-  approvals: "publish" | "auto"
+  approvals: "confidence" | "publish" | "auto"
   mode: "fix" | "test-first"
   jira: {
     project?: string
@@ -80,8 +80,8 @@ export const DEFAULTS: FixoraOptions = {
   validate: { denyPaths: [], maxFilesChanged: 10, maxDiffLines: 400, requireTestChange: true },
   maxFixRounds: 3,
   maxReviewRounds: 3,
-  confidence: { minToFix: 0.4, minToPublish: 0.6, autoApprove: 0.85 },
-  approvals: "publish",
+  confidence: { minToFix: 0.4, minToPublish: 0.6, autoApprove: 0.8 },
+  approvals: "confidence",
   mode: "fix",
   jira: { issueType: "Bug", labels: ["fixora"], transitionOnMr: "In Review", ticketOnSkip: false },
   mr: { draft: true, labels: ["fixora"], reviewers: [] },
@@ -246,7 +246,7 @@ export function readOptions(raw: unknown): Validation<FixoraOptions> {
       minToPublish: r.num("confidence.minToPublish", d.confidence.minToPublish, { min: 0, max: 1 }),
       autoApprove: r.num("confidence.autoApprove", d.confidence.autoApprove, { min: 0, max: 1 }),
     },
-    approvals: r.getRaw("approvals") === "each" ? "publish" : r.oneOf("approvals", ["publish", "auto"] as const, d.approvals),
+    approvals: r.getRaw("approvals") === "each" ? "publish" : r.oneOf("approvals", ["confidence", "publish", "auto"] as const, d.approvals),
     mode: r.oneOf("mode", ["fix", "test-first"] as const, d.mode),
     jira: {
       project: r.str("jira.project"),
@@ -310,7 +310,7 @@ const LEGACY_OPTIONS: Array<[path: string, why: string]> = [
   ["jira.password", "Jira is reached only through a Jira MCP server"],
   ["jira.sslVerify", "Jira is reached only through a Jira MCP server"],
 ]
-const LEGACY_VALUES: Array<[path: string, value: unknown, why: string]> = [["approvals", "each", 'treated as "publish": one approval covers the Jira ticket, the push and the merge request']]
+const LEGACY_VALUES: Array<[path: string, value: unknown, why: string]> = [["approvals", "each", 'treated as "publish": one approval covers the push and the merge request']]
 
 /** Human-readable notes about legacy keys present in the raw options (shown by `/fixora doctor` and once per session). */
 export function legacyOptionWarnings(raw: unknown): string[] {

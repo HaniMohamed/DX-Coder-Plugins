@@ -323,7 +323,10 @@ export const crashlytics: CrashSource = {
     if (!toolId) return []
     const style = styleFor(sc, toolId)
     const now = Date.now()
-    return appIdsOf(sc).map((appId) => ({
+    const all = appIdsOf(sc)
+    const apps = q.platform ? all.filter((id) => platformOfAppId(id) === q.platform) : all
+    if (apps.length === 0) throw new SourceError("crashlytics", `no ${q.platform} app is configured (apps: ${all.map((id) => platformOfAppId(id) ?? id).join(", ")}); add its id to "crashlytics.appIds"`)
+    return apps.map((appId) => ({
       toolId,
       namespace: s.namespace,
       appId,

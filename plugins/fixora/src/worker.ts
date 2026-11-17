@@ -21,6 +21,30 @@ export function namespaces(services: Services) {
   }
 }
 
+/** The host shows the first 100 characters of a session title. */
+const TITLE_MAX = 100
+const clip = (text: string, max = TITLE_MAX) => (text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`)
+
+/**
+ * The title of a worker session in the host's session list: the role, then what the run is about
+ * (the Jira key once it exists, else the source and a short crash id, then the crash title). Before
+ * the crash is fetched only the run id is known.
+ */
+export function sessionTitle(run: Pick<RunRecord, "runId" | "source" | "crashId" | "title" | "jiraKey">, role: "fixer" | "reviewer", o: { round?: number } = {}): string {
+  const head = role === "fixer" ? "Fixora fix" : `Fixora review${o.round ? ` #${o.round}` : ""}`
+  const known = !!run.title && run.title !== run.runId
+  if (!known) return clip(`${head} · ${run.runId}`)
+  const tag = run.jiraKey ?? `${run.source}-${run.crashId.slice(0, 8)}`
+  return clip(`${head} · ${tag} · ${run.title.replace(/\s+/g, " ").trim()}`)
+}
+
+/** Renames the run's fixer session once the crash title or the Jira key is known (best effort: an older host has no update). */
+export async function retitleWorker(rt: Runtime, run: RunRecord): Promise<void> {
+  const id = run.sessions.fixer
+  if (!id) return
+  await rt.ctx.session.update({ sessionID: id as never, title: sessionTitle(run, "fixer") } as never).catch(() => {})
+}
+
 async function alive(rt: Runtime, sessionID: string | undefined): Promise<boolean> {
   if (!sessionID) return false
   return rt.ctx.session.get({ sessionID: sessionID as never }).then(() => true, () => false)
@@ -46,10 +70,10 @@ export async function ensureWorker(rt: Runtime, run: RunRecord, role: "fixer" | 
   let id = role === "fixer" && !o.fresh ? run.sessions.fixer : undefined
   if (id && !(await alive(rt, id))) id = undefined
   if (!id) {
-    id = await create(rt, { parentID: run.originSessionID, title: role === "fixer" ? `fixora: ${run.runId}` : `fixora review: ${run.runId} #${run.reviews.length + 1}`, directory: run.repo, role, model: role === "reviewer" ? (rt.opts.review.model ?? rt.opts.worker.model) : rt.opts.worker.model })
+    id = await create(rt, { parentID: run.originSessionID, title: sessionTitle(run, role, { round: run.reviews.length + 1 }), directory: run.repo, role, model: role === "reviewer" ? (rt.opts.review.model ?? rt.opts.worker.model) : rt.opts.worker.model })
     run.sessions[role] = id
     await saveRun(rt.ctx, run)
-  }
+  } else if (role === "fixer") await retitleWorker(rt, run) // a reused session (retry) carries the crash title and key learned since
   await saveWorker(rt.ctx, id, { runId: run.runId, role, repo: run.gitRoot ?? run.repo, folder: run.folder, phase: info.phase, grants: info.grants ?? {}, baseBranch: run.base.branch, branch: run.branch })
   return id
 }
@@ -61,7 +85,7 @@ export async function ensureLister(rt: Runtime, originSessionID: string, repo: s
   let id = existing?.sessionID
   if (id && !(await alive(rt, id))) id = undefined
   if (!id) {
-    id = await create(rt, { parentID: originSessionID, title: "fixora: crash list", directory: repo, role: "lister" })
+    id = await create(rt, { parentID: originSessionID, title: "Fixora · crash list", directory: repo, role: "lister" })
     await setJson(rt.ctx, key, { sessionID: id })
   }
   await saveWorker(rt.ctx, id, { role: "lister", repo, phase: "crashes", requestId, grants: {} })
@@ -70,7 +94,7 @@ export async function ensureLister(rt: Runtime, originSessionID: string, repo: s
 
 /** Session for verbs that are not part of a run (sync); created per call in the origin session's directory. */
 export async function ensureOpsSession(rt: Runtime, originSessionID: string, repo: string, phase: WorkerPhase, grants: WorkerGrants = {}, o: { runId?: string; branch?: string; baseBranch?: string } = {}): Promise<string> {
-  const id = await create(rt, { parentID: originSessionID, title: `fixora: ${phase}`, directory: repo, role: "fixer" })
+  const id = await create(rt, { parentID: originSessionID, title: clip(`Fixora ${phase}${o.branch ? ` · ${o.branch}` : o.runId ? ` · ${o.runId}` : ""}`), directory: repo, role: "fixer" })
   await saveWorker(rt.ctx, id, { runId: o.runId, role: "fixer", repo, phase, grants, branch: o.branch, baseBranch: o.baseBranch })
   return id
 }

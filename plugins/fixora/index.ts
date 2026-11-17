@@ -91,10 +91,10 @@ export default Plugin.define({
           return { sources: Object.values(rt.services).filter(Boolean).map((s) => ({ id: s!.id, status: s!.status, serverName: s!.serverName })) }
         },
         "crashes.list": async (input) => {
-          const i = input as { source?: string; top?: number; minUsers?: number; sessionID?: string; refresh?: boolean }
+          const i = input as { source?: string; platform?: string; top?: number; minUsers?: number; sessionID?: string; refresh?: boolean }
           try {
             rt.opts = readOpts()
-            const list = await runList(rt, { sessionID: i.sessionID ?? "", top: i.top, minUsers: i.minUsers, source: i.source as never, refresh: i.refresh })
+            const list = await runList(rt, { sessionID: i.sessionID ?? "", top: i.top, minUsers: i.minUsers, source: i.source as never, platform: i.platform, refresh: i.refresh })
             return { crashes: list.crashes, errors: list.errors }
           } catch (error) {
             return { crashes: [], errors: [describeError(error)] }
@@ -277,7 +277,7 @@ export default Plugin.define({
                 await tell(ctx, sessionID, "fixora usage", `\`\`\`\n${USAGE}\n\`\`\``)
                 break
               case "list": {
-                const list = await runList(rt, { sessionID })
+                const list = await runList(rt, { sessionID, platform: parsed.platform })
                 await presentList(rt, sessionID, list)
                 break
               }
@@ -288,12 +288,12 @@ export default Plugin.define({
                 await runPaste(rt, { sessionID, file: parsed.file, title: parsed.title, platform: parsed.platform, language: parsed.language, flags: parsed.flags })
                 break
               case "top": {
-                const res = await runTop(rt, { sessionID, count: parsed.count, flags: parsed.flags })
+                const res = await runTop(rt, { sessionID, count: parsed.count, platform: parsed.platform, flags: parsed.flags })
                 if (res.errors.length) await notify(ctx, sessionID, `fixora top: ${res.errors.join("; ")}`)
                 break
               }
               case "batch": {
-                const res = await runTop(rt, { sessionID, count: parsed.top ?? rt.opts.batch.top, minUsers: parsed.minUsers ?? rt.opts.batch.minUsers, source: parsed.source as never, maxMinutes: parsed.minutes ?? rt.opts.batch.maxMinutes, flags: parsed.flags })
+                const res = await runTop(rt, { sessionID, count: parsed.top ?? rt.opts.batch.top, minUsers: parsed.minUsers ?? rt.opts.batch.minUsers, source: parsed.source as never, platform: parsed.platform, maxMinutes: parsed.minutes ?? rt.opts.batch.maxMinutes, flags: parsed.flags })
                 await tell(ctx, sessionID, "fixora batch finished", `Batch finished.\n\nStarted: ${res.started.map((s) => `\`${s}\``).join(", ") || "none"}${res.errors.length ? `\n\nSkipped: ${res.errors.join("; ")}` : ""}\n\nRun \`/fixora status\` for details.`)
                 break
               }

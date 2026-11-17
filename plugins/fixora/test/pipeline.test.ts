@@ -16,6 +16,8 @@ import { renderRunStatus } from "../src/render.js"
 import { loadRun, saveRun } from "../src/state.js"
 import { eventEmitter } from "../src/rpc.js"
 import { registerPluginTools } from "../src/tools.js"
+import { progressOf } from "../src/tui/format.js"
+import { applyEvent, initialState } from "../src/tui/store.js"
 import type { RunRecord, WorkerInfo } from "../src/types.js"
 import { mockCtx, toolCtx, type MockCtx, type Worker } from "./mock-ctx.js"
 
@@ -170,7 +172,8 @@ beforeAll(async () => {
   repo = join(root, "repo")
   await writeFile(join(root, "trace.txt"), `TypeError: Cannot read properties of undefined (reading 'id')\n    at applyCoupon (src/cart/service.ts:2:12)\n    at pay (src/checkout.ts:40:5)\n`)
   await writeFile(join(root, "trace2.txt"), `RangeError: Invalid array length\n    at buildRows (src/table/rows.ts:17:3)\n    at render (src/table/index.ts:9:5)\n`)
-  const options = { jira: { project: undefined }, testCommands: { fullSuiteMaxMinutes: 1 } }
+  // approvals=publish: the suite exercises the publish dialog; the confidence mode has its own test.
+  const options = { jira: { project: undefined }, testCommands: { fullSuiteMaxMinutes: 1 }, approvals: "publish" }
   mock = mockCtx({ directory: repo, options, worker })
   const opts = readOptions(options)
   if (!opts.ok) throw new Error(opts.errors.join())
@@ -227,6 +230,11 @@ describe("pipeline orchestration", () => {
     expect(state.restorePrompts).toHaveLength(0)
     // The stage events came from the tools while the single turn ran.
     for (const step of ["prepare", "analyse", "fix", "validate", "review", "publish"] as const) expect(run.timings[step]?.status).toBe("ok")
+    // Rows without a phase of their own close too: no Jira → ticket skipped, nothing to link, the publish turn restored.
+    expect(run.timings.ticket).toMatchObject({ status: "skipped", attempts: 1 })
+    expect(run.timings["close-loop"]?.status).toBe("skipped")
+    expect(run.timings.restore).toMatchObject({ status: "ok", attempts: 1 })
+    expect(run.step).toBe("done")
     const work = state.workPrompts.at(-1)!
     expect(work).toContain("fixora_submit_prepare")
     expect(work).toContain("fixora_submit_triage")
@@ -245,6 +253,9 @@ describe("pipeline orchestration", () => {
     expect(fixer.agent).toBe("build")
     expect(Array.isArray(fixer.permissions)).toBe(true)
     expect(run.sessions.reviewer).not.toBe(run.sessions.fixer)
+    // Session titles name the crash, so the sessions can be found in the host's list.
+    expect(fixer.title).toBe(`Fixora fix · manual-${run.crashId.slice(0, 8)} · ${run.title}`)
+    expect(mock.sessions.get(run.sessions.reviewer!)!.title).toBe(`Fixora review #1 · manual-${run.crashId.slice(0, 8)} · ${run.title}`)
     // One approval dialog for the whole publish turn.
     const gate = mock.permissionRequests.find((p) => p.action === "fixora.publish")!
     expect(gate.resources.some((r) => r.startsWith("push branch fixora/"))).toBe(true)
@@ -263,7 +274,16 @@ describe("pipeline orchestration", () => {
       expect(stageEvents.some((e) => e.step === step && e.status === "running")).toBe(true)
       expect(stageEvents.some((e) => e.step === step && e.status === "ok")).toBe(true)
     }
+    expect(stageEvents.some((e) => e.step === "restore" && e.status === "ok")).toBe(true)
+    expect(stageEvents.some((e) => e.step === "restore" && e.status === "running")).toBe(false)
     expect(mock.rpcEvents.some((e) => e.name === "run.done")).toBe(true)
+    // Replayed into the panel's store, the run shows 11/11 and no pending row.
+    const panel = initialState()
+    for (const e of mock.rpcEvents) applyEvent(panel, e.name, e.data as Record<string, unknown>)
+    const stages = panel.runs[run.runId]!.stages
+    expect(stages.filter((st) => st.status === "pending").map((st) => st.step)).toEqual([])
+    expect(progressOf(stages)).toMatchObject({ done: stages.length, total: stages.length })
+    expect(panel.runs[run.runId]!.step).toBe("done")
     const final = mock.synthetics.filter((s) => s.resume).pop()!
     expect(final.text).toContain("finished in")
     expect(final.text).toContain(run.branch!)
@@ -455,6 +475,26 @@ describe("cancellation and the repository lock", () => {
     const aRestore = Date.parse(a.checkout.restoredAt!)
     const bPrepare = Date.parse(b.timings.prepare!.startedAt)
     expect(bPrepare).toBeGreaterThanOrEqual(aRestore)
+  })
+})
+
+describe("approvals by confidence", () => {
+  test("the default mode publishes without a dialog when the analysis confidence reaches autoApprove", async () => {
+    const saved = rt.opts
+    rt.opts = { ...rt.opts, approvals: "confidence" }
+    await writeFile(join(root, "trace3.txt"), `TypeError: Cannot read properties of undefined (reading 'id')\n    at applyCoupon (src/cart/service.ts:2:12)\n    at render (src/cart/view.ts:8:3)\n`)
+    const before = mock.permissionRequests.length
+    try {
+      const run = await runPaste(rt, { sessionID: "origin", file: join(root, "trace3.txt"), flags: { ...FLAGS, force: true } })
+      if (run.status !== "done") throw new Error(`${run.status} at ${run.step}: ${run.error}`)
+      expect(run.triage?.confidence).toBe(0.9)
+      expect(run.approvals.publish).toBe("auto")
+      expect(run.pipeline.pushed).toBe(true)
+      expect(mock.permissionRequests.slice(before).map((p) => p.action)).toEqual([])
+      expect(mock.synthetics.some((s) => /auto-approved \(confidence 90% ≥ 80%\)/.test(s.description ?? ""))).toBe(true)
+    } finally {
+      rt.opts = saved
+    }
   })
 })
 

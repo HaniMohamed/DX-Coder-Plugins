@@ -7,7 +7,7 @@
 import { Plugin } from "@opencode/plugin/tui"
 import { Show } from "solid-js"
 import { ComposerStrip, FixoraPanel, FooterChip, GateDialog, SidebarBadge, type Fixora } from "./src/tui/components.js"
-import { currentSession, ensureSession, fixTop, loadCrashes, parseSlash, pickCrash, startCrash, startRuns } from "./src/tui/commands.js"
+import { currentSession, ensureSession, fixTop, loadCrashes, parseSlash, pickCrash, platformFlag, startCrash, startRuns } from "./src/tui/commands.js"
 import { FixoraRpc, type RunSummary } from "./src/rpc.js"
 import type { FunnelStats } from "./src/state.js"
 import { activeRuns, applyEvent, applyRecord, applySummary, awaitingGates, initialState, type GateView, type PanelView, type TuiState } from "./src/tui/store.js"
@@ -259,12 +259,13 @@ export default Plugin.define({
             switch (verb) {
               case "":
               case "list":
-                return pickCrash(fx, rpc as never)
+                return pickCrash(fx, rpc as never, { platform: platformFlag(rest).platform })
               case "top": {
                 const sessionID = await ensureSession(fx)
                 if (!sessionID) return
-                const n = Math.max(1, Math.min(20, Number(rest) || 1))
-                const list = (await rpc["crashes.list"]({ sessionID, top: n * 3 })) as { crashes: Array<{ source: string; id: string; state?: string; ref?: string }> }
+                const { platform, rest: count } = platformFlag(rest)
+                const n = Math.max(1, Math.min(20, Number(count) || 1))
+                const list = (await rpc["crashes.list"]({ sessionID, top: n * 3, ...(platform ? { platform } : {}) })) as { crashes: Array<{ source: string; id: string; state?: string; ref?: string }> }
                 const refs = list.crashes.filter((c) => isFixCandidate(c.state)).slice(0, n).map((c) => c.ref ?? `${c.source}:${c.id}`)
                 if (refs.length === 0) return toast.show({ message: `No new crashes to fix (${list.crashes.length} listed, all already handled by Fixora)`, variant: "info" })
                 return startRuns(fx, rpc, sessionID, refs)

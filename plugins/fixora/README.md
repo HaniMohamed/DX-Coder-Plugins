@@ -17,11 +17,11 @@ Works on any codebase: Flutter/Dart, Kotlin/Java, Swift, JavaScript/TypeScript, 
 
 | Command | What it does |
 |---|---|
-| `/fixora` (or `/fixora:list`) | List the top crashes from every connected source (an agent session makes the MCP calls). Crashes Fixora already worked on are marked in the list with their state and their Jira / MR links (see below); the agent then asks which of the remaining ones to fix and starts the runs. |
+| `/fixora [--platform android\|ios\|web]` (or `/fixora:list`) | List the top crashes from every connected source (an agent session makes the MCP calls). `--platform` queries only the Firebase app of that platform (Sentry has no platform split and is skipped). Crashes Fixora already worked on are marked in the list with their state and their Jira / MR links (see below); the agent then asks which of the remaining ones to fix and starts the runs. |
 | `/fixora:fix <source>:<id> \| <crash url>` | Fix one crash, e.g. `sentry:4523123`, `crashlytics:deadbeef`, a Sentry issue URL or a Firebase console issue URL. With several Firebase apps, `crashlytics:deadbeef@1:123:ios:abc` names the app (the picker and `/fixora` list print this form). `/fixora sentry:123` is a shortcut. |
 | `/fixora:paste <file> [--title ".."] [--platform ..] [--language ..]` | Fix a stack trace saved in a file. No MCP server needed. |
-| `/fixora:top [N]` | Fix the top N new crashes (default 1), one after the other (one checkout, one run at a time). |
-| `/fixora:batch [--top N] [--min-users N] [--source s] [--minutes M]` | Batch mode with a time budget. |
+| `/fixora:top [N] [--platform p]` | Fix the top N new crashes (default 1), one after the other (one checkout, one run at a time). |
+| `/fixora:batch [--top N] [--min-users N] [--source s] [--platform p] [--minutes M]` | Batch mode with a time budget. |
 | `/fixora:status [<runId>]` | Runs table, or one run in detail (steps, timings, links, checkout state). |
 | `/fixora:retry <runId> [--from <step>] [--fresh]` | Resume a stopped run from where it stopped (or from a step); the agent checks the run's branch out again first, carrying an uncommitted fix along. After a fix-stage timeout the retry runs only the mapped tests (`--tests full` overrides). `--fresh` forgets the worker sessions and redoes the prepare phase. |
 | `/fixora:feedback <runId> "<message>"` | Fix copilot: ask a question about the fix or request a change. Changes are re-validated, re-reviewed, committed, pushed and the MR is updated. |
@@ -84,11 +84,11 @@ Steps are idempotent; `/fixora retry` resumes where a run stopped.
 | fetch | agent (`fixora-crashes`) | Calls the crash-source tools the plugin planned (issue, then the sample event) and submits the raw replies; the plugin parses them (firebase-tools ≥ 15 YAML and older JSON shapes), normalises frames, fingerprints, detects duplicates and reopened crashes. No frame mapping and no in-app / symbolication judgement: the frames go to the agent as reported. Pasted traces are parsed by the plugin directly. |
 | prepare | agent (`fixora-prepare`) | Inspects your checkout. **Dirty tree → the run stops and asks you** (`fixora.stash` approval); only then the agent runs `git stash push -u`. Then `git fetch <remote> <base>`, a `fixora/…` branch following the repository's naming convention, `git checkout -b`, and a quick marker-file scan of the root and the crash's package(s) for the check commands. No installs here: the fix phase runs them only when a check needs them. |
 | analyse | agent (`fixora-triage`) | Read-only root cause in the checkout: the agent locates the files of the frames itself (glob / grep), decides which frames are application code, uses `git log` / `git blame`, and submits classification (`fixable`, `third_party_only`, `needs_symbolication`, …), confidence, strategy, alternatives → `fixora_submit_triage`. Low confidence or non-fixable classifications stop here with a report. |
-| ticket | agent, inside the publish turn | Covered by the publish approval: searches Jira for a ticket with the same fingerprint marker, reuses it or creates one with the exact input the plugin rendered; the key goes into the commit trailer and the MR body. |
+| ticket | agent, inside the prepare or publish turn | No approval: searches Jira for a ticket with the same fingerprint marker, reuses it or creates one with the exact input the plugin rendered; the key goes into the commit trailer and the MR body. |
 | fix | agent (`fixora-fix`) | Minimal change plus a regression test in the checkout, the check commands run by the agent, then `git add -N . && git status --porcelain` and `git diff HEAD` submitted verbatim with the report. |
 | validate | plugin | Pure checks on the submitted status / diff: forbidden paths, file and line limits, secret scan, failed checks. Problems go back to the agent, up to `maxFixRounds`. |
 | review | agent (`fixora-review`) | A fresh, read-only reviewer session in the same checkout. A rejection goes back to the fixer with the findings, up to `maxReviewRounds`. |
-| publish | agent (`fixora-publish`) | After your approval (`fixora.publish`, one dialog for ticket + push + MR): the ticket, `git add -- <files>`, `git commit -F` with the prepared conventional message (`fix(<scope>): …`, `Fixora-Run` / `Fixora-Fingerprint` trailers), `git push -u` (never force, never the base branch), then the MR through the first provider that works: GitLab / GitHub MCP → `glab` / `gh` → compare URL. |
+| publish | agent (`fixora-publish`) | After the publish decision (`fixora.publish`: one dialog for push + MR, skipped when confidence is at least `confidence.autoApprove`): the ticket, `git add -- <files>`, `git commit -F` with the prepared conventional message (`fix(<scope>): …`, `Fixora-Run` / `Fixora-Fingerprint` trailers), `git push -u` (never force, never the base branch), then the MR through the first provider that works: GitLab / GitHub MCP → `glab` / `gh` → compare URL. |
 | close-loop | agent, inside the publish turn | Jira comment with the MR link and transition, optional note on the crash source. |
 | restore | agent, inside the publish turn | **On every exit path** (done, failed, rejected, blocked, cancelled): `git checkout <your previous branch>` and `git stash pop` of the Fixora stash. Failure paths run it as a separate step; if it fails, the final report prints the manual commands. One exception: a run that stops with its fix still uncommitted (fix timed out, checks blocked, review rejected, cancelled mid-fix) keeps the fix branch checked out and the stash untouched, so the half-done change never lands on your branch; `/fixora retry <runId> --from fix` continues there and `/fixora clean <runId>` puts your branch back. |
 
@@ -181,8 +181,8 @@ and GitLab/GitHub servers, and the plugin:
         "testCommands": { "unit": null, "integration": null, "lint": null, "typecheck": null, "timeoutSec": 600, "fullSuiteMaxMinutes": 15 },
         "validate": { "denyPaths": [], "maxFilesChanged": 10, "maxDiffLines": 400, "requireTestChange": true },
         "maxFixRounds": 3, "maxReviewRounds": 3,
-        "confidence": { "minToFix": 0.4, "minToPublish": 0.6, "autoApprove": 0.85 },
-        "approvals": "publish",
+        "confidence": { "minToFix": 0.4, "minToPublish": 0.6, "autoApprove": 0.8 },
+        "approvals": "confidence",
         "mode": "fix",
         "jira": { "project": "APP", "issueType": "Bug", "parent": null, "labels": ["fixora"], "transitionOnMr": "In Review", "ticketOnSkip": false },
         "mr": { "draft": true, "labels": ["fixora"], "reviewers": [], "target": null, "forge": null },
@@ -211,7 +211,7 @@ dxcoder plugin add 'git+https://<your-git-host>/<org>/dxcoder-plugins.git#path:p
 |---|---|---|
 | `sources` | both | Which crash sources to use when their MCP server is connected. Pasted traces always work. |
 | `baseBranch`, `remote`, `branchPrefix` | `main`, `origin`, `fixora/` | Where fixes start from; every Fixora branch starts with the prefix. |
-| `branchNaming` | `{ "type": "fix" }` | The repository's branch naming convention, applied after the prefix. `template` placeholders: `{type}` (`branchNaming.type`), `{ticket}` (the Jira key), `{slug}` (crash title), `{runId}`, `{crashId}`; `example` is shown to the agent. With a template the plugin renders the exact name and the agent must use it. `{ticket}` makes the run create the Jira ticket **before** the branch (one `fixora.ticket` approval unless auto mode; declined or no Jira → the crash id takes its place); a Sentry / Crashlytics crash is then fetched in its own agent turn first, because the ticket text needs it. Without a template the agent infers a name from the remote branches, falling back to `<prefix><runId>-<slug>`. Example: a repository with the convention `type/ticket-number-short-description` (`fix/DE-456-fix-crash-on-startup`) sets `"branchNaming": { "template": "{type}/{ticket}-{slug}", "type": "fix" }` and gets `fixora/fix/DE-457-null-coupon-in-applycoupon`; set `"branchPrefix": "fix/"` with `"template": "{ticket}-{slug}"` to drop the `fixora/` part. |
+| `branchNaming` | `{ "type": "fix" }` | The repository's branch naming convention, applied after the prefix. `template` placeholders: `{type}` (`branchNaming.type`), `{ticket}` (the Jira key), `{slug}` (crash title), `{runId}`, `{crashId}`; `example` is shown to the agent. With a template the plugin renders the exact name and the agent must use it. `{ticket}` makes the run create the Jira ticket **before** the branch, without a dialog (no Jira or `--no-ticket` → the crash id takes its place); a Sentry / Crashlytics crash is then fetched in its own agent turn first, because the ticket text needs it. Without a template the agent infers a name from the remote branches, falling back to `<prefix><runId>-<slug>`. Example: a repository with the convention `type/ticket-number-short-description` (`fix/DE-456-fix-crash-on-startup`) sets `"branchNaming": { "template": "{type}/{ticket}-{slug}", "type": "fix" }` and gets `fixora/fix/DE-457-null-coupon-in-applycoupon`; set `"branchPrefix": "fix/"` with `"template": "{ticket}-{slug}"` to drop the `fixora/` part. |
 | `worker.agent` / `worker.model` | `build` / host default | The coding agent (and model) used for every session: crash fetch, prepare, analysis, fix, publish, restore. |
 | `worker.shell` | `allow` | Whether the host prompts for the agent's shell commands (`ask`) on top of Fixora's own phase policy. |
 | `worker.maxPhaseMinutes` | see above | Time budget per phase; the session is interrupted and the run can be resumed. |
@@ -220,12 +220,12 @@ dxcoder plugin add 'git+https://<your-git-host>/<org>/dxcoder-plugins.git#path:p
 | `validate.*` | 10 files / 400 lines | Change-set limits; `denyPaths` adds protected globs. |
 | `maxFixRounds`, `maxReviewRounds` | 3 / 3 | How often failing checks or a rejecting review send the agent back. |
 | `confidence.*` | 0.4 / 0.6 / 0.85 | Minimum confidence to attempt a fix, to publish, and to auto-approve. |
-| `approvals` | `publish` | `publish` = one dialog for the Jira ticket, the push and the MR; `auto` = no dialog when confidence, checks, review and risk allow (stashing is auto-approved too). `each` is accepted as `publish`. |
+| `approvals` | `confidence` | When the publish dialog (push + MR) appears. `confidence` = only when the analysis confidence is below `confidence.autoApprove` (80% by default); `publish` = always; `auto` = never (stashing is auto-approved too). The Jira ticket never asks: it is created whenever Jira is connected and `--no-ticket` is not set. `each` is accepted as `publish`. |
 | `mode` | `fix` | `test-first` makes the agent write a failing reproduction test before the fix. |
 | `jira.*` | — | Project key enables tickets (through the Jira MCP server only); issue type, labels, transition after the MR. `parent` links every ticket to an issue (set it together with `"issueType": "Sub-task"` to create sub-tasks under a story). |
 | `mr.*` | draft | Draft MRs, labels, reviewers, target branch, forge override (`gitlab` / `github`). |
 | `sourceWriteBack` | false | Have the agent post a note with the MR link on the Sentry / Crashlytics issue. |
-| `crashlytics.appId` / `appIds`, `sentry.organization` / `project` | — | Needed by the respective MCP tools when not derivable from a URL. `appIds` lists several Firebase apps: `/fixora` queries all of them, refs carry the app (`crashlytics:<id>@<appId>`) and a bare `crashlytics:<id>` is looked up in each app in order. |
+| `crashlytics.appId` / `appIds`, `sentry.organization` / `project` | — | Needed by the respective MCP tools when not derivable from a URL. `appIds` lists several Firebase apps: `/fixora` queries all of them and shares the list slots round-robin between apps (the best issue of each first), so a quieter platform is not crowded out by a busier one; refs carry the app (`crashlytics:<id>@<appId>`) and a bare `crashlytics:<id>` is looked up in each app in order. |
 | `inAppPackages`, `appPackage` | — | Package / module prefixes used only to prefer application frames when fingerprinting a crash (dedupe / reopen detection); they never decide whether a crash is fixable. |
 | `crashes.cacheMinutes` | 5 | How long a crash list stays valid for the picker before the agent fetches it again. |
 
@@ -259,7 +259,7 @@ restore, feedback, rejected approvals, restart, dry run, cancellation and the re
 ## Verification checklist (manual, on a live DXcoder host)
 
 1. `/fixora doctor`: services come from the host's tool list; the "ignored legacy options" section lists `worktree` when it is still in `opencode.jsonc`.
-2. `/fixora`: a child session titled "fixora: crash list" calls only read tools and submits once; the picker renders; a second `/fixora` within 5 minutes uses the cache; `--probe` shows raw replies.
+2. `/fixora`: a child session titled "Fixora · crash list" calls only read tools and submits once; the picker renders; a second `/fixora` within 5 minutes uses the cache; `--probe` shows raw replies.
 3. `/fixora fix <ref>` on a clean checkout: the fixer session runs in the directory you have open; `git branch --show-current` in a terminal shows the `fixora/…` branch; no `.git/worktrees` entry appears.
 4. Dirty checkout: the `fixora.stash` dialog appears before anything is stashed; decline → run blocked, tree untouched; accept → `git stash list` shows `fixora/<runId>`.
 5. Triage: an `edit` attempt and a Jira write by the agent are refused by the hook ("read-only phase", "Jira writes need the ticket grant").

@@ -67,7 +67,7 @@ export const FixoraRpc = Rpc.define({
   id: "gosi.fixora",
   methods: {
     "sources.list": { input: obj({}), output: obj({ sources: arr(obj({ id: S, status: S, serverName: S, hint: S }, ["id", "status"])) }) },
-    "crashes.list": { input: obj({ source: S, top: N, minUsers: N, sessionID: S, refresh: B }), output: obj({ crashes: arr(CrashSummarySchema), errors: arr(S) }), errors: { source_unavailable: obj({ message: S }) } },
+    "crashes.list": { input: obj({ source: S, platform: S, top: N, minUsers: N, sessionID: S, refresh: B }), output: obj({ crashes: arr(CrashSummarySchema), errors: arr(S) }), errors: { source_unavailable: obj({ message: S }) } },
     "runs.list": { input: obj({ status: arr(S), limit: N }), output: obj({ runs: arr(RunSummarySchema) }) },
     "runs.get": { input: obj({ runId: S }, ["runId"]), output: obj({ run: any }), errors: { not_found: obj({ runId: S }) } },
     "run.start": { input: obj({ ref: S, sessionID: S, flags: any }, ["ref", "sessionID"]), output: obj({ runId: S }), errors: { busy: obj({ runId: S }), invalid_ref: obj({ ref: S }) } },

@@ -42,6 +42,8 @@ export function listPlans(sc: SourceContext, q: ListQuery & { source?: Source })
   for (const s of availableSources(sc.services, sc.options)) {
     if (q.source && s.id !== q.source) continue
     if (!s.listPlan) continue
+    // A platform filter selects Firebase apps; sources without a per-platform split have nothing to answer.
+    if (q.platform && s.id !== "crashlytics") continue
     try {
       const calls = s.listPlan(sc, q)
       if (calls.length) plans.push({ source: s.id, calls })
@@ -74,7 +76,7 @@ export function interpretCrashList(results: Array<ListResult & { source: Source 
     }
   }
   const seen = new Set<string>()
-  const crashes = out
+  const ranked = out
     .filter((c) => (q.minUsers ?? 0) === 0 || (c.userCount ?? 0) >= (q.minUsers ?? 0))
     .filter((c) => {
       const key = c.ref ?? `${c.source}:${c.id}`
@@ -82,9 +84,29 @@ export function interpretCrashList(results: Array<ListResult & { source: Source 
       seen.add(key)
       return true
     })
-    .sort((a, b) => (b.userCount ?? 0) - (a.userCount ?? 0) || (b.eventCount ?? 0) - (a.eventCount ?? 0))
-    .slice(0, q.top)
-  return { crashes, errors }
+    .sort(byImpact)
+  return { crashes: fairShare(ranked, q.top).sort(byImpact), errors }
+}
+
+const byImpact = (a: CrashSummary, b: CrashSummary) => (b.userCount ?? 0) - (a.userCount ?? 0) || (b.eventCount ?? 0) - (a.eventCount ?? 0)
+
+/**
+ * The `top` rows to keep, taken round-robin from every source / Firebase app (best of each first)
+ * so that a platform with fewer users still shows up next to a busier one. One group: plain cut.
+ */
+export function fairShare(ranked: CrashSummary[], top: number): CrashSummary[] {
+  const groups = new Map<string, CrashSummary[]>()
+  for (const c of ranked) {
+    const key = `${c.source}:${c.appId ?? ""}`
+    groups.set(key, [...(groups.get(key) ?? []), c])
+  }
+  if (groups.size <= 1) return ranked.slice(0, top)
+  const queues = [...groups.values()]
+  const picked: CrashSummary[] = []
+  for (let i = 0; picked.length < top && queues.some((g) => i < g.length); i++) {
+    for (const g of queues) if (picked.length < top && i < g.length) picked.push(g[i]!)
+  }
+  return picked
 }
 
 export const runIdFor = (source: Source, id: string) => `${source}-${id.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64)}`

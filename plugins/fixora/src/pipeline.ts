@@ -16,7 +16,7 @@ import { dedupeJql, jiraAvailable, jiraBaseUrl, jiraCommentInput, jiraCreateInpu
 import { connected } from "./mcp.js"
 import { mrProviderOrder, renderMrAttempts, renderMrOp, type MrProvider } from "./mr.js"
 import { fixFollowUpPrompt, nudgePrompt, opsPrompt, publishPrompt, renderTestFailureText, restorePlan, restoreSteps, SKILLS, workPrompt, type OpStep, type PublishPlan, type TicketPlan, type WorkStage } from "./prompts.js"
-import { appendLog, FixoraStop, notify, present, sourceContext, stageBegin, stageEnd, toolProps, type Runtime } from "./progress.js"
+import { appendLog, FixoraStop, notify, present, sourceContext, stageBegin, stageEnd, stageMark, toolProps, type Runtime } from "./progress.js"
 import { renderApprovalPreview, renderCommitMessage, renderCrashMarkdown, renderFinalReport, renderJiraComment, renderJiraIssue, renderMr, renderTriageCard, renderValidationCard } from "./render.js"
 import { ensureRunRepo } from "./repo.js"
 import { latestFixAttempt, runReview } from "./review.js"
@@ -24,7 +24,7 @@ import { scanAddedLines } from "./secrets.js"
 import { sourceById } from "./sources/index.js"
 import { crashFromFile } from "./sources/manual.js"
 import { fixInProgress, saveRun } from "./state.js"
-import type { Crash, RunRecord, Step, WorkerGrants, WorkerPhase } from "./types.js"
+import { STEPS, type Crash, type RunRecord, type Step, type WorkerGrants, type WorkerPhase } from "./types.js"
 import { checkChangedFiles, failedChecks, summarizeChecks } from "./validate.js"
 import { awaitSubmission, ensureWorker, lastAssistantText, type Outcome } from "./worker.js"
 
@@ -185,6 +185,7 @@ export class Pipeline {
 
   private async finish() {
     const run = this.run
+    if (run.status === "done") await this.settle()
     await saveRun(this.ctx, run)
     const compare = typeof run.meta?.compareUrl === "string" ? run.meta.compareUrl : undefined
     const report = renderFinalReport(run, { crashUrl: this.crashUrl(), compareUrl: compare, notes: this.notes })
@@ -725,7 +726,13 @@ export class Pipeline {
   /** Runs in `finally` for every path that did not restore inside the publish turn. */
   private async restore() {
     const run = this.run
-    if (!run.checkout?.active) return
+    if (!run.checkout?.active) {
+      // The publish turn restores as its last step (fixora_submit_ops restore): close the row for it.
+      const at = run.checkout?.restoredAt
+      const t = run.timings.restore
+      if (at && (!t?.endedAt || t.endedAt < at)) await stageMark(this.rt, run, "restore", "ok", `${run.checkout.previousBranch ?? "previous branch"}${run.checkout.stashRef ? " · stash popped" : ""}`)
+      return
+    }
     const outcome = { status: run.status, error: run.error, step: run.step }
     // A run that stopped with its fix uncommitted (fix / validate / review) keeps the fix branch checked
     // out: `git checkout <previous>` would carry the half-done change onto the user's branch, where the
@@ -779,6 +786,20 @@ export class Pipeline {
       return JSON.parse(String(run.meta?.opsResult ?? "")) as { ok: boolean; errors: string[]; results: Record<string, unknown> }
     } catch {
       return undefined
+    }
+  }
+
+  /** A done run closes every row the panel shows: the steps it never needed are recorded as skipped. */
+  private async settle() {
+    const run = this.run
+    for (const step of STEPS) {
+      if (step === "done" || run.timings[step]) continue
+      if (step === "ticket" && run.jiraKey) {
+        await stageMark(this.rt, run, step, "ok", `Jira ${run.jiraKey}`)
+        continue
+      }
+      const detail = step === "ticket" ? (run.approvals.ticket === "rejected" ? "declined" : "no ticket this run") : step === "close-loop" ? "nothing to link" : step === "restore" ? "no checkout to restore" : "not needed"
+      await stageMark(this.rt, run, step, "skipped", detail)
     }
   }
 

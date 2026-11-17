@@ -176,7 +176,8 @@ export function applyEvent(state: TuiState, name: string, data: Record<string, u
           stage.durationMs = undefined
         } else if (typeof data.durationMs === "number") stage.durationMs = data.durationMs
       }
-      run.step = step
+      // A row closed from inside another stage's turn (the ticket, a restore done by the publish turn) does not move the header.
+      if (status === "running" || !run.stages.some((s) => s.status === "running")) run.step = step
       if (status === "running") {
         run.status = "running"
         run.progress = undefined

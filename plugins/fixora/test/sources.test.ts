@@ -161,6 +161,43 @@ describe("crashlytics plans across several apps (the agent makes the calls)", ()
     expect(listPlans(sc([]), { top: 5 }).errors[0]).toContain("Firebase app id")
   })
 
+  test("listPlan: --platform keeps only that platform's app and skips Sentry; an unknown platform is an error", () => {
+    const ios = listPlans(sc([ANDROID, IOS]), { top: 5, platform: "ios" })
+    expect(ios.errors).toEqual([])
+    expect(ios.plans.map((p) => p.source)).toEqual(["crashlytics"])
+    expect(ios.plans[0]!.calls.map((c) => c.appId)).toEqual([IOS])
+    const web = listPlans(sc([ANDROID, IOS]), { top: 5, platform: "web" })
+    expect(web.plans).toEqual([])
+    expect(web.errors[0]).toContain("no web app is configured (apps: android, ios)")
+  })
+
+  test("interpretCrashList: the top slice is shared round-robin across apps so a quieter platform is not crowded out", () => {
+    const issues = (prefix: string, users: number[]) => ({ issues: users.map((u, i) => ({ id: `${prefix}${i}`, title: prefix, issueStats: { userCount: u } })) })
+    const list = interpretCrashList(
+      [
+        { source: "crashlytics", toolId: "x", appId: ANDROID, raw: issues("a", [900, 800, 700, 600, 500, 400]) },
+        { source: "crashlytics", toolId: "x", appId: IOS, raw: issues("i", [9, 8, 7, 6]) },
+      ],
+      sc([ANDROID, IOS]),
+      { top: 6 },
+    )
+    // Three of each (the best of every app first), then the usual impact order for display.
+    expect(list.crashes.map((c) => c.id)).toEqual(["a0", "a1", "a2", "i0", "i1", "i2"])
+    // When one app runs dry the other fills the remaining slots.
+    const uneven = interpretCrashList(
+      [
+        { source: "crashlytics", toolId: "x", appId: ANDROID, raw: issues("a", [900, 800, 700, 600, 500, 400]) },
+        { source: "crashlytics", toolId: "x", appId: IOS, raw: issues("i", [9]) },
+      ],
+      sc([ANDROID, IOS]),
+      { top: 4 },
+    )
+    expect(uneven.crashes.map((c) => c.id)).toEqual(["a0", "a1", "a2", "i0"])
+    // A single app is a plain cut by impact.
+    const one = interpretCrashList([{ source: "crashlytics", toolId: "x", appId: ANDROID, raw: issues("a", [1, 5, 3]) }], sc([ANDROID]), { top: 2 })
+    expect(one.crashes.map((c) => c.id)).toEqual(["a1", "a2"])
+  })
+
   test("fetchPlan: the app from the reference, else every configured app in order; follow-ups carry placeholders", () => {
     const direct = crashlytics.fetchPlan!(sc([ANDROID, IOS]), "i1", { appId: IOS })
     expect(direct.primary.map((c) => c.appId)).toEqual([IOS])

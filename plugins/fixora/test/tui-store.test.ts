@@ -40,6 +40,20 @@ describe("tui store reducers", () => {
     expect(run.stages.every((st) => st.status !== "running")).toBe(true)
   })
 
+  test("a row closed while another stage runs keeps the header on the running stage", () => {
+    const s = initialState()
+    applyEvent(s, "run.started", { runId: "r", sessionID: "ses" }, T0)
+    applyEvent(s, "run.stage", { runId: "r", sessionID: "ses", step: "publish", status: "running" }, T0)
+    applyEvent(s, "run.stage", { runId: "r", sessionID: "ses", step: "ticket", status: "ok", durationMs: 0, detail: "DE-1 created" }, T0 + 10)
+    const run = s.runs.r!
+    expect(run.step).toBe("publish")
+    expect(run.stages.find((st) => st.step === "ticket")).toMatchObject({ status: "ok", detail: "DE-1 created" })
+    expect(run.stages.find((st) => st.step === "publish")!.status).toBe("running")
+    applyEvent(s, "run.stage", { runId: "r", sessionID: "ses", step: "publish", status: "ok", durationMs: 5 }, T0 + 20)
+    applyEvent(s, "run.stage", { runId: "r", sessionID: "ses", step: "restore", status: "ok", durationMs: 0, detail: "main" }, T0 + 30)
+    expect(run.step).toBe("restore")
+  })
+
   test("failures clear gates and mark the stage", () => {
     const s = initialState()
     applyEvent(s, "run.started", { runId: "r", sessionID: "ses" }, T0)

@@ -19,11 +19,11 @@ export interface Flags {
 }
 
 export type Parsed =
-  | { verb: "list"; flags: Flags }
+  | { verb: "list"; platform?: ListPlatform; flags: Flags }
   | { verb: "fix"; ref: string; flags: Flags }
   | { verb: "paste"; file: string; title?: string; platform?: string; language?: string; flags: Flags }
-  | { verb: "top"; count: number; flags: Flags }
-  | { verb: "batch"; top?: number; minUsers?: number; source?: string; minutes?: number; flags: Flags }
+  | { verb: "top"; count: number; platform?: ListPlatform; flags: Flags }
+  | { verb: "batch"; top?: number; minUsers?: number; source?: string; minutes?: number; platform?: ListPlatform; flags: Flags }
   | { verb: "status"; runId?: string }
   | { verb: "retry"; runId: string; from?: Step; fresh: boolean; flags: Flags }
   | { verb: "feedback"; runId: string; message: string }
@@ -56,11 +56,11 @@ export interface Subcommand {
  * next to `/fixora`; `/fixora status …` keeps working as the long form.
  */
 export const SUBCOMMANDS: Subcommand[] = [
-  { verb: "list", name: `${COMMAND}:list`, args: "", description: "list the top crashes from every detected source" },
+  { verb: "list", name: `${COMMAND}:list`, args: "[--platform android|ios|web]", description: "list the top crashes from every detected source (one platform's Firebase app only with --platform)" },
   { verb: "fix", name: `${COMMAND}:fix`, args: "<source>:<id> | <crash url>", description: "fix one crash (e.g. sentry:12345, crashlytics:abc, or a Sentry / Firebase console URL)" },
   { verb: "paste", name: `${COMMAND}:paste`, args: '<file> [--title ".."] [--platform ..] [--language ..]', description: "fix a pasted stack trace saved in a file" },
-  { verb: "top", name: `${COMMAND}:top`, args: "[N]", description: "fix the top N new crashes (default 1)" },
-  { verb: "batch", name: `${COMMAND}:batch`, args: "[--top N] [--min-users N] [--source s] [--minutes M]", description: "batch mode with a time budget" },
+  { verb: "top", name: `${COMMAND}:top`, args: "[N] [--platform android|ios|web]", description: "fix the top N new crashes (default 1)" },
+  { verb: "batch", name: `${COMMAND}:batch`, args: "[--top N] [--min-users N] [--source s] [--platform p] [--minutes M]", description: "batch mode with a time budget" },
   { verb: "status", name: `${COMMAND}:status`, args: "[<runId>]", description: "runs table or one run's detail" },
   { verb: "retry", name: `${COMMAND}:retry`, args: "<runId> [--from <step>] [--fresh]", description: "resume a stopped run; --fresh forgets the worker sessions and redoes prepare" },
   { verb: "feedback", name: `${COMMAND}:feedback`, args: '<runId> "<message>"', description: "ask for a change or a question on the fix (same branch, MR updated)" },
@@ -78,7 +78,7 @@ const pad = (s: string, n: number) => (s.length >= n ? `${s}  ` : s.padEnd(n))
 
 export const USAGE = [
   "Usage:",
-  pad(`  /${COMMAND}`, 54) + "list the top crashes from every detected source",
+  pad(`  /${COMMAND} [--platform android|ios|web]`, 54) + "list the top crashes from every detected source",
   ...SUBCOMMANDS.filter((c) => c.verb !== "list").map((c) => pad(`  /${c.name} ${c.args}`.trimEnd(), 54) + c.description),
   `(the long form \`/${COMMAND} <verb> …\` works too)`,
   "Flags: --dry-run --no-ticket --no-mr --no-push --auto --force --test-first --base <branch>",
@@ -169,6 +169,18 @@ const runIdAt = (t: Tokens, i: number): string | undefined => {
   const v = t.positional[i]
   return v && RUN_ID_PATTERN.test(v) ? v : undefined
 }
+export const LIST_PLATFORMS = ["android", "ios", "web"] as const
+export type ListPlatform = (typeof LIST_PLATFORMS)[number]
+
+/** `--platform` of list / top / batch: which Firebase app (by the platform in its id) to query. */
+const listPlatform = (v: string | true | undefined, errors: string[]): ListPlatform | undefined => {
+  if (v === undefined) return undefined
+  const p = typeof v === "string" ? v.trim().toLowerCase() : ""
+  if ((LIST_PLATFORMS as readonly string[]).includes(p)) return p as ListPlatform
+  errors.push(`--platform must be ${LIST_PLATFORMS.join(", ")}`)
+  return undefined
+}
+
 const int = (v: string | true | undefined, name: string, errors: string[], o: { min: number }): number | undefined => {
   if (v === undefined || v === true) return undefined
   const n = Number(v)
@@ -191,8 +203,12 @@ export function parseCommand(text: string): ParseResult {
     case "help":
     case "--help":
       return { verb: "help" }
-    case "list":
-      return { verb: "list", flags }
+    case "list": {
+      const errs: string[] = []
+      const platform = listPlatform(t.flags.get("platform"), errs)
+      if (errs.length > 0) return fail(errs.join("; "))
+      return { verb: "list", platform, flags }
+    }
     case "fix": {
       const ref = t.positional[1]
       if (!ref) return fail("fix needs a crash reference (source:id or a crash URL)")
@@ -208,7 +224,10 @@ export function parseCommand(text: string): ParseResult {
       const raw = t.positional[1]
       const count = raw === undefined ? 1 : Number(raw)
       if (!Number.isInteger(count) || count < 1 || count > 20) return fail("top takes an integer between 1 and 20")
-      return { verb: "top", count, flags }
+      const errs: string[] = []
+      const platform = listPlatform(t.flags.get("platform"), errs)
+      if (errs.length > 0) return fail(errs.join("; "))
+      return { verb: "top", count, platform, flags }
     }
     case "batch": {
       const errs: string[] = []
@@ -217,8 +236,9 @@ export function parseCommand(text: string): ParseResult {
       const minutes = int(t.flags.get("minutes"), "minutes", errs, { min: 1 })
       const source = typeof t.flags.get("source") === "string" ? (t.flags.get("source") as string) : undefined
       if (source && source !== "sentry" && source !== "crashlytics") errs.push("--source must be sentry or crashlytics")
+      const platform = listPlatform(t.flags.get("platform"), errs)
       if (errs.length > 0) return fail(errs.join("; "))
-      return { verb: "batch", top, minUsers, source, minutes, flags }
+      return { verb: "batch", top, minUsers, source, minutes, platform, flags }
     }
     case "status": {
       const raw = t.positional[1]

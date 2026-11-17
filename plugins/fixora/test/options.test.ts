@@ -8,7 +8,8 @@ describe("readOptions", () => {
     if (!r.ok) return
     expect(r.value.baseBranch).toBe("main")
     expect(r.value.worker.agent).toBe("build")
-    expect(r.value.approvals).toBe("publish")
+    expect(r.value.approvals).toBe("confidence")
+    expect(r.value.confidence.autoApprove).toBe(0.8)
     expect(r.value.mr.draft).toBe(true)
     expect(r.value.branchPrefix).toBe("fixora/")
     expect(r.value.branchNaming).toEqual({ type: "fix", template: undefined, example: undefined })

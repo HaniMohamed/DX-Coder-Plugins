@@ -119,7 +119,7 @@ describe("crash list through the lister session", () => {
     expect(list.markdown).toContain("| 1 |")
     expect(existsSync(join(root, "repo", ".dxcoder", "fixora", "crashes.md"))).toBe(true)
     // The lister session is confined: no shell, read-only tools, created in the session's checkout.
-    const lister = [...mock.sessions.values()].find((s) => s.title === "fixora: crash list")!
+    const lister = [...mock.sessions.values()].find((s) => s.title === "Fixora · crash list")!
     expect(lister.location?.directory).toBe(join(root, "repo"))
     expect(mock.storage.get(`fixora/worker/${lister.id}`)).toMatchObject({ role: "lister", phase: "crashes" })
     // Second call within the cache window: no new prompt.
@@ -128,6 +128,28 @@ describe("crash list through the lister session", () => {
     expect(again.crashes).toHaveLength(3)
     await runList(rt, { sessionID: "origin", top: 5, refresh: true })
     expect(listerPrompts).toHaveLength(2)
+  })
+
+  test("--platform plans only that platform's Firebase app, skips Sentry and has its own cache entry", async () => {
+    const before = listerPrompts.length
+    const android = await runList(rt, { sessionID: "origin", top: 5, platform: "android" })
+    expect(listerPrompts).toHaveLength(before + 1)
+    const prompt = listerPrompts[before]!
+    expect(prompt).toContain(`"appId": "${ANDROID}"`)
+    expect(prompt).not.toContain(IOS)
+    expect(prompt).not.toContain("sentry_search_issues")
+    expect(android.crashes.every((c) => c.source === "crashlytics" && c.platform === "android")).toBe(true)
+    expect(android.crashes.length).toBeGreaterThan(0)
+    expect(android.errors).toEqual([])
+    expect(android.markdown).toContain("android only")
+    // The platform is part of the cache key: the plain list does not reuse the android-only result, and vice versa.
+    await runList(rt, { sessionID: "origin", top: 5, platform: "android" })
+    expect(listerPrompts).toHaveLength(before + 1)
+    const ios = await runList(rt, { sessionID: "origin", top: 5, platform: "ios" })
+    expect(listerPrompts).toHaveLength(before + 2)
+    expect(ios.crashes).toEqual([])
+    expect(ios.errors).toEqual([`crashlytics (${IOS}): PERMISSION_DENIED`])
+    await expect(runList(rt, { sessionID: "origin", top: 5, platform: "web" })).rejects.toThrow(/no web app is configured/)
   })
 })
 
@@ -168,7 +190,7 @@ describe("crash fetch through the fixer session", () => {
     expect(fixer.prompts[0]!.text).toContain(`Report \`appId\` as ${ANDROID}`)
   })
 
-  test("a {ticket} branch template: the crash is fetched in its own turn, the ticket is approved and created before the branch, the name carries its key", async () => {
+  test("a {ticket} branch template: the crash is fetched in its own turn, the ticket is created before the branch without a dialog, the name carries its key", async () => {
     const saved = { opts: rt.opts, tools: [...mock.mcpTools] }
     mock.mcpTools.push(fakeMcpTool("jira_jira_search", { jql: {} }), fakeMcpTool("jira_jira_create_issue", { project_key: {}, summary: {}, issue_type: {}, description: {}, additional_fields: {} }), fakeMcpTool("jira_jira_get_issue", { issue_key: {} }))
     mock.mcpServers.push({ name: "jira", status: "connected" })
@@ -182,8 +204,13 @@ describe("crash fetch through the fixer session", () => {
       expect(run.blockedReason).toBe("base-missing")
       expect(run.timings.fetch?.status).toBe("ok")
       expect(run.jiraKey).toBe("DE-456")
-      expect(run.approvals.ticket).toBe("approved")
-      expect(mock.permissionRequests.filter((p) => p.action === "fixora.ticket")).toHaveLength(1)
+      expect(run.approvals.ticket).toBe("auto")
+      // The ticket row of the panel closed from inside the prepare turn, without resetting the rows after it.
+      expect(run.timings.ticket).toMatchObject({ status: "ok", attempts: 1 })
+      // The fixer session was renamed as the run learned its crash title and ticket key.
+      expect(mock.sessions.get(run.sessions.fixer!)!.title).toBe(`Fixora fix · DE-456 · ${run.title}`)
+      expect(mock.rpcEvents.filter((e) => e.name === "run.stage" && (e.data as { step: string }).step === "ticket").map((e) => (e.data as { status: string }).status)).toEqual(["ok"])
+      expect(mock.permissionRequests.filter((p) => p.action === "fixora.ticket")).toHaveLength(0) // the ticket never asks
       expect(run.meta?.plannedBranch).toBe(`fixora/fix/<key>-${slug(run.title, 32)}`)
       const fixer = mock.sessions.get(run.sessions.fixer!)!
       // Turn 1: fetch only (the ticket needs the crash). Turn 2: prepare → analyse → fix with the ticket step first.

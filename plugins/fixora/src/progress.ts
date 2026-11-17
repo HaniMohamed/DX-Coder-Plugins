@@ -90,6 +90,20 @@ export async function stageEnd(rt: Runtime, run: RunRecord, step: Step, status: 
   await notify(rt.ctx, run.originSessionID, `fixora ${run.runId} · ${GLYPH[status]} ${step}${t?.durationMs !== undefined ? ` (${Math.round(t.durationMs / 1000)}s)` : ""}${detail ? ` — ${detail}` : ""}${error ? ` — ${error.slice(0, 120)}` : ""}`)
 }
 
+/**
+ * Records a step that finished without a running phase of its own: the Jira ticket (created inside
+ * the prepare or publish turn), a restore the publish turn did, and the steps a done run never
+ * needed. No "running" event is sent, so the panel keeps the rows after it, and `run.step` is untouched.
+ */
+export async function stageMark(rt: Runtime, run: RunRecord, step: Step, status: Exclude<StepTiming["status"], "running">, detail?: string) {
+  const at = new Date().toISOString()
+  run.timings[step] = { startedAt: at, attempts: (run.timings[step]?.attempts ?? 0) + 1, status: "running" }
+  endStep(run, step, status, at)
+  await saveRun(rt.ctx, run)
+  await rt.emit("run.stage", { runId: run.runId, sessionID: run.originSessionID, step, status, durationMs: 0, attempt: run.timings[step]?.attempts ?? 1, detail })
+  await notify(rt.ctx, run.originSessionID, `fixora ${run.runId} · ${GLYPH[status]} ${step}${detail ? ` — ${detail}` : ""}`)
+}
+
 const lastRow = new Map<string, number>()
 
 /**

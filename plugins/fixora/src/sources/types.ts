@@ -28,6 +28,8 @@ export interface SourceContext {
 export interface ListQuery {
   top: number
   minUsers?: number
+  /** Only the Firebase app(s) of this platform ("android", "ios", "web"); sources without a per-platform split are skipped. */
+  platform?: string
 }
 
 /** What the lister session submits for one planned call. */
