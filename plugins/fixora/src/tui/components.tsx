@@ -281,6 +281,7 @@ function RunsView(props: { fx: Fixora; panel: PanelInput }) {
       { bind: "m", title: "Mark fixed", enabled: () => !!selected(), run: () => void fx.actions.markFixed(selected()!.runId) },
       { bind: "y", title: "Copy MR URL", enabled: () => !!selected()?.mrUrl, run: () => void fx.actions.copy(selected()!.mrUrl!) },
       { bind: "s", title: "Sync MRs", run: () => void fx.actions.sync() },
+      { bind: "u", title: "Recover runs from MRs", run: () => void fx.actions.recover() },
       { bind: "shift+c", title: "Crashes", run: () => fx.actions.show("crashes") },
       { bind: "g", title: "Report", run: () => fx.actions.show("report") },
       { bind: "f", title: "Fullscreen", run: () => props.panel.toggleFullscreen() },
@@ -342,7 +343,7 @@ function RunsView(props: { fx: Fixora; panel: PanelInput }) {
         </box>
       </scrollbox>
       <Rule fx={fx} width={width()} />
-      <Keys fx={fx} items={[["↑↓", "select"], ["enter", "show"], ["a", "answer"], ["r", "retry"], ["R", "restart"], ["x", "cancel"], ["m", "mark fixed"], ["y", "copy MR"], ["s", "sync MRs"], ["C", "crashes"], ["g", "report"], ["esc", "back"]]} />
+      <Keys fx={fx} items={[["↑↓", "select"], ["enter", "show"], ["a", "answer"], ["r", "retry"], ["R", "restart"], ["x", "cancel"], ["m", "mark fixed"], ["y", "copy MR"], ["s", "sync MRs"], ["u", "recover"], ["C", "crashes"], ["g", "report"], ["esc", "back"]]} />
     </>
   )
 }

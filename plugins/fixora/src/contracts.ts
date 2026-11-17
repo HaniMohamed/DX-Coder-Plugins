@@ -605,6 +605,39 @@ export function validatePublish(input: unknown, ctx: PublishContext): Validation
 
 // ---------- ops ----------
 
+export const RECOVER_PROVIDERS = ["gitlab-mcp", "github-mcp", "glab", "gh"] as const
+
+/** What the recover worker submits: the listing reply (inline or in a file) and the commit trailers. */
+export interface RecoverSubmission {
+  version: 1
+  requestId: string
+  provider: (typeof RECOVER_PROVIDERS)[number]
+  remoteUrl?: string
+  raw?: unknown
+  rawFile?: string
+  commits?: string
+  commitsFile?: string
+  errors: string[]
+}
+
+export function validateRecover(input: unknown, ctx: { requestId: string }): Validation<RecoverSubmission> {
+  if (!isRecord(input)) return { ok: false, errors: ["root must be an object"] }
+  const c = new Check(input)
+  if (input.version !== 1) c.errors.push("version must be 1")
+  const requestId = c.str("requestId", { max: 100 })
+  if (requestId && requestId !== ctx.requestId) c.errors.push(`requestId must be "${ctx.requestId}"`)
+  const provider = c.oneOf("provider", RECOVER_PROVIDERS)
+  const remoteUrl = c.str("remoteUrl", { required: false, max: 500 })
+  const rawFile = c.str("rawFile", { required: false, max: 1000 })
+  const commitsFile = c.str("commitsFile", { required: false, max: 1000 })
+  const commits = typeof input.commits === "string" ? input.commits.slice(0, 200_000) : undefined
+  const errors = c.strs("errors", { max: 20 })
+  const hasRaw = input.raw !== undefined && input.raw !== null
+  if (!hasRaw && !rawFile && errors.length === 0) c.errors.push("raw (the listing reply) or rawFile (path of the saved reply) is required unless errors[] says why the listing failed")
+  if (c.errors.length > 0) return { ok: false, errors: dedupe(c.errors) }
+  return { ok: true, value: { version: 1, requestId: ctx.requestId, provider: provider!, remoteUrl, raw: hasRaw ? input.raw : undefined, rawFile, commits, commitsFile, errors } }
+}
+
 export const OPS = ["close-loop", "restore", "sync", "close-mr", "jira-comment", "clean", "annotate"] as const
 export type Op = (typeof OPS)[number]
 

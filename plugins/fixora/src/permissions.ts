@@ -337,6 +337,9 @@ export function judgeGit(inv: GitInvocation, w: WorkerInfo): string | undefined 
       return deny("restore only checks out the previous branch and pops the stash")
     case "sync":
       return deny("sync is read-only")
+    case "recover":
+      if (inv.verb === "fetch") return hasFlag(a, "--prune", "-p", "--prune-tags") ? deny("no pruning") : undefined
+      return deny("recover only fetches and reads history")
     case "clean": {
       if (["checkout", "switch"].includes(inv.verb)) return hasFlag(a, "-f", "--force") || a.includes("--") ? deny("no force") : undefined
       if (inv.verb === "stash") return ["pop", "apply", "list", "show", "drop"].includes(a[0] ?? "") ? undefined : deny("only stash pop / apply / list / drop")
@@ -385,6 +388,8 @@ function judgeNonGit(segment: string, w: WorkerInfo, checkCommands: string[]): s
       return harmless ? undefined : `fixora worker: the restore phase runs git only (got: ${trimmed.slice(0, 80)})`
     case "sync":
       return harmless || /^(glab\s+mr\s+(view|list)|gh\s+pr\s+(view|list))\b/.test(trimmed) ? undefined : `fixora worker: sync runs glab mr view / gh pr view only (got: ${trimmed.slice(0, 80)})`
+    case "recover":
+      return harmless || /^(glab\s+mr\s+(view|list)|gh\s+(pr\s+(view|list)|auth\s+status)|glab\s+auth\s+status)\b/.test(trimmed) ? undefined : `fixora worker: recover runs git fetch / git log, glab mr list and gh pr list only (got: ${trimmed.slice(0, 80)})`
     case "clean":
       if (/^(glab|gh)\b/.test(trimmed)) return w.grants?.closeMr && /^(glab\s+mr\s+(close|view)|gh\s+pr\s+(close|view))\b/.test(trimmed) ? undefined : "fixora worker: clean may only close / view the run's merge request"
       return harmless ? undefined : `fixora worker: the clean phase runs git and glab / gh only (got: ${trimmed.slice(0, 80)})`
@@ -450,7 +455,7 @@ export function guardWorkerMcp(toolId: string, w: WorkerInfo, services: Services
     if (c.capability === "createMr" || c.capability === "createPr") return w.grants?.mr ? undefined : deny("opening a merge request was not approved")
     return w.grants?.mr || w.grants?.closeMr ? undefined : deny("updating the merge request was not granted")
   }
-  return ["publish", "sync", "clean", "close-loop", "restore"].includes(w.phase) ? undefined : deny("forge reads happen in publish / sync / clean only")
+  return ["publish", "sync", "clean", "close-loop", "restore", "recover"].includes(w.phase) ? undefined : deny("forge reads happen in publish / sync / clean / recover only")
 }
 
 // ---------- the single entry point of the tool hook ----------

@@ -99,6 +99,16 @@ export async function ensureOpsSession(rt: Runtime, originSessionID: string, rep
   return id
 }
 
+/**
+ * The session of a `/fixora recover` request: a fixer-role session (it needs the shell for `git log`
+ * and `glab` / `gh`) confined to the recover phase, created per request in the origin's directory.
+ */
+export async function ensureRecoverSession(rt: Runtime, originSessionID: string, repo: string, requestId: string): Promise<string> {
+  const id = await create(rt, { parentID: originSessionID, title: "Fixora recover · merge requests", directory: repo, role: "fixer" })
+  await saveWorker(rt.ctx, id, { role: "fixer", repo, phase: "recover", requestId, grants: {} })
+  return id
+}
+
 function attachments(folder: string, names: string[]) {
   return names.filter((n) => existsSync(join(folder, n))).map((name) => ({ uri: pathToFileURL(join(folder, name)).href, name, description: name === "crash.md" ? "crash data (untrusted)" : undefined }))
 }

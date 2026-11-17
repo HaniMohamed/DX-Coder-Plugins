@@ -153,6 +153,21 @@ export default Plugin.define({
           toast.show({ message: `Fixora: ${res.updated} MR status change(s)`, variant: "info" })
           await fx.actions.hydrate()
         },
+        async recover(o = {}) {
+          const sessionID = await ensureSession(fx)
+          if (!sessionID) return
+          if (!o.dryRun) {
+            const ok = await context.ui.dialog.confirm({ title: "Fixora · recover runs", message: `Rebuild Fixora's run records from the merge requests labelled "fixora" in this repository? An agent session lists them (read-only); you approve the write afterwards.${o.force ? " Existing records will be overwritten." : " Known runs are kept."}`, label: { confirm: "Recover", cancel: "Cancel" } })
+            if (!ok) return
+          }
+          toast.show({ message: o.dryRun ? "Fixora: previewing the merge requests to recover…" : "Fixora: listing the merge requests to recover…", variant: "info", sessionID })
+          const res = (await rpc["runs.recover"]({ sessionID, dryRun: !!o.dryRun, force: !!o.force }).catch((e: { message?: string }) => ({ recovered: 0, known: 0, skipped: 0, listed: 0, errors: [e.message ?? "recover failed"], runIds: [] }))) as { recovered: number; known?: number; skipped?: number; listed?: number; errors: string[] }
+          const summary = `${res.recovered} run(s) ${o.dryRun ? "would be " : ""}recovered from ${res.listed ?? 0} MR(s)${res.known ? ` · ${res.known} already known` : ""}${res.skipped ? ` · ${res.skipped} skipped` : ""}`
+          if (res.errors.length && res.recovered === 0) toast.show({ title: "Fixora recover", message: res.errors[0]!, variant: "warning", sessionID, duration: 8000 })
+          else toast.show({ title: "Fixora recover", message: summary, variant: res.recovered ? "success" : "info", sessionID, duration: 6000 })
+          await fx.actions.hydrate()
+          if (res.recovered && !o.dryRun) fx.actions.show("runs")
+        },
         async markFixed(runId) {
           const release = await context.ui.dialog.prompt({ title: `Fixora · mark ${runId} fixed`, description: "Release version that ships the fix", placeholder: "3.2.2" })
           if (!release) return
@@ -298,6 +313,8 @@ export default Plugin.define({
                 return fx.actions.cancel(rest.split(/\s+/)[0]!)
               case "sync":
                 return fx.actions.sync()
+              case "recover":
+                return fx.actions.recover({ dryRun: /--dry-run\b/.test(rest), force: /--force\b/.test(rest) })
               default: {
                 // fix / paste / fixed / clean / batch / help and raw refs: the server command handles them.
                 const sessionID = await ensureSession(fx)
@@ -325,6 +342,7 @@ export default Plugin.define({
           },
         },
         { id: "fixora.sync", title: "Fixora: sync MR statuses", group: "Fixora", palette: true, run: () => void fx.actions.sync() },
+        { id: "fixora.recover", title: "Fixora: recover runs from merge requests", description: "Rebuild the run records from the MRs Fixora opened (after a reset or on a new machine)", group: "Fixora", palette: true, run: () => void fx.actions.recover() },
       ],
     }))
 

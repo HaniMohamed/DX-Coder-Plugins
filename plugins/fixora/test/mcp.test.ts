@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { classifyTool, isWriteTool, matchServices, mcpNamespace, normalizeToolOutput, adaptInput, paramStyleOf, parseToolText, renderDoctor, renderToolSchema } from "../src/mcp.js"
 import { pruneUndefined, prunedHandlers } from "../src/rpc.js"
+import { codeModePath } from "../src/prompts.js"
 
 describe("matchServices", () => {
   test("detects each service from tool ids, including odd server names", () => {
@@ -129,7 +130,13 @@ describe("gitlab tool aliases + adaptInput", () => {
   test("create_mr / get_mr style servers are recognised", () => {
     const servers = [{ name: "gitlab", status: "connected" }]
     const ids = ["gitlab_gitlab_create_mr", "gitlab_gitlab_get_mr", "gitlab_gitlab_update_mr", "gitlab_gitlab_list_mrs", "gitlab_gitlab_create_issue"]
-    expect(matchServices(ids, servers).gitlab).toMatchObject({ namespace: "gitlab_gitlab", serverName: "gitlab", status: "connected", capabilities: { createMr: "gitlab_gitlab_create_mr", getMr: "gitlab_gitlab_get_mr", updateMr: "gitlab_gitlab_update_mr", listMrs: "gitlab_gitlab_list_mrs" } })
+    const gitlab = matchServices(ids, servers).gitlab!
+    expect(gitlab).toMatchObject({ namespace: "gitlab", serverName: "gitlab", status: "connected", capabilities: { createMr: "gitlab_gitlab_create_mr", getMr: "gitlab_gitlab_get_mr", updateMr: "gitlab_gitlab_update_mr", listMrs: "gitlab_gitlab_list_mrs" } })
+    // The namespace is the server's, so the CodeMode path names the tool as the server registered it (seen live: `tools.gitlab.gitlab_list_mrs`).
+    expect(codeModePath(gitlab.capabilities.listMrs!, gitlab.namespace)).toBe("tools.gitlab.gitlab_list_mrs")
+    expect(classifyTool("gitlab_gitlab_update_mr", { gitlab })).toMatchObject({ capability: "updateMr" })
+    // Without a server list the tool prefix is all there is.
+    expect(matchServices(ids, []).gitlab).toMatchObject({ namespace: "gitlab_gitlab" })
   })
   test("adaptInput renames to the schema's spelling and drops unknown keys", () => {
     const aliases = { project_id: ["projectId", "project"], merge_request_iid: ["mrIid", "iid"], description: ["body"] }

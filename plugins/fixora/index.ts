@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import { COMMAND, parseCommand, SUBCOMMANDS, USAGE, type Flags, type Parsed } from "./src/command.js"
 import { describeError } from "./src/errors.js"
-import { prepareRun, presentList, refreshServices, runClean, runDoctor, runFeedback, runFix, runFixed, runList, runPaste, runReport, runReset, runRestart, runRetry, runStatus, runSync, runTop, startPipeline, warnLegacyOnce } from "./src/flows.js"
+import { prepareRun, presentList, refreshServices, runClean, runDoctor, runFeedback, runFix, runFixed, runList, runPaste, runRecover, runReport, runReset, runRestart, runRetry, runStatus, runSync, runTop, startPipeline, warnLegacyOnce } from "./src/flows.js"
 import { ackGate, decideGate } from "./src/gate.js"
 import { DEFAULTS, readOptions, type FixoraOptions } from "./src/options.js"
 import { guardWorkerTool, SHELL_TOOLS, WRITE_TOOLS } from "./src/permissions.js"
@@ -175,6 +175,16 @@ export default Plugin.define({
           return { ok: true }
         },
         "mr.sync": async (input) => ({ updated: await runSync(rt, { sessionID: (input as { sessionID?: string }).sessionID ?? "" }) }),
+        "runs.recover": async (input) => {
+          const i = input as { sessionID?: string; dryRun?: boolean; force?: boolean }
+          try {
+            rt.opts = readOpts()
+            const r = await runRecover(rt, { sessionID: i.sessionID ?? "", dryRun: i.dryRun, force: i.force })
+            return { recovered: r.recovered.length, known: r.known.length, skipped: r.skipped.length, listed: r.listed, errors: r.errors, runIds: r.recovered.map((x) => x.runId) }
+          } catch (error) {
+            return { recovered: 0, known: 0, skipped: 0, listed: 0, errors: [describeError(error).split("\n")[0]!], runIds: [] }
+          }
+        },
         "report.get": async (input) => {
           const [runs, crashes] = await Promise.all([listRuns(ctx), listCrashIndex(ctx)])
           return funnel(runs, crashes, { days: (input as { days?: number }).days ?? 30 }) as unknown as Record<string, unknown>
@@ -324,6 +334,9 @@ export default Plugin.define({
               case "reset":
                 await runReset(rt, { sessionID, files: parsed.files })
                 break
+              case "recover":
+                await runRecover(rt, { sessionID, dryRun: parsed.dryRun, force: parsed.force, state: parsed.state, limit: parsed.limit, label: parsed.label })
+                break
               case "doctor":
                 await runDoctor(rt, { sessionID, all: parsed.all, probe: parsed.probe, tool: parsed.tool })
                 break
@@ -333,7 +346,7 @@ export default Plugin.define({
     await ctx.command.transform((editor) => {
       editor.add({
         name: COMMAND,
-        description: "Fix production crashes: pick a crash from Sentry / Crashlytics (or paste a trace); the coding agent then finds the root cause in this checkout, fixes and tests it on a fixora/ branch, a second agent session reviews it, and after your approval the agent pushes and opens a draft MR (with a Jira ticket when available). Your branch and local changes are restored afterwards. Verbs: fix, paste, top, batch, status, retry, feedback, restart, fixed, report, clean, sync, reset, doctor (each also a /fixora:<verb> command).",
+        description: "Fix production crashes: pick a crash from Sentry / Crashlytics (or paste a trace); the coding agent then finds the root cause in this checkout, fixes and tests it on a fixora/ branch, a second agent session reviews it, and after your approval the agent pushes and opens a draft MR (with a Jira ticket when available). Your branch and local changes are restored afterwards. Verbs: fix, paste, top, batch, status, retry, feedback, restart, fixed, report, clean, sync, reset, recover, doctor (each also a /fixora:<verb> command).",
         execute: (input) => dispatch(input.sessionID, input.prompt.text),
       })
       // Every verb as its own command so the palette lists `/fixora:status`, `/fixora:fix`, …

@@ -376,6 +376,7 @@ export function renderRunStatus(run: RunRecord): string {
   if (run.tests) facts.push(`Checks: ${run.tests.commands.map((c) => `${c.kind} ${c.exitCode === 0 ? "✓" : "✗"}`).join(" · ")}`)
   facts.push(`Rounds: fix ${run.counters.fixRounds}, review ${run.counters.reviewRounds}, feedback ${run.counters.feedback}, restarts ${run.counters.restarts}`)
   facts.push(`Folder: \`${run.folder}\``)
+  if (typeof run.meta?.recoveredFrom === "string") facts.push(`Recovered from the merge request${typeof run.meta.recoveredAt === "string" ? ` ${relTime(run.meta.recoveredAt)}` : ""}${run.meta.fingerprintPartial === true ? " (fingerprint prefix only: reopen detection off for this crash)" : ""}; timings and sessions are not available`)
   L.push(...facts.map((f) => `- ${f}`))
   L.push("", `Next: \`/fixora retry ${run.runId}\`${run.status === "done" || run.mrUrl ? ` · \`/fixora feedback ${run.runId} "…"\` · \`/fixora fixed ${run.runId} --release X\`` : ""} · \`/fixora restart ${run.runId}\` · \`/fixora clean ${run.runId}\``)
   return L.join("\n")

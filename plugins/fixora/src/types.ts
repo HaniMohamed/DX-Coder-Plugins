@@ -317,7 +317,7 @@ export interface CrashIndexEntry {
 }
 
 export type WorkerRole = "fixer" | "reviewer" | "lister"
-export type WorkerPhase = "crashes" | "crash" | "prepare" | "triage" | "ticket" | "fix" | "feedback" | "review" | "publish" | "close-loop" | "restore" | "sync" | "clean"
+export type WorkerPhase = "crashes" | "crash" | "prepare" | "triage" | "ticket" | "fix" | "feedback" | "review" | "publish" | "close-loop" | "restore" | "sync" | "clean" | "recover"
 
 /** What a worker session may do right now; the plugin tools and the tool hook read this record on every call. */
 export interface WorkerGrants {

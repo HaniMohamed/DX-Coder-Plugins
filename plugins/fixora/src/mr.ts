@@ -197,6 +197,87 @@ export function renderMrOp(o: { provider: MrProvider; op: "update" | "close" | "
   }
 }
 
+// ---------- listing (recover) ----------
+
+export type MrListState = "all" | "open" | "merged" | "closed"
+export type MrListProvider = Exclude<MrProvider, "url">
+
+/** Providers that can LIST merge requests, in order: the matching MCP server (with a list tool), then the CLI. */
+export function mrListProviderOrder(services: Services, remote: ParsedRemote | undefined, o: { forge?: FixoraOptions["mr"]["forge"] } = {}): MrListProvider[] {
+  const kind = o.forge ?? remote?.kind ?? "unknown"
+  const host = remote?.host ?? ""
+  const gl = services.gitlab?.status === "connected" && !!services.gitlab.capabilities.listMrs && (!host || serviceMatchesHost(services.gitlab, host))
+  const gh = services.github?.status === "connected" && !!services.github.capabilities.listPrs && (!host || serviceMatchesHost(services.github, host))
+  const out: MrListProvider[] = []
+  if (kind === "gitlab") {
+    if (gl) out.push("gitlab-mcp")
+    out.push("glab")
+  } else if (kind === "github") {
+    if (gh) out.push("github-mcp")
+    out.push("gh")
+  } else {
+    if (gl) out.push("gitlab-mcp")
+    if (gh) out.push("github-mcp")
+    out.push("glab", "gh")
+  }
+  return out
+}
+
+export interface MrListPlan {
+  provider: MrListProvider
+  /** MCP: the list tool, its namespace and the page-1 input (`page` is incremented by the worker). */
+  toolId?: string
+  namespace?: string
+  input?: Record<string, unknown>
+  /** CLI: the exact command; its JSON output goes to `outFile` (page `n` → `<outFile>.<n>.json` for glab). */
+  command?: string
+  /** The page size the input asks for; a shorter page ends the listing. */
+  perPage: number
+  /** CLI pages are numbered files; gh pages by itself. */
+  pagedFiles: boolean
+}
+
+export const LIST_PER_PAGE = 100
+
+/**
+ * The exact tool input / command line that lists the merge requests carrying `label`. The project
+ * path comes from the remote when the plugin could read it, else the placeholder `<owner/repo>` the
+ * prompt tells the worker to fill in from `git remote get-url`.
+ */
+export function renderMrList(o: { provider: MrListProvider; remote?: ParsedRemote; label: string; state: MrListState; limit: number; services: Services; toolProps: (toolId: string) => Record<string, unknown>; outFile: string }): MrListPlan | undefined {
+  const project = o.remote ? `${o.remote.owner}/${o.remote.repo}` : "<owner/repo>"
+  const owner = o.remote?.owner ?? "<owner>"
+  const repo = o.remote?.repo ?? "<repo>"
+  const perPage = Math.min(LIST_PER_PAGE, Math.max(1, o.limit))
+  switch (o.provider) {
+    case "gitlab-mcp": {
+      const toolId = o.services.gitlab?.capabilities.listMrs
+      if (!toolId) return undefined
+      const props = o.toolProps(toolId)
+      const labelsProp = (props.labels ?? props.label) as { type?: string } | undefined
+      const labels = labelsProp?.type === "array" ? [o.label] : o.label
+      const input = adaptInput({ project_id: project, state: o.state === "open" ? "opened" : o.state, labels, per_page: perPage, page: 1, order_by: "updated_at", sort: "desc" }, props, GITLAB_ALIASES)
+      return { provider: o.provider, toolId, namespace: o.services.gitlab?.namespace, input, perPage, pagedFiles: false }
+    }
+    case "github-mcp": {
+      const toolId = o.services.github?.capabilities.listPrs
+      if (!toolId) return undefined
+      const input = adaptInput({ owner, repo, state: o.state === "open" ? "open" : o.state === "all" ? "all" : "closed", per_page: perPage, page: 1, sort: "updated", direction: "desc" }, o.toolProps(toolId))
+      return { provider: o.provider, toolId, namespace: o.services.github?.namespace, input, perPage, pagedFiles: false }
+    }
+    case "glab": {
+      const state = o.state === "all" ? ["--all"] : o.state === "merged" ? ["--merged"] : o.state === "closed" ? ["--closed"] : []
+      const args = ["glab", "mr", "list", "--label", o.label, ...state, "--output", "json", "--per-page", String(perPage), "--page", "1"]
+      return { provider: o.provider, command: `${args.map(shellQuote).join(" ")} > ${shellQuote(`${o.outFile}.1.json`)}`, perPage, pagedFiles: true }
+    }
+    case "gh": {
+      const fields = "number,title,body,state,isDraft,url,headRefName,baseRefName,createdAt,updatedAt,mergedAt,closedAt,labels,headRefOid,mergeCommit,author"
+      const args = ["gh", "pr", "list", "--label", o.label, "--state", o.state, "--limit", String(Math.max(1, o.limit)), "--json", fields]
+      return { provider: o.provider, command: `${args.map(shellQuote).join(" ")} > ${shellQuote(`${o.outFile}.1.json`)}`, perPage: Math.max(1, o.limit), pagedFiles: false }
+    }
+  }
+}
+
 export function urlFromResult(raw: unknown): { url?: string; id?: string } {
   if (typeof raw === "string") {
     const url = /https?:\/\/\S+\/(?:-\/merge_requests|merge_requests|pull)\/\d+/.exec(raw)?.[0]

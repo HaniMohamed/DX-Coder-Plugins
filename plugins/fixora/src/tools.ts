@@ -5,14 +5,17 @@
 
 import type { Plugin } from "@opencode/plugin"
 import { existsSync } from "node:fs"
-import { mkdir, writeFile } from "node:fs/promises"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { markPrepared, markRestored } from "./checkout.js"
-import { validateFix, validateOps, validatePrepare, validatePublish, validateReview, validateTicket, validateTriage } from "./contracts.js"
+import { validateFix, validateOps, validatePrepare, validatePublish, validateRecover, validateReview, validateTicket, validateTriage } from "./contracts.js"
 import { duplicateMessage, indexCrash } from "./crashindex.js"
 import { describeError } from "./errors.js"
-import { FORBIDDEN_GLOBS, forbiddenReason } from "./permissions.js"
+import { parseRemote } from "./git.js"
+import type { MrListPlan, MrListProvider, MrListState } from "./mr.js"
+import { FORBIDDEN_GLOBS, forbiddenReason, normalizePath } from "./permissions.js"
 import { sourceContext, stageBegin, stageEnd, stageMark, type Runtime } from "./progress.js"
+import { normalizeMrList, parseTrailers, type MrListing } from "./recover.js"
 import { retitleWorker } from "./worker.js"
 import { renderCrashMarkdown, renderProject } from "./render.js"
 import { interpretCrashList, sourceById } from "./sources/index.js"
@@ -38,6 +41,19 @@ export interface CrashListRecord {
   plans: Array<{ source: Source; calls: Array<{ toolId: string; input: Record<string, unknown>; appId?: string; label?: string }> }>
   planErrors: string[]
   result?: { crashes: CrashSummary[]; errors: string[]; raw?: unknown; at: string }
+}
+
+/** Stored under `fixora/recover/<requestId>`: what the recover worker was asked to list and what it reported. */
+export interface RecoverRecord {
+  requestId: string
+  originSessionID: string
+  createdAt: string
+  label: string
+  state: MrListState
+  limit: number
+  plan: MrListPlan
+  remoteUrl?: string
+  result?: { provider: MrListProvider; remoteUrl?: string; mrs: MrListing[]; trailers: Record<string, string>; errors: string[]; at: string }
 }
 
 const schema = (properties: Record<string, unknown>, required: string[]) => ({ type: "object", properties, required, additionalProperties: true })
@@ -152,6 +168,21 @@ const PUBLISH_SCHEMA = schema(
 )
 
 const OPS_SCHEMA = schema({ version: { type: "number", const: 1 }, runId: S, op: { type: "string", enum: ["close-loop", "restore", "sync", "close-mr", "jira-comment", "clean", "annotate"] }, ok: B, results: ANY, errors: A(S) }, ["version", "op", "ok", "errors"])
+
+const RECOVER_SCHEMA = schema(
+  {
+    version: { type: "number", const: 1 },
+    requestId: S,
+    provider: { type: "string", enum: ["gitlab-mcp", "github-mcp", "glab", "gh"] },
+    remoteUrl: { type: "string", description: "the remote url (`git remote get-url <remote>`)" },
+    raw: { description: "the listing reply (or the array of page replies), verbatim" },
+    rawFile: { type: "string", description: "path of the saved JSON listing (CLI providers); page n is read from <path with .n.json>" },
+    commits: { type: "string", description: "the `Fixora-Run:` / `Fixora-Fingerprint:` lines from git log, verbatim" },
+    commitsFile: { type: "string", description: "path of the file those lines were written to" },
+    errors: A(S),
+  },
+  ["version", "requestId", "provider", "errors"],
+)
 
 const START_SCHEMA = schema({ refs: A(S), flags: schema({ dryRun: B, ticket: B, mr: B, push: B, auto: B, force: B, testFirst: B }, []) }, ["refs"])
 
@@ -585,6 +616,64 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
         await saveRun(ctx, run)
         const more = o.op === "close-loop" ? CONTINUE("the restore step of the prompt") : STOP()
         return ok(`${o.op} recorded (${o.ok ? "ok" : "with errors"}).${more}`)
+      },
+    })
+
+    editor.add({
+      name: "submit_recover",
+      description: "Fixora recover: submit the merge-request listing (the reply value or the saved JSON file) and the Fixora commit trailer lines. Call it once, from the same execute script that listed the merge requests when an MCP tool was used. Then stop.",
+      input: RECOVER_SCHEMA,
+      output: RESULT_SCHEMA,
+      options: { namespace: "fixora", codemode: true },
+      async execute(input, c) {
+        const w = await worker(c.sessionID, "fixer", ["recover"])
+        if ("error" in w) return failure([w.error], "recover")
+        if (!w.info.requestId) return failure(["this session has no recover request"], "recover")
+        const result = validateRecover(input, { requestId: w.info.requestId })
+        if (!result.ok) return failure(result.errors, "recover")
+        const record = await getJson<RecoverRecord>(ctx, keys.recover(w.info.requestId))
+        if (!record) return failure([`unknown request ${w.info.requestId}`], "recover")
+        const s = result.value
+        const errors = [...s.errors]
+        const inside = (p: string) => normalizePath(p).startsWith(`${normalizePath(join(w.info.repo, ".dxcoder", "fixora"))}/`)
+        const readInside = async (p: string) => {
+          if (!inside(p)) {
+            errors.push(`${p} is outside ${join(w.info.repo, ".dxcoder", "fixora")}; files are only read from there`)
+            return undefined
+          }
+          return readFile(p, "utf8").catch((e: unknown) => {
+            errors.push(`${p}: ${describeError(e)}`)
+            return undefined
+          })
+        }
+        const raws: unknown[] = []
+        if (s.raw !== undefined) raws.push(s.raw)
+        if (s.rawFile) {
+          // `<base>.1.json`, `.2.json`, … are one page each (CLI listings); any other name is a single file.
+          const paged = /^(.*)\.1\.json$/.exec(s.rawFile)
+          if (paged) {
+            for (let n = 1; n <= 50; n++) {
+              const p = `${paged[1]}.${n}.json`
+              if (n > 1 && !existsSync(p)) break
+              const text = await readInside(p)
+              if (text === undefined) break
+              raws.push(text)
+            }
+          } else {
+            const text = await readInside(s.rawFile)
+            if (text !== undefined) raws.push(text)
+          }
+        }
+        let commits = s.commits ?? ""
+        if (!commits && s.commitsFile) commits = (await readInside(s.commitsFile)) ?? ""
+        const mrs = normalizeMrList(raws)
+        const trailers = parseTrailers(commits)
+        if (mrs.length === 0 && errors.length === 0 && raws.length === 0) return failure(["no listing was submitted: pass the reply as raw, or the saved file as rawFile"], "recover")
+        // A placeholder left in place of the remote url ("<remote url from step 1>") is dropped, not stored.
+        const remoteUrl = s.remoteUrl && parseRemote(s.remoteUrl) ? s.remoteUrl : undefined
+        record.result = { provider: s.provider, remoteUrl, mrs, trailers: Object.fromEntries(trailers), errors, at: now() }
+        await setJson(ctx, keys.recover(w.info.requestId), record)
+        return ok(`Recover listing recorded: ${mrs.length} merge request(s), ${trailers.size} commit trailer pair(s)${errors.length ? `, ${errors.length} error(s)` : ""}.${STOP()}`, { count: mrs.length })
       },
     })
 

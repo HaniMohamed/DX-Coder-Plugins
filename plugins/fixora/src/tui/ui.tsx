@@ -28,6 +28,8 @@ export interface Fixora {
     /** Switches the panel view (and opens the panel when needed). */
     show(view: PanelView, runId?: string): void
     sync(): Promise<void>
+    /** Rebuilds the run records from the merge requests Fixora opened (after a reset / on a new machine). */
+    recover(o?: { dryRun?: boolean; force?: boolean }): Promise<void>
     markFixed(runId: string): Promise<void>
     copy(text: string): Promise<void>
     hydrate(runId?: string): Promise<void>

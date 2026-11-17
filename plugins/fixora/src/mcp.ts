@@ -127,9 +127,12 @@ export function matchServices(toolIds: string[], servers: ServerInfo[], configs?
     const server =
       servers.find((s) => mcpNamespace(s.name) === namespace) ??
       servers.filter((s) => namespace.startsWith(`${mcpNamespace(s.name)}_`)).sort((a, b) => b.name.length - a.name.length)[0]
+    // The CodeMode path is `tools.<server namespace>.<tool name>`: a server called "gitlab" whose tools
+    // are named `gitlab_list_mrs` is reached as `tools.gitlab.gitlab_list_mrs`, not `tools.gitlab_gitlab.list_mrs`,
+    // so the namespace is the server's whenever the server is known.
     out[id] = {
       id,
-      namespace,
+      namespace: server ? mcpNamespace(server.name) : namespace,
       serverName: server?.name ?? namespace,
       status: server ? statusOf(server) : "unknown",
       toolIds: toolIds.filter((t) => (prefix ? t.startsWith(prefix) : true) && Object.values(probes).some((p) => p.test(t))),

@@ -6,7 +6,7 @@
 
 import { restorePlan } from "./checkout.js"
 import { shellQuote } from "./git.js"
-import type { MrAttempt } from "./mr.js"
+import type { MrAttempt, MrListPlan } from "./mr.js"
 import type { FixoraOptions } from "./options.js"
 import type { FetchPlan, ToolCall } from "./sources/types.js"
 import type { CheckCommand, RunRecord, TestReport } from "./types.js"
@@ -370,6 +370,69 @@ export function restoreSteps(run: RunRecord, o: { keepFix?: boolean } = {}): OpS
 }
 
 export { restorePlan }
+
+// ---------- recover (merge requests → run records) ----------
+
+export interface RecoverPromptInput {
+  requestId: string
+  repo: string
+  remote: string
+  /** Known from `.git/config`; when undefined the worker reads it with `git remote get-url`. */
+  remoteUrl?: string
+  label: string
+  plan: MrListPlan
+  /** `git log` trailer lines go here (`<repo>/.dxcoder/fixora/recover/<requestId>.commits.txt`). */
+  commitsFile: string
+  /** CLI listings are written here (`<base>.<n>.json`). */
+  outFile: string
+}
+
+/** The one CodeMode script an MCP listing runs: every page, then the submission with the page replies. */
+export function recoverScript(i: RecoverPromptInput): string {
+  const p = i.plan
+  const path = codeModePath(p.toolId!, p.namespace) ?? `tools["${p.toolId}"]`
+  const items = "Array.isArray(r) ? r : r && typeof r === \"object\" ? (r.merge_requests ?? r.pull_requests ?? r.items ?? r.data ?? r.results) : undefined"
+  return [
+    "const pages = []",
+    "const errors = []",
+    `const input = ${JSON.stringify(p.input)}`,
+    "for (let page = 1; page <= 20; page++) {",
+    "  let r",
+    `  try { r = await ${path}({ ...input, page }) } catch (e) { errors.push(\`page \${page}: \${String(e?.message ?? e)}\`); break }`,
+    "  pages.push(r)",
+    `  const items = ${items}`,
+    `  if (!Array.isArray(items) || items.length < ${p.perPage}) break`,
+    "}",
+    `return await tools.fixora.submit_recover({ version: 1, requestId: ${JSON.stringify(i.requestId)}, provider: ${JSON.stringify(p.provider)}, remoteUrl: ${JSON.stringify(i.remoteUrl ?? "<remote url from step 1>")}, raw: pages, commitsFile: ${JSON.stringify(i.commitsFile)}, errors })`,
+  ].join("\n")
+}
+
+/**
+ * `/fixora recover`: list the merge requests Fixora opened (by label), read the `Fixora-Run` /
+ * `Fixora-Fingerprint` commit trailers from history, submit both. Read-only apart from `git fetch`.
+ */
+export function recoverPrompt(i: RecoverPromptInput): Prompt {
+  const p = i.plan
+  const L: string[] = [
+    `Fixora recover ${i.requestId}: list the merge requests Fixora opened in this repository (label \`${i.label}\`) and the Fixora commit trailers, then submit both with fixora_submit_recover. Repository: ${i.repo}. Do exactly the steps below, in order; change no input, add no filters, do not summarise or edit any reply.`,
+    ...(p.toolId ? [CODEMODE_NOTE, FORWARD_NOTE] : []),
+    RETRY_NOTE,
+    "",
+  ]
+  let n = 1
+  if (i.remoteUrl) L.push(`${n++}. The remote \`${i.remote}\` is ${i.remoteUrl}; nothing to look up.`)
+  else L.push(`${n++}. \`git remote get-url ${shellQuote(i.remote)}\` — the project path is everything after the host, without \`.git\` (e.g. \`group/app\`); it replaces \`<owner/repo>\` (and \`<owner>\` / \`<repo>\`) below, and the full URL is reported as \`remoteUrl\`.`)
+  L.push(`${n++}. \`git fetch ${shellQuote(i.remote)} --no-tags\` — best effort: when it fails (offline, auth), carry on with the history already present.`)
+  L.push(`${n++}. \`git log --all --grep='^Fixora-Run:' --format=%B | grep '^Fixora-' > ${shellQuote(i.commitsFile)}\` — the run id / fingerprint pairs from Fixora's commits; an empty file (grep exit code 1) is fine, do not retry.`)
+  if (p.toolId) {
+    L.push(`${n++}. List the merge requests with tool \`${p.toolId}\`${codeModePath(p.toolId, p.namespace) ? ` (CodeMode: \`${codeModePath(p.toolId, p.namespace)}(input)\`)` : ""}, page by page, and submit from the same execute script. Run this script once (replace \`<owner/repo>\` / \`<owner>\` / \`<repo>\`${i.remoteUrl ? "" : " and `<remote url from step 1>`"} from step 1 when they appear; change nothing else):`, "```js", recoverScript(i), "```")
+  } else {
+    L.push(`${n++}. \`${p.command}\` — the JSON listing goes to the file.${p.pagedFiles ? ` When the file holds exactly ${p.perPage} entries, run the same command again with \`--page 2\` into \`${i.outFile}.2.json\`, then \`--page 3\` into \`.3.json\`, until a page is shorter.` : ""} A missing or unauthenticated CLI is an error to report, not something to install or log in to.`)
+    L.push(`${n++}. Call fixora_submit_recover ONCE with { version: 1, requestId: "${i.requestId}", provider: "${p.provider}", remoteUrl: "<the remote url>", rawFile: "${i.outFile}.1.json", commitsFile: "${i.commitsFile}", errors: [] } (errors[]: the exact message of any step that failed).`)
+  }
+  L.push("", "Never open, update, close or merge anything; never run commands that were not listed. When the submission reports validation errors, fix exactly what it names and call it again. Then stop.")
+  return { text: L.join("\n"), files: [], skills: [SKILLS.ops] }
+}
 
 /** "You have not called X" nudge after a worker went idle without submitting. */
 export function nudgePrompt(tool: string, runId: string | undefined, skills: string[], extra = ""): Prompt {

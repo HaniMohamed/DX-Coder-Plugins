@@ -16,6 +16,8 @@ export const keys = {
   lister: (sessionID: string) => `fixora/lister/${sessionID}`,
   /** Result of an ops prompt that belongs to no run (sync), keyed by the worker session. */
   ops: (sessionID: string) => `fixora/ops/${sessionID}`,
+  /** A `/fixora recover` request (plan + the merge requests the worker listed). */
+  recover: (requestId: string) => `fixora/recover/${requestId}`,
 }
 
 type StorageValue = Parameters<Plugin.Context["storage"]["set"]>[1]

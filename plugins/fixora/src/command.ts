@@ -33,12 +33,16 @@ export type Parsed =
   | { verb: "clean"; runId: string; remote: boolean }
   | { verb: "sync" }
   | { verb: "reset"; files: boolean }
+  | { verb: "recover"; dryRun: boolean; force: boolean; state: RecoverState; limit: number; label?: string }
   | { verb: "doctor"; all: boolean; probe: boolean; tool?: string }
   | { verb: "help" }
 
 export type ParseResult = Parsed | { error: string }
 
 export const RUN_ID_PATTERN = /^(sentry|crashlytics|manual)-[A-Za-z0-9._-]{1,64}$/
+
+export const RECOVER_STATES = ["all", "open", "merged", "closed"] as const
+export type RecoverState = (typeof RECOVER_STATES)[number]
 
 export type Verb = Parsed["verb"]
 
@@ -70,6 +74,7 @@ export const SUBCOMMANDS: Subcommand[] = [
   { verb: "clean", name: `${COMMAND}:clean`, args: "<runId> [--remote]", description: "restore the checkout, delete the local branch (and, after approval, the remote branch)" },
   { verb: "sync", name: `${COMMAND}:sync`, args: "", description: "refresh MR statuses" },
   { verb: "reset", name: `${COMMAND}:reset`, args: "[--files]", description: "forget every run, crash and cache record (after approval); --files also deletes <repo>/.dxcoder/fixora" },
+  { verb: "recover", name: `${COMMAND}:recover`, args: "[--dry-run] [--force] [--state all|open|merged|closed] [--limit N] [--label fixora]", description: "rebuild the run records from the merge requests Fixora opened (after a reset or on a new machine); --dry-run previews, --force overwrites known runs" },
   { verb: "doctor", name: `${COMMAND}:doctor`, args: "[--all] [--probe] [--tool <id>]", description: "MCP servers / tools Fixora detects; --probe calls the crash source; --tool prints a tool's input schema" },
   { verb: "help", name: `${COMMAND}:help`, args: "", description: "show this usage" },
 ]
@@ -90,7 +95,7 @@ interface Tokens {
   flags: Map<string, string | true>
 }
 
-const VALUE_FLAGS = new Set(["from", "base", "model", "tests", "title", "platform", "language", "top", "min-users", "source", "minutes", "release", "days"])
+const VALUE_FLAGS = new Set(["from", "base", "model", "tests", "title", "platform", "language", "top", "min-users", "source", "minutes", "release", "days", "state", "limit", "label", "tool"])
 
 /** Splits on whitespace, honouring double-quoted strings, `--key value` and `--key=value`. */
 export function tokenize(text: string): Tokens {
@@ -292,6 +297,17 @@ export function parseCommand(text: string): ParseResult {
       return { verb: "sync" }
     case "reset":
       return { verb: "reset", files: t.flags.has("files") }
+    case "recover": {
+      const errs: string[] = []
+      const rawState = t.flags.get("state")
+      const state = rawState === undefined ? "all" : typeof rawState === "string" && (RECOVER_STATES as readonly string[]).includes(rawState.toLowerCase()) ? (rawState.toLowerCase() as RecoverState) : undefined
+      if (!state) errs.push(`--state must be ${RECOVER_STATES.join(", ")}`)
+      const limit = int(t.flags.get("limit"), "limit", errs, { min: 1 }) ?? 200
+      const label = typeof t.flags.get("label") === "string" ? (t.flags.get("label") as string).trim() : undefined
+      if (label !== undefined && !label) errs.push("--label needs a name")
+      if (errs.length > 0) return fail(errs.join("; "))
+      return { verb: "recover", dryRun: flags.dryRun, force: flags.force, state: state!, limit, label }
+    }
     case "doctor":
       return { verb: "doctor", all: t.flags.has("all"), probe: t.flags.has("probe"), tool: typeof t.flags.get("tool") === "string" ? (t.flags.get("tool") as string) : undefined }
     default:

@@ -44,6 +44,16 @@ MCP tool calls (Jira, GitLab, GitHub, crash sources) go through the `execute` to
   current branch or does not exist), and `git push <remote> --delete <branch>` only when listed.
   Results: `{ "localDeleted": true|false, "remoteDeleted": true|false }`.
 - **annotate** — post the given note on the crash source. Results: `{ "noted": true }`.
+- **recover** (reported with `fixora_submit_recover`, not `fixora_submit_ops`) — list the merge
+  requests Fixora opened and read its commit trailers so the plugin can rebuild its run records.
+  Steps, as listed: `git remote get-url` when the prompt needs it, `git fetch <remote> --no-tags`
+  (a failure is not a stop), `git log --all --grep='^Fixora-Run:' --format=%B | grep '^Fixora-' > <file>`
+  (an empty result is fine), then the listing: either the MCP list tool page by page from ONE
+  execute script that ends with `tools.fixora.submit_recover({ … raw: pages … })`, or
+  `glab mr list … --output json > <file>.1.json` / `gh pr list … --json … > <file>.1.json`
+  followed by `fixora_submit_recover` with `rawFile`. Pass replies through unchanged; never open,
+  update, close or merge anything; a missing or unauthenticated CLI is reported in `errors[]`, not
+  installed or logged in to.
 
 ## Report (`fixora_submit_ops`)
 

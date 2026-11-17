@@ -11,18 +11,19 @@ import { crashFixOf, describeTally, isFixCandidate, tallyFixes } from "./crashst
 import { parseRemote, shellQuote } from "./git.js"
 import { jiraCommentInput } from "./jira.js"
 import { connected, detectServices, INSTALL_SOURCES, listServers, renderDoctor, renderToolSchema, toolSchemas } from "./mcp.js"
-import { renderMrOp, type MrProvider } from "./mr.js"
+import { mrListProviderOrder, renderMrList, renderMrOp, type MrListPlan, type MrListState, type MrProvider } from "./mr.js"
 import { legacyOptionWarnings } from "./options.js"
 import { Pipeline } from "./pipeline.js"
-import { crashListPrompt, nudgePrompt, opsPrompt, restoreSteps, SKILLS, type OpStep } from "./prompts.js"
+import { crashListPrompt, nudgePrompt, opsPrompt, recoverPrompt, restoreSteps, SKILLS, type OpStep } from "./prompts.js"
 import { FixoraStop, notify, present, progress, sourceContext, tell, toolProps, type Runtime } from "./progress.js"
+import { rankCandidates, rebuildIndex, rebuildRun, renderRecoverReport, type RecoverOutcome } from "./recover.js"
 import { renderCrashTable, renderFunnelReport, renderJiraComment, renderRunsTable, renderRunStatus } from "./render.js"
-import { ensureRunRepo, folderFor, sessionRepo, type SessionRepo } from "./repo.js"
+import { ensureRunRepo, folderFor, readRemoteUrl, sessionRepo, type SessionRepo } from "./repo.js"
 import { availableSources, listPlans, resolveRef, runIdFor } from "./sources/index.js"
 import { acquireLock, funnel, getJson, keys, listCrashIndex, listKeys, listRuns, loadCrashIndex, loadRun, now, releaseLock, resumePoint, saveCrashIndex, saveRun, setJson, TERMINAL, wipeStorage } from "./state.js"
-import type { CrashListRecord } from "./tools.js"
+import type { CrashListRecord, RecoverRecord } from "./tools.js"
 import type { CrashSummary, RunRecord, Source, Step, WorkerGrants, WorkerPhase } from "./types.js"
-import { awaitSubmission, ensureLister, ensureWorker, promptSession } from "./worker.js"
+import { awaitSubmission, ensureLister, ensureRecoverSession, ensureWorker, promptSession } from "./worker.js"
 
 export { folderFor }
 
@@ -430,6 +431,108 @@ export async function runSync(rt: Runtime, input: { sessionID: string }) {
   }
   await notify(rt.ctx, input.sessionID, `fixora sync: ${runs.length} open MR(s) checked, ${updated} status change(s)`)
   return updated
+}
+
+// ---------- recover (merge requests → run records) ----------
+
+export interface RecoverInput {
+  sessionID: string
+  dryRun?: boolean
+  force?: boolean
+  state?: MrListState
+  limit?: number
+  label?: string
+}
+
+/**
+ * `/fixora recover`: rebuilds the run records (and the crash index) from the merge requests Fixora
+ * opened, after a reset or on a machine that never ran them. A worker session lists the MRs that
+ * carry the `fixora` label (GitLab / GitHub MCP, else `glab` / `gh`) and reads the `Fixora-Run` /
+ * `Fixora-Fingerprint` commit trailers; the plugin parses the descriptions Fixora wrote. Known
+ * runs are kept unless `--force`; nothing is written on `--dry-run`, and the write is approved first.
+ */
+export async function runRecover(rt: Runtime, input: RecoverInput): Promise<RecoverOutcome> {
+  await refreshServices(rt)
+  const where = await sessionRepo(rt.ctx, input.sessionID)
+  const label = input.label ?? rt.opts.mr.labels[0] ?? "fixora"
+  const state: MrListState = input.state ?? "all"
+  const limit = input.limit ?? 200
+  const remoteUrl = await readRemoteUrl(where.repo, rt.opts.remote)
+  const remote = remoteUrl ? parseRemote(remoteUrl, rt.opts.mr.forge) : undefined
+  const requestId = `recover-${rand()}`
+  const folder = join(where.repo, ".dxcoder", "fixora", "recover")
+  const outFile = join(folder, requestId)
+  const commitsFile = join(folder, `${requestId}.commits.txt`)
+  const order = mrListProviderOrder(rt.services, remote, { forge: rt.opts.mr.forge })
+  let plan: MrListPlan | undefined
+  for (const provider of order) {
+    plan = renderMrList({ provider, remote, label, state, limit, services: rt.services, toolProps: (id) => toolProps(rt, id), outFile })
+    if (plan) break
+  }
+  if (!plan) throw new FixoraStop("No way to list merge requests: connect a GitLab / GitHub MCP server with a list tool, or install `glab` / `gh`.")
+  await mkdir(folder, { recursive: true })
+  const record: RecoverRecord = { requestId, originSessionID: input.sessionID, createdAt: now(), label, state, limit, plan, remoteUrl }
+  await setJson(rt.ctx, keys.recover(requestId), record)
+  const sessionID = await ensureRecoverSession(rt, input.sessionID, where.repo, requestId)
+  await notify(rt.ctx, input.sessionID, `fixora recover: the agent is listing the merge requests labelled \`${label}\` via ${plan.provider}${remote ? ` for ${remote.owner}/${remote.repo}` : ""} (session ${sessionID})`)
+  const prompt = recoverPrompt({ requestId, repo: where.repo, remote: rt.opts.remote, remoteUrl, label, plan, commitsFile, outFile })
+  const minutes = rt.opts.worker.maxPhaseMinutes.list
+  let outcome = await promptSession(rt, sessionID, prompt, { minutes })
+  let fresh = (await getJson<RecoverRecord>(rt.ctx, keys.recover(requestId))) ?? record
+  if (!fresh.result && outcome === "done") {
+    outcome = await promptSession(rt, sessionID, nudgePrompt("fixora_submit_recover", undefined, [SKILLS.ops], `requestId "${requestId}", provider "${plan.provider}", the listing (raw or rawFile), commitsFile "${commitsFile}" and every error you got`), { minutes: 3 })
+    fresh = (await getJson<RecoverRecord>(rt.ctx, keys.recover(requestId))) ?? record
+  }
+  if (!fresh.result) throw new FixoraStop(outcome === "timeout" ? `Listing the merge requests exceeded ${minutes} minutes. See the worker session ${sessionID} and try again.` : `The worker session ${sessionID} did not report the merge requests. See that session, then run \`/fixora recover\` again.`)
+  const result = fresh.result
+  const provider = result.provider
+  const resolvedRemote = result.remoteUrl ?? remoteUrl
+  const { picks, skipped } = rankCandidates(result.mrs, { label })
+  const trailers = new Map(Object.entries(result.trailers ?? {}))
+  const existing = new Map((await listRuns(rt.ctx)).map((r) => [r.runId, r] as const))
+  const at = now()
+  const recovered: RunRecord[] = []
+  const known: RecoverOutcome["known"] = []
+  for (const candidate of picks) {
+    const old = existing.get(candidate.facts.runId)
+    if (old && !input.force) {
+      known.push({ runId: old.runId, mrUrl: candidate.mr.url })
+      continue
+    }
+    if (old && rt.inflight.has(old.runId)) {
+      skipped.push({ mr: candidate.mr, reason: `run ${old.runId} is in progress right now` })
+      continue
+    }
+    recovered.push(rebuildRun({ candidate, repo: where.repo, sessionID: input.sessionID, provider, remote: rt.opts.remote, remoteUrl: resolvedRemote ?? undefined, baseBranch: rt.opts.baseBranch, trailers, at, folder: folderFor(where.repo, candidate.facts.runId) }))
+  }
+  const outcomeReport: RecoverOutcome = { label, provider, listed: result.mrs.length, recovered, known, skipped, errors: [...result.errors], dryRun: !!input.dryRun }
+  if (input.dryRun || recovered.length === 0) {
+    await present(rt.ctx, input.sessionID, `fixora recover: ${recovered.length} run(s) ${input.dryRun ? "would be" : ""} recovered from ${result.mrs.length} MR(s)`.replace(/\s+/g, " "), renderRecoverReport(outcomeReport))
+    return outcomeReport
+  }
+  const byStatus: Record<string, number> = {}
+  for (const r of recovered) byStatus[r.mrStatus ?? "open"] = (byStatus[r.mrStatus ?? "open"] ?? 0) + 1
+  await rt.ctx.permission.assert({
+    sessionID: input.sessionID as never,
+    action: "fixora.recover",
+    resources: [
+      `write ${recovered.length} run record(s) rebuilt from merge requests (${Object.entries(byStatus).map(([s, n]) => `${n} ${s}`).join(", ")})${recovered.filter((r) => r.jiraKey).length ? `, ${recovered.filter((r) => r.jiraKey).length} with a Jira ticket` : ""}`,
+      ...(input.force && recovered.some((r) => existing.has(r.runId)) ? [`⚠ overwrite ${recovered.filter((r) => existing.has(r.runId)).length} existing run record(s) (--force)`] : []),
+      ...(known.length ? [`keep ${known.length} run(s) already recorded`] : []),
+      "merge requests, branches, commits and Jira tickets are only read, never changed",
+    ],
+    metadata: { requestId, provider, dryRun: false, force: !!input.force },
+  })
+  for (const run of recovered) {
+    await mkdir(run.folder, { recursive: true }).catch(() => {})
+    const mr = picks.find((p) => p.facts.runId === run.runId)?.mr
+    if (mr) await writeFile(join(run.folder, "mr.md"), `# ${mr.title}\n\n${mr.body}\n`).catch(() => {})
+    await saveRun(rt.ctx, run)
+    const index = rebuildIndex(run, run.fingerprint ? await loadCrashIndex(rt.ctx, run.fingerprint) : undefined)
+    if (index) await saveCrashIndex(rt.ctx, index)
+  }
+  await present(rt.ctx, input.sessionID, `fixora recover: ${recovered.length} run(s) recovered from ${result.mrs.length} MR(s)`, renderRecoverReport(outcomeReport))
+  return outcomeReport
 }
 
 // ---------- retry / feedback / restart / fixed / clean ----------

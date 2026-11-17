@@ -32,8 +32,40 @@ Works on any codebase: Flutter/Dart, Kotlin/Java, Swift, JavaScript/TypeScript, 
 | `/fixora:doctor [--all] [--probe] [--tool <id>]` | Show the MCP servers and tools Fixora detects, which services it recognised, ignored legacy options, and the likely fix when a crash source is missing. `--all` lists every tool id; `--probe` has the agent make one real call per crash source and app and prints the raw reply; `--tool <id>` prints a tool's input schema. |
 | `/fixora:reset [--files]` | Forget every stored record (runs, crash index, cached crash lists, locks) after approval; `--files` also deletes `<repo>/.dxcoder/fixora`. Branches, commits, MRs and Jira tickets are never touched. Useful between test rounds. |
 | `/fixora:clean <runId> [--remote]` | Restore the checkout if a run left it on its branch, delete the local branch (and, after approval, the remote branch). |
+| `/fixora:recover [--dry-run] [--force] [--state all\|open\|merged\|closed] [--limit N] [--label fixora]` | Rebuild the run records from the merge requests Fixora opened: after a `reset`, on a new machine, or when the host's database was lost. See [Recovering runs from merge requests](#recovering-runs-from-merge-requests). |
 
 Every verb is registered as its own command so the command palette lists them (`/fixora:status`, `/fixora:fix`, …); the long form `/fixora <verb> …` does the same thing.
+
+### Recovering runs from merge requests
+
+Fixora's memory (run records, crash index) lives in the host's plugin storage, so `/fixora reset`, a
+lost database or a second machine leaves the crash list unaware of what was already fixed. The work
+products survive on the remotes, and every MR Fixora opens is self-describing: the `fixora` label
+(`mr.labels[0]`), a title ending in `(fixes crash <source>:<id>)`, a description with the crash,
+the Jira link, the root cause, the confidence, the files changed, the review verdict and the risk,
+and a footer with the run id and the fingerprint prefix; the commits carry `Fixora-Run` /
+`Fixora-Fingerprint` trailers. `/fixora recover` reads all of that back:
+
+1. A worker session (read-only apart from `git fetch`) lists the labelled MRs through the GitLab /
+   GitHub MCP list tool, else `glab mr list` / `gh pr list`, page by page, and greps the commit
+   trailers out of `git log --all` for the full fingerprints. The project path comes from
+   `.git/config` when the plugin can read it; otherwise the worker runs `git remote get-url`.
+2. The plugin parses the descriptions (nothing is guessed: an MR whose title / description do not
+   match Fixora's layout is listed under *Skipped*), keeps one MR per run (merged beats open beats
+   closed; a restart's `-r2` branch supersedes the closed one), and skips runs already recorded unless
+   `--force`.
+3. `--dry-run` shows the table and stops. Otherwise one `fixora.recover` approval precedes the write.
+   Each recovered run is `done` with its MR, Jira, branch, root cause, files and review; timings,
+   worker sessions, check results and the checkout state are not stored in an MR and stay empty
+   (`/fixora status <runId>` says so). The original description is saved as `mr.md` in the run
+   folder. Only a full fingerprint (from a trailer) is put into the crash index, so reopen detection
+   works again for those crashes; the 12-character prefix from the footer is kept on the run only.
+
+After a recovery `/fixora` marks the recovered crashes as handled again, `/fixora sync` refreshes
+the MR states and `/fixora fixed <runId> --release X` records the release of a merged fix. Note that
+`/fixora feedback` re-renders the MR description from the recovered summary, which is shorter than
+the original. The TUI offers the same action as *Fixora: recover runs from merge requests* in the
+palette, `/fixora recover [--dry-run] [--force]` in the composer and `u` in the runs view.
 
 ### What the list says about crashes Fixora already handled
 
@@ -269,3 +301,4 @@ restore, feedback, rejected approvals, restart, dry run, cancellation and the re
 9. Publish: one `fixora.publish` dialog; `git log -1` shows the prepared message and trailers; push without force; draft MR via MCP, then `glab` / `gh`, else the compare URL in the report; a forced push or a push to `main` is refused by the hook.
 10. Restore: after done, after a rejected gate and after `/fixora restart` mid-run, `git branch --show-current` is your previous branch and the stash is popped; kill the host during fix → `/fixora retry` → prepare keeps the branch already checked out; `/fixora clean <id> --remote` asks `fixora.delete-branch`.
 11. `/fixora feedback`, `/fixora sync`, `/fixora fixed` go through ops prompts; `worker.shell = "ask"` makes the host prompt for shell calls, `"allow"` yields no prompts beyond the Fixora gates.
+12. `/fixora recover --dry-run` after a `reset`: a session titled "Fixora recover · merge requests" runs only `git remote get-url` / `git fetch` / `git log` and the list tool or CLI, the table names every Fixora MR with its Jira key and MR state; `/fixora recover` then asks `fixora.recover` once, `/fixora status` lists the runs as `done`, and `/fixora` shows them as handled with their links.
