@@ -16,7 +16,7 @@ import { legacyOptionWarnings } from "./options.js"
 import { Pipeline } from "./pipeline.js"
 import { crashListPrompt, nudgePrompt, opsPrompt, recoverPrompt, restoreSteps, SKILLS, type OpStep } from "./prompts.js"
 import { FixoraStop, notify, present, progress, sourceContext, tell, toolProps, type Runtime } from "./progress.js"
-import { rankCandidates, rebuildIndex, rebuildRun, renderRecoverReport, type RecoverOutcome } from "./recover.js"
+import { rankCandidates, rebuildIndex, rebuildRun, renderRecoverReport, type MrListing, type RecoverOutcome } from "./recover.js"
 import { renderCrashTable, renderFunnelReport, renderJiraComment, renderRunsTable, renderRunStatus } from "./render.js"
 import { ensureRunRepo, folderFor, readRemoteUrl, sessionRepo, type SessionRepo } from "./repo.js"
 import { availableSources, listPlans, resolveRef, runIdFor } from "./sources/index.js"
@@ -384,12 +384,12 @@ export async function probeSources(rt: Runtime, sessionID: string): Promise<stri
 }
 
 /** One ops prompt for an existing run (outside the pipeline): sync / close-mr / jira-comment / clean / restore. */
-export async function opsRound(rt: Runtime, run: RunRecord, o: { phase: WorkerPhase; grants?: WorkerGrants; op: string; title: string; steps: OpStep[]; report: string; minutes?: number; forward?: boolean }): Promise<{ ok: boolean; errors: string[]; results: Record<string, unknown> } | undefined> {
+export async function opsRound(rt: Runtime, run: RunRecord, o: { phase: WorkerPhase; grants?: WorkerGrants; op: string; title: string; steps: OpStep[]; report: string; minutes?: number }): Promise<{ ok: boolean; errors: string[]; results: Record<string, unknown> } | undefined> {
   const sessionID = await ensureWorker(rt, run, "fixer", { phase: o.phase, grants: o.grants })
   const token = `${o.op}:${rand()}`
   run.meta = { ...run.meta, expect: token, received: null }
   await saveRun(rt.ctx, run)
-  const r = await awaitSubmission(rt, run, sessionID, opsPrompt({ runId: run.runId, op: o.op, title: o.title, steps: o.steps, report: o.report, repo: run.repo, forward: o.forward }), {
+  const r = await awaitSubmission(rt, run, sessionID, opsPrompt({ runId: run.runId, op: o.op, title: o.title, steps: o.steps, report: o.report, repo: run.repo }), {
     minutes: o.minutes ?? rt.opts.worker.maxPhaseMinutes.restore,
     label: o.title,
     pick: (fresh) => (fresh.meta?.received === token ? fresh : undefined),
@@ -412,48 +412,67 @@ function mrTargetOf(rt: Runtime, run: RunRecord) {
   return remote ? { remote, base: rt.opts.mr.target ?? run.base.branch, branch: run.branch! } : undefined
 }
 
+const mrIid = (url?: string, id?: string) => id ?? (url ? url.split(/[/!#]/).pop() : undefined)
+
 export async function runSync(rt: Runtime, input: { sessionID: string }) {
   await refreshServices(rt)
   const runs = (await listRuns(rt.ctx)).filter((r) => r.mrUrl && r.mrProvider && r.mrProvider !== "url" && r.mrStatus !== "merged" && r.mrStatus !== "closed")
   if (runs.length === 0) {
-    await tell(rt.ctx, input.sessionID, "fixora sync: nothing to check", "**fixora sync** — no open merge requests to refresh. Sync only checks runs whose MR is still `draft` or `open`; merged, closed, and MR-less runs are skipped.\n\n`/fixora status` lists every run and its MR state.")
+    await tell(rt.ctx, input.sessionID, "fixora sync: nothing to check", "**fixora sync** — no open merge requests to refresh. Sync only checks runs whose MR is still `draft` or `open`; merged, closed and MR-less runs are skipped.\n\n`/fixora status` lists every run and its MR state.")
     return 0
   }
-  await notify(rt.ctx, input.sessionID, `fixora sync: checking ${runs.length} open MR(s)…`)
+  const where = await sessionRepo(rt.ctx, input.sessionID)
+  const label = rt.opts.mr.labels[0] ?? "fixora"
+  await notify(rt.ctx, input.sessionID, `fixora sync: listing the merge requests labelled \`${label}\` to refresh ${runs.length} open run(s)…`)
+  let listing: Awaited<ReturnType<typeof listFixoraMrs>>
+  try {
+    // ONE listing call (labels + state:all) for every MR at once — not a worker read per MR, and
+    // listOnly skips the git fetch + trailer git log that recover needs but a status refresh does not.
+    listing = await listFixoraMrs(rt, where, { sessionID: input.sessionID, label, state: "all", limit: 200, verb: "sync", listOnly: true })
+  } catch (error) {
+    await tell(rt.ctx, input.sessionID, "fixora sync failed", `**fixora sync** could not list the merge requests: ${describeError(error)}`)
+    return 0
+  }
+  // Index the listed MRs by URL and by iid so each open run finds its own, whatever the stored URL shape.
+  const byUrl = new Map<string, MrListing>()
+  const byIid = new Map<string, MrListing>()
+  for (const mr of listing.result.mrs) {
+    if (mr.url) byUrl.set(mr.url, mr)
+    const iid = mrIid(mr.url, mr.id)
+    if (iid) byIid.set(iid, mr)
+  }
+  const at = now()
   let updated = 0
-  let checked = 0
-  const skipped: string[] = []
   const rows: string[] = []
+  const unmatched: string[] = []
   for (const r of runs) {
-    await ensureRunRepo(rt.ctx, r)
-    const target = mrTargetOf(rt, r)
-    const op = target ? renderMrOp({ provider: r.mrProvider as MrProvider, op: "view", target, id: r.mrId, url: r.mrUrl!, services: rt.services, toolProps: (id) => toolProps(rt, id) }) : undefined
-    if (!op) {
-      skipped.push(r.runId)
+    const mr = (r.mrUrl ? byUrl.get(r.mrUrl) : undefined) ?? byIid.get(mrIid(r.mrUrl, r.mrId) ?? "\0")
+    if (!mr?.status) {
+      unmatched.push(r.runId)
+      rows.push(`| \`${r.runId}\` | \`${r.mrStatus ?? "?"}\` — not in listing | ${r.mrUrl} |`)
       continue
     }
     const before = r.mrStatus
-    await notify(rt.ctx, input.sessionID, `fixora sync · ${r.runId} · reading MR state…`)
-    const result = await opsRound(rt, r, { phase: "sync", op: "sync", title: `read the state of merge request ${r.mrUrl}`, steps: [op.toolId ? { call: { toolId: op.toolId, namespace: op.namespace, input: op.input ?? {} } } : { command: op.command }], report: "{ raw: <the full reply of the view step, forwarded unchanged> }", forward: true })
-    checked++
-    const changed = result?.ok && r.mrStatus !== before
+    const changed = mr.status !== before
     if (changed) {
-      updated++
+      r.mrStatus = mr.status
+      if (mr.status === "merged" && typeof r.meta?.mergedAt !== "string") r.meta = { ...r.meta, mergedAt: mr.mergedAt ?? at }
       await saveRun(rt.ctx, r)
-      if (r.mrStatus === "merged") await notify(rt.ctx, input.sessionID, `fixora ${r.runId}: MR merged 🎉 — mark the release with /fixora fixed ${r.runId} --release <version>`)
+      updated++
+      if (mr.status === "merged") await notify(rt.ctx, input.sessionID, `fixora ${r.runId}: MR merged 🎉 — mark the release with /fixora fixed ${r.runId} --release <version>`)
     }
-    const state = result?.ok ? `\`${before ?? "?"}\` → \`${r.mrStatus ?? "?"}\`${changed ? " ✓" : ""}` : `not read${result?.errors?.length ? ` — ${result.errors[0]}` : ""}`
-    rows.push(`| \`${r.runId}\` | ${state} | ${r.mrUrl} |`)
+    rows.push(`| \`${r.runId}\` | \`${before ?? "?"}\` → \`${mr.status}\`${changed ? " ✓" : ""} | ${r.mrUrl} |`)
   }
   const report = [
-    `**fixora sync** — ${checked} MR(s) checked, ${updated} status change(s).`,
+    `**fixora sync** — ${runs.length} open run(s) checked against ${listing.result.mrs.length} merge request(s), ${updated} status change(s).`,
     "",
     "| Run | MR status | Merge request |",
     "| --- | --- | --- |",
     ...rows,
-    ...(skipped.length ? ["", `Skipped (no MR target resolved): ${skipped.map((id) => `\`${id}\``).join(", ")}`] : []),
+    ...(unmatched.length ? ["", `${unmatched.length} run(s) had no matching merge request in the \`${label}\` listing — if their MR dropped the label, \`/fixora recover --all\` re-reads every MR.`] : []),
+    ...(listing.result.errors.length ? ["", `Listing warnings: ${listing.result.errors.slice(0, 3).join("; ")}`] : []),
   ].join("\n")
-  await present(rt.ctx, input.sessionID, `fixora sync: ${checked} MR(s) checked, ${updated} change(s)`, report)
+  await present(rt.ctx, input.sessionID, `fixora sync: ${runs.length} run(s) checked, ${updated} change(s)`, report)
   return updated
 }
 
@@ -471,18 +490,16 @@ export interface RecoverInput {
 }
 
 /**
- * `/fixora recover`: rebuilds the run records (and the crash index) from the merge requests Fixora
- * opened, after a reset or on a machine that never ran them. A worker session lists the MRs that
- * carry the `fixora` label (GitLab / GitHub MCP, else `glab` / `gh`) and reads the `Fixora-Run` /
- * `Fixora-Fingerprint` commit trailers; the plugin parses the descriptions Fixora wrote. Known
- * runs are kept unless `--force`; nothing is written on `--dry-run`, and the write is approved first.
+ * Lists Fixora's merge requests in ONE worker session (the fast path `recover` uses, and the one a
+ * human agent takes: a single `list_mrs` call with `labels` + `state: all`, not a read per MR). The
+ * worker only lists and reads commit trailers; the plugin normalises every reply and derives each
+ * status deterministically. Both `recover` (rebuild records) and `sync` (refresh statuses) use it.
  */
-export async function runRecover(rt: Runtime, input: RecoverInput): Promise<RecoverOutcome> {
-  await refreshServices(rt)
-  const where = await sessionRepo(rt.ctx, input.sessionID)
-  const label = input.all ? undefined : (input.label ?? rt.opts.mr.labels[0] ?? "fixora")
+async function listFixoraMrs(rt: Runtime, where: SessionRepo, input: { sessionID: string; label?: string; state?: MrListState; limit?: number; verb?: string; listOnly?: boolean }): Promise<{ result: NonNullable<RecoverRecord["result"]>; remoteUrl?: string; requestId: string }> {
+  const label = input.label
   const state: MrListState = input.state ?? "all"
   const limit = input.limit ?? 200
+  const verb = input.verb ?? "recover"
   const remoteUrl = await readRemoteUrl(where.repo, rt.opts.remote)
   const remote = remoteUrl ? parseRemote(remoteUrl, rt.opts.mr.forge) : undefined
   const requestId = `recover-${rand()}`
@@ -500,8 +517,8 @@ export async function runRecover(rt: Runtime, input: RecoverInput): Promise<Reco
   const record: RecoverRecord = { requestId, originSessionID: input.sessionID, createdAt: now(), label, state, limit, plan, remoteUrl }
   await setJson(rt.ctx, keys.recover(requestId), record)
   const sessionID = await ensureRecoverSession(rt, input.sessionID, where.repo, requestId)
-  await notify(rt.ctx, input.sessionID, `fixora recover: the agent is listing ${label ? `the merge requests labelled \`${label}\`` : "every merge request"} via ${plan.provider}${remote ? ` for ${remote.owner}/${remote.repo}` : ""} (session ${sessionID})`)
-  const prompt = recoverPrompt({ requestId, repo: where.repo, remote: rt.opts.remote, remoteUrl, label, plan, commitsFile, outFile })
+  await notify(rt.ctx, input.sessionID, `fixora ${verb}: the agent is listing ${label ? `the merge requests labelled \`${label}\`` : "every merge request"} via ${plan.provider}${remote ? ` for ${remote.owner}/${remote.repo}` : ""} (session ${sessionID})`)
+  const prompt = recoverPrompt({ requestId, repo: where.repo, remote: rt.opts.remote, remoteUrl, label, plan, commitsFile, outFile, listOnly: input.listOnly })
   const minutes = rt.opts.worker.maxPhaseMinutes.list
   let outcome = await promptSession(rt, sessionID, prompt, { minutes })
   let fresh = (await getJson<RecoverRecord>(rt.ctx, keys.recover(requestId))) ?? record
@@ -509,8 +526,22 @@ export async function runRecover(rt: Runtime, input: RecoverInput): Promise<Reco
     outcome = await promptSession(rt, sessionID, nudgePrompt("fixora_submit_recover", undefined, [SKILLS.ops], `requestId "${requestId}", provider "${plan.provider}", the listing (raw or rawFile), commitsFile "${commitsFile}" and every error you got`), { minutes: 3 })
     fresh = (await getJson<RecoverRecord>(rt.ctx, keys.recover(requestId))) ?? record
   }
-  if (!fresh.result) throw new FixoraStop(outcome === "timeout" ? `Listing the merge requests exceeded ${minutes} minutes. See the worker session ${sessionID} and try again.` : `The worker session ${sessionID} did not report the merge requests. See that session, then run \`/fixora recover\` again.`)
-  const result = fresh.result
+  if (!fresh.result) throw new FixoraStop(outcome === "timeout" ? `Listing the merge requests exceeded ${minutes} minutes. See the worker session ${sessionID} and try again.` : `The worker session ${sessionID} did not report the merge requests. See that session, then run \`/fixora ${verb}\` again.`)
+  return { result: fresh.result, remoteUrl, requestId }
+}
+
+/**
+ * `/fixora recover`: rebuilds the run records (and the crash index) from the merge requests Fixora
+ * opened, after a reset or on a machine that never ran them. A worker session lists the MRs that
+ * carry the `fixora` label (GitLab / GitHub MCP, else `glab` / `gh`) and reads the `Fixora-Run` /
+ * `Fixora-Fingerprint` commit trailers; the plugin parses the descriptions Fixora wrote. Known
+ * runs are kept unless `--force`; nothing is written on `--dry-run`, and the write is approved first.
+ */
+export async function runRecover(rt: Runtime, input: RecoverInput): Promise<RecoverOutcome> {
+  await refreshServices(rt)
+  const where = await sessionRepo(rt.ctx, input.sessionID)
+  const label = input.all ? undefined : (input.label ?? rt.opts.mr.labels[0] ?? "fixora")
+  const { result, remoteUrl, requestId } = await listFixoraMrs(rt, where, { sessionID: input.sessionID, label, state: input.state ?? "all", limit: input.limit ?? 200, verb: "recover" })
   const provider = result.provider
   const resolvedRemote = result.remoteUrl ?? remoteUrl
   const { picks, skipped } = rankCandidates(result.mrs, { label })

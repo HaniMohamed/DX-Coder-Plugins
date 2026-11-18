@@ -367,17 +367,14 @@ export function publishPrompt(run: RunRecord, p: PublishPlan): Prompt {
 
 // ---------- ops (restore on failure paths, sync, clean, restart, fixed) ----------
 
-export function opsPrompt(o: { runId?: string; op: string; title: string; steps: OpStep[]; report: string; repo: string; forward?: boolean }): Prompt {
-  const L: string[] = [`Fixora${o.runId ? ` run ${o.runId}` : ""}: ${o.title}. Repository: ${o.repo}. Do exactly the steps below, in order; never improvise other calls or commands.`, ...(o.steps.some((s) => s.call) ? [CODEMODE_NOTE] : []), ...(o.forward ? [FORWARD_NOTE] : []), ""]
+export function opsPrompt(o: { runId?: string; op: string; title: string; steps: OpStep[]; report: string; repo: string }): Prompt {
+  const L: string[] = [`Fixora${o.runId ? ` run ${o.runId}` : ""}: ${o.title}. Repository: ${o.repo}. Do exactly the steps below, in order; never improvise other calls or commands.`, ...(o.steps.some((s) => s.call) ? [CODEMODE_NOTE] : []), ""]
   o.steps.forEach((s, i) => {
     if (s.call) L.push(`${i + 1}. ${renderCall(s.call)}${s.note ? `\n   ${s.note}` : ""}`)
     else if (s.command) L.push(`${i + 1}. \`${s.command}\`${s.note ? ` — ${s.note}` : ""}`)
     else if (s.note) L.push(`${i + 1}. ${s.note}`)
   })
-  const finish = o.forward
-    ? `Finish by calling fixora_submit_ops ONCE with op "${o.op}"${o.runId ? `, runId "${o.runId}"` : ""}, ok true/false, \`results\` as described (${o.report}) and errors[] with the exact error of any step that failed. Forward the step's reply straight into \`results\` unchanged — do not read, summarise, or re-derive any field from it yourself. Then stop.`
-    : `Finish by calling fixora_submit_ops ONCE with op "${o.op}"${o.runId ? `, runId "${o.runId}"` : ""}, ok true/false, \`results\` as described (${o.report}) and errors[] with the exact error of any step that failed. Then stop.`
-  L.push("", finish)
+  L.push("", `Finish by calling fixora_submit_ops ONCE with op "${o.op}"${o.runId ? `, runId "${o.runId}"` : ""}, ok true/false, \`results\` as described (${o.report}) and errors[] with the exact error of any step that failed. Then stop.`)
   return { text: L.join("\n"), files: [], skills: [SKILLS.ops] }
 }
 
@@ -402,6 +399,8 @@ export interface RecoverPromptInput {
   commitsFile: string
   /** CLI listings are written here (`<base>.<n>.json`). */
   outFile: string
+  /** Sync: list the MRs only — skip `git fetch` and the commit-trailer `git log` (neither is needed to refresh a status). */
+  listOnly?: boolean
 }
 
 /** The one CodeMode script an MCP listing runs: every page, then the submission with the page replies. */
@@ -420,7 +419,7 @@ export function recoverScript(i: RecoverPromptInput): string {
     `  const items = ${items}`,
     `  if (!Array.isArray(items) || items.length < ${p.perPage}) break`,
     "}",
-    `return await tools.fixora.submit_recover({ version: 1, requestId: ${JSON.stringify(i.requestId)}, provider: ${JSON.stringify(p.provider)}, remoteUrl: ${JSON.stringify(i.remoteUrl ?? "<remote url from step 1>")}, raw: pages, commitsFile: ${JSON.stringify(i.commitsFile)}, errors })`,
+    `return await tools.fixora.submit_recover({ version: 1, requestId: ${JSON.stringify(i.requestId)}, provider: ${JSON.stringify(p.provider)}, remoteUrl: ${JSON.stringify(i.remoteUrl ?? "<remote url from step 1>")}, raw: pages, commitsFile: ${JSON.stringify(i.listOnly ? "" : i.commitsFile)}, errors })`,
   ].join("\n")
 }
 
@@ -431,7 +430,9 @@ export function recoverScript(i: RecoverPromptInput): string {
 export function recoverPrompt(i: RecoverPromptInput): Prompt {
   const p = i.plan
   const L: string[] = [
-    `Fixora recover ${i.requestId}: list the merge requests Fixora opened in this repository (${i.label ? `label \`${i.label}\`` : "every merge request; Fixora picks its own by title and description"}) and the Fixora commit trailers, then submit both with fixora_submit_recover. Repository: ${i.repo}. Do exactly the steps below, in order; change no input, add no filters, do not summarise or edit any reply.`,
+    i.listOnly
+      ? `Fixora sync ${i.requestId}: list the merge requests Fixora opened in this repository (${i.label ? `label \`${i.label}\`` : "every merge request; Fixora picks its own by title and description"}) and submit them with fixora_submit_recover. Repository: ${i.repo}. This is a read-only status refresh — do exactly the steps below, in order; change no input, add no filters, do not summarise or edit any reply.`
+      : `Fixora recover ${i.requestId}: list the merge requests Fixora opened in this repository (${i.label ? `label \`${i.label}\`` : "every merge request; Fixora picks its own by title and description"}) and the Fixora commit trailers, then submit both with fixora_submit_recover. Repository: ${i.repo}. Do exactly the steps below, in order; change no input, add no filters, do not summarise or edit any reply.`,
     ...(p.toolId ? [CODEMODE_NOTE, FORWARD_NOTE] : []),
     RETRY_NOTE,
     "",
@@ -439,13 +440,15 @@ export function recoverPrompt(i: RecoverPromptInput): Prompt {
   let n = 1
   if (i.remoteUrl) L.push(`${n++}. The remote \`${i.remote}\` is ${i.remoteUrl}; nothing to look up.`)
   else L.push(`${n++}. \`git remote get-url ${shellQuote(i.remote)}\` — the project path is everything after the host, without \`.git\` (e.g. \`group/app\`); it replaces \`<owner/repo>\` (and \`<owner>\` / \`<repo>\`) below, and the full URL is reported as \`remoteUrl\`.`)
-  L.push(`${n++}. \`git fetch ${shellQuote(i.remote)} --no-tags\` — best effort: when it fails (offline, auth), carry on with the history already present.`)
-  L.push(`${n++}. \`git log --all --grep='^Fixora-Run:' --format=%B | grep '^Fixora-' > ${shellQuote(i.commitsFile)}\` — the run id / fingerprint pairs from Fixora's commits; an empty file (grep exit code 1) is fine, do not retry.`)
+  if (!i.listOnly) {
+    L.push(`${n++}. \`git fetch ${shellQuote(i.remote)} --no-tags\` — best effort: when it fails (offline, auth), carry on with the history already present.`)
+    L.push(`${n++}. \`git log --all --grep='^Fixora-Run:' --format=%B | grep '^Fixora-' > ${shellQuote(i.commitsFile)}\` — the run id / fingerprint pairs from Fixora's commits; an empty file (grep exit code 1) is fine, do not retry.`)
+  }
   if (p.toolId) {
     L.push(`${n++}. List the merge requests with tool \`${p.toolId}\`${codeModePath(p.toolId, p.namespace) ? ` (CodeMode: \`${codeModePath(p.toolId, p.namespace)}(input)\`)` : ""}, page by page, and submit from the same execute script. Run this script once (replace \`<owner/repo>\` / \`<owner>\` / \`<repo>\`${i.remoteUrl ? "" : " and `<remote url from step 1>`"} from step 1 when they appear; change nothing else):`, "```js", recoverScript(i), "```")
   } else {
     L.push(`${n++}. \`${p.command}\` — the JSON listing goes to the file.${p.pagedFiles ? ` When the file holds exactly ${p.perPage} entries, run the same command again with \`--page 2\` into \`${i.outFile}.2.json\`, then \`--page 3\` into \`.3.json\`, until a page is shorter.` : ""} A missing or unauthenticated CLI is an error to report, not something to install or log in to.`)
-    L.push(`${n++}. Call fixora_submit_recover ONCE with { version: 1, requestId: "${i.requestId}", provider: "${p.provider}", remoteUrl: "<the remote url>", rawFile: "${i.outFile}.1.json", commitsFile: "${i.commitsFile}", errors: [] } (errors[]: the exact message of any step that failed).`)
+    L.push(`${n++}. Call fixora_submit_recover ONCE with { version: 1, requestId: "${i.requestId}", provider: "${p.provider}", remoteUrl: "<the remote url>", rawFile: "${i.outFile}.1.json", commitsFile: "${i.listOnly ? "" : i.commitsFile}", errors: [] } (errors[]: the exact message of any step that failed).`)
   }
   L.push("", "Never open, update, close or merge anything; never run commands that were not listed. When the submission reports validation errors, fix exactly what it names and call it again. Then stop.")
   return { text: L.join("\n"), files: [], skills: [SKILLS.ops] }

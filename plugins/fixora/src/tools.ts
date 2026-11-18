@@ -12,7 +12,6 @@ import { validateFix, validateOps, validatePrepare, validatePublish, validateRec
 import { duplicateMessage, indexCrash } from "./crashindex.js"
 import { describeError } from "./errors.js"
 import { parseRemote } from "./git.js"
-import { statusFromResult } from "./mr.js"
 import type { MrListPlan, MrListProvider, MrListState } from "./mr.js"
 import { FORBIDDEN_GLOBS, forbiddenReason, normalizePath } from "./permissions.js"
 import { sourceContext, stageBegin, stageEnd, stageMark, type Runtime } from "./progress.js"
@@ -604,12 +603,8 @@ export async function registerPluginTools(ctx: Plugin.Context, deps: ToolDeps): 
             if (o.ok && run.mrUrl) run.mrStatus = "closed"
             break
           case "sync": {
-            // Derive the status from the forwarded forge reply (merged wins over a stale "Draft:" title),
-            // falling back to a plain `status` field the worker may still send.
-            const raw = o.results.raw ?? o.results
-            const word = typeof o.results.status === "string" ? o.results.status : undefined
-            const s = statusFromResult(raw) ?? (word === "draft" || word === "open" || word === "merged" || word === "closed" ? word : undefined)
-            if (s) run.mrStatus = s
+            const s = typeof o.results.status === "string" ? o.results.status : undefined
+            if (s === "draft" || s === "open" || s === "merged" || s === "closed") run.mrStatus = s
             if (s === "merged" && typeof run.meta?.mergedAt !== "string") run.meta = { ...run.meta, mergedAt: at }
             break
           }

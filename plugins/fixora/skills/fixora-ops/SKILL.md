@@ -36,11 +36,8 @@ MCP tool calls (Jira, GitLab, GitHub, crash sources) go through the `execute` to
   JQL; reuse a hit (`action: "reused"`), else create with the given input (`action: "created"`). If the
   server rejects `additional_fields` as the wrong type, resend once with the other encoding (JSON
   string ↔ object). Any other failure → `action: "failed"` with the exact error.
-- **sync** — read the merge request with the given tool / command and forward its reply straight into
-  `results.raw` unchanged: `{ "raw": <the tool reply / the command's JSON stdout> }`. Do not read the
-  reply, summarise it, or decide the status yourself — the plugin derives it (and a merged MR whose
-  title still begins `Draft:` is merged, not draft). Call the view tool / command and
-  `fixora_submit_ops` in the SAME `execute` script so the reply is forwarded by variable.
+- **sync** — read the merge request state with the given tool / command and report
+  `{ "status": "draft" | "open" | "merged" | "closed" }` (merged when it has a merge date or state merged).
 - **close-mr** — close the merge request with the given tool / command. Results: `{ "closed": true }`.
 - **jira-comment** — add the given comment. Results: `{ "commented": true }`.
 - **clean** — `git branch -D <branch>` for the run's branch only (skip, and say so, when it is the
