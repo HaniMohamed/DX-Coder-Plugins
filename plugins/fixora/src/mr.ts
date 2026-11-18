@@ -143,6 +143,28 @@ export interface MrAttempt {
   url?: string
 }
 
+const LABEL_KEYS = ["labels", "label", "add_labels", "addLabels"]
+
+/** The labels field of a tool schema (name + whether it takes an array), when it has one. */
+export function labelsField(props: Record<string, unknown>): { key: string; array: boolean } | undefined {
+  const key = LABEL_KEYS.find((k) => k in props)
+  if (!key) return undefined
+  const type = (props[key] as { type?: string | string[] } | undefined)?.type
+  return { key, array: Array.isArray(type) ? type.includes("array") : type === "array" }
+}
+
+/**
+ * Labels in the spelling and shape the schema declares (array or comma string). An unknown schema
+ * (no properties listed) gets the GitLab API form `labels: "a,b"`; a schema without a labels field
+ * gets none, and the label step after creation adds them.
+ */
+function withLabels(input: Record<string, unknown>, props: Record<string, unknown>, labels: string[]): Record<string, unknown> {
+  if (labels.length === 0) return input
+  const field = labelsField(props)
+  if (!field) return Object.keys(props).length === 0 ? { ...input, labels: input.labels ?? labels.join(",") } : input
+  return { ...input, [field.key]: field.array ? labels : labels.join(",") }
+}
+
 /**
  * One attempt per provider in order, with the exact tool input (adapted to the server's schema) or
  * command line. The worker tries them top to bottom and stops at the first success.
@@ -153,7 +175,10 @@ export function renderMrAttempts(o: { order: MrProvider[]; target: MrTarget; mr:
     switch (provider) {
       case "gitlab-mcp": {
         const toolId = o.services.gitlab?.capabilities.createMr
-        if (toolId) out.push({ provider, toolId, namespace: o.services.gitlab?.namespace, input: adaptInput(gitlabCreateInput(o.target, o.mr), o.toolProps(toolId), GITLAB_ALIASES) })
+        if (toolId) {
+          const props = o.toolProps(toolId)
+          out.push({ provider, toolId, namespace: o.services.gitlab?.namespace, input: withLabels(adaptInput(gitlabCreateInput(o.target, o.mr), props, GITLAB_ALIASES), props, o.mr.labels) })
+        }
         break
       }
       case "github-mcp": {
@@ -168,6 +193,29 @@ export function renderMrAttempts(o: { order: MrProvider[]; target: MrTarget; mr:
       case "url":
         out.push({ provider, url: compareUrl(o.target.remote, o.target.base, o.target.branch) })
         break
+    }
+  }
+  return out
+}
+
+/**
+ * How the worker adds the configured labels to a merge request the MCP tool created without them
+ * (a create tool whose schema has no labels field, or GitHub, whose create call never takes labels):
+ * the update tool when its schema has a labels field, else the CLI. `<id>` is the MR iid / PR number.
+ * CLI providers pass `--label` on create and need nothing.
+ */
+export function renderLabelSteps(o: { order: MrProvider[]; target: MrTarget; labels: string[]; services: Services; toolProps: (toolId: string) => Record<string, unknown> }): MrAttempt[] {
+  if (o.labels.length === 0) return []
+  const out: MrAttempt[] = []
+  const project = `${o.target.remote.owner}/${o.target.remote.repo}`
+  for (const provider of o.order) {
+    if (provider === "gitlab-mcp") {
+      const toolId = o.services.gitlab?.capabilities.updateMr
+      const props = toolId ? o.toolProps(toolId) : {}
+      if (toolId && labelsField(props)) out.push({ provider, toolId, namespace: o.services.gitlab?.namespace, input: withLabels(adaptInput({ project_id: project, merge_request_iid: "<id>" }, props, GITLAB_ALIASES), props, o.labels) })
+      else out.push({ provider, command: ["glab", "mr", "update", "<id>", "--label", o.labels.join(",")].map(shellQuote).join(" ") })
+    } else if (provider === "github-mcp") {
+      out.push({ provider, command: ["gh", "pr", "edit", "<id>", ...o.labels.flatMap((l) => ["--add-label", l])].map(shellQuote).join(" ") })
     }
   }
   return out
@@ -239,12 +287,16 @@ export interface MrListPlan {
 
 export const LIST_PER_PAGE = 100
 
+/** Every Fixora MR title ends with this; it narrows an unlabelled listing where the forge can search titles. */
+export const FIXORA_TITLE_SEARCH = "fixes crash"
+
 /**
- * The exact tool input / command line that lists the merge requests carrying `label`. The project
+ * The exact tool input / command line that lists the merge requests carrying `label` (or, without a
+ * label, every merge request — narrowed to Fixora titles where the forge can search). The project
  * path comes from the remote when the plugin could read it, else the placeholder `<owner/repo>` the
  * prompt tells the worker to fill in from `git remote get-url`.
  */
-export function renderMrList(o: { provider: MrListProvider; remote?: ParsedRemote; label: string; state: MrListState; limit: number; services: Services; toolProps: (toolId: string) => Record<string, unknown>; outFile: string }): MrListPlan | undefined {
+export function renderMrList(o: { provider: MrListProvider; remote?: ParsedRemote; label?: string; state: MrListState; limit: number; services: Services; toolProps: (toolId: string) => Record<string, unknown>; outFile: string }): MrListPlan | undefined {
   const project = o.remote ? `${o.remote.owner}/${o.remote.repo}` : "<owner/repo>"
   const owner = o.remote?.owner ?? "<owner>"
   const repo = o.remote?.repo ?? "<repo>"
@@ -254,9 +306,8 @@ export function renderMrList(o: { provider: MrListProvider; remote?: ParsedRemot
       const toolId = o.services.gitlab?.capabilities.listMrs
       if (!toolId) return undefined
       const props = o.toolProps(toolId)
-      const labelsProp = (props.labels ?? props.label) as { type?: string } | undefined
-      const labels = labelsProp?.type === "array" ? [o.label] : o.label
-      const input = adaptInput({ project_id: project, state: o.state === "open" ? "opened" : o.state, labels, per_page: perPage, page: 1, order_by: "updated_at", sort: "desc" }, props, GITLAB_ALIASES)
+      const base = { project_id: project, state: o.state === "open" ? "opened" : o.state, per_page: perPage, page: 1, order_by: "updated_at", sort: "desc", ...(o.label ? {} : { search: FIXORA_TITLE_SEARCH, in: "title" }) }
+      const input = withLabels(adaptInput(base, props, GITLAB_ALIASES), props, o.label ? [o.label] : [])
       return { provider: o.provider, toolId, namespace: o.services.gitlab?.namespace, input, perPage, pagedFiles: false }
     }
     case "github-mcp": {
@@ -267,12 +318,12 @@ export function renderMrList(o: { provider: MrListProvider; remote?: ParsedRemot
     }
     case "glab": {
       const state = o.state === "all" ? ["--all"] : o.state === "merged" ? ["--merged"] : o.state === "closed" ? ["--closed"] : []
-      const args = ["glab", "mr", "list", "--label", o.label, ...state, "--output", "json", "--per-page", String(perPage), "--page", "1"]
+      const args = ["glab", "mr", "list", ...(o.label ? ["--label", o.label] : []), ...state, "--output", "json", "--per-page", String(perPage), "--page", "1"]
       return { provider: o.provider, command: `${args.map(shellQuote).join(" ")} > ${shellQuote(`${o.outFile}.1.json`)}`, perPage, pagedFiles: true }
     }
     case "gh": {
       const fields = "number,title,body,state,isDraft,url,headRefName,baseRefName,createdAt,updatedAt,mergedAt,closedAt,labels,headRefOid,mergeCommit,author"
-      const args = ["gh", "pr", "list", "--label", o.label, "--state", o.state, "--limit", String(Math.max(1, o.limit)), "--json", fields]
+      const args = ["gh", "pr", "list", ...(o.label ? ["--label", o.label] : ["--search", `"${FIXORA_TITLE_SEARCH}" in:title`]), "--state", o.state, "--limit", String(Math.max(1, o.limit)), "--json", fields]
       return { provider: o.provider, command: `${args.map(shellQuote).join(" ")} > ${shellQuote(`${o.outFile}.1.json`)}`, perPage: Math.max(1, o.limit), pagedFiles: false }
     }
   }

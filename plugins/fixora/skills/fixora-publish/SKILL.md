@@ -55,6 +55,13 @@ Try the providers in the order the prompt lists, top to bottom, and stop at the 
 Report `mr: { url, id, provider, status }` where `provider` is one of `gitlab-mcp`, `github-mcp`,
 `glab`, `gh`, `status` is `draft` or `open`, and `url` is the merge request / pull request page.
 
+**Labels.** The merge request must carry the label(s) the prompt names (`fixora`): Fixora finds its
+own merge requests by them later. When the MR was created through an MCP tool and its reply does not
+list them (the create tool had no labels field, or it is GitHub), add them right away with the step
+the prompt gives for that provider (`<id>` = the iid / number from the reply): the update tool, or
+`glab mr update <id> --label fixora` / `gh pr edit <id> --add-label fixora`. A refused label is an
+entry in `errors[]`, never a reason to drop the MR from the report.
+
 ## Report (`fixora_submit_publish`)
 
 ```json

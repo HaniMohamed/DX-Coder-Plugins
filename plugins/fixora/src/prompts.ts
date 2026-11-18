@@ -305,6 +305,9 @@ export interface PublishPlan {
   branch: string
   target: string
   attempts: MrAttempt[]
+  /** The labels the MR must carry (`mr.labels`) and how to add them when the create call did not (`<id>` = the MR id). */
+  labels?: string[]
+  labelSteps?: MrAttempt[]
   /** Jira comment / transition / source note after the MR (tool calls; `<key>` = the ticket key). */
   closeLoop: OpStep[]
   /** The restore commands, run last. */
@@ -337,6 +340,16 @@ export function publishPrompt(run: RunRecord, p: PublishPlan): Prompt {
       else if (a.url) L.push(`   ${String.fromCharCode(97 + i)}) no provider worked: report \`mrSkipped: { reason, compareUrl: "${a.url}" }\``)
     })
     L.push("   Report `mr: { url, id, provider, status }` with the merge request URL the provider returned.")
+    if (p.labels?.length && p.labelSteps?.length) {
+      L.push(`   Then make sure the merge request carries the label(s) ${p.labels.map((l) => `\`${l}\``).join(", ")} (Fixora finds its merge requests by them). When the create reply does not list them, add them right away, by the provider that created the MR (<id> = the MR iid / PR number from the reply):`)
+      for (const s of p.labelSteps) {
+        if (s.toolId) {
+          const path = codeModePath(s.toolId, s.namespace)
+          L.push(`   - ${s.provider}: tool \`${s.toolId}\`${path ? ` (CodeMode: \`${path}(input)\`)` : ""} with input:`, "```json", json(s.input), "```")
+        } else if (s.command) L.push(`   - ${s.provider}: \`${s.command}\``)
+      }
+      L.push("   A label the forge refuses (does not exist, no permission) goes into errors[]; the MR itself is still reported.")
+    }
   }
   L.push(`${n++}. Call fixora_submit_publish ONCE with runId "${run.runId}" and what succeeded (committed / pushed / mr / mrSkipped) plus any errors[].`)
   if (p.closeLoop.length) {
@@ -354,14 +367,17 @@ export function publishPrompt(run: RunRecord, p: PublishPlan): Prompt {
 
 // ---------- ops (restore on failure paths, sync, clean, restart, fixed) ----------
 
-export function opsPrompt(o: { runId?: string; op: string; title: string; steps: OpStep[]; report: string; repo: string }): Prompt {
-  const L: string[] = [`Fixora${o.runId ? ` run ${o.runId}` : ""}: ${o.title}. Repository: ${o.repo}. Do exactly the steps below, in order; never improvise other calls or commands.`, ...(o.steps.some((s) => s.call) ? [CODEMODE_NOTE] : []), ""]
+export function opsPrompt(o: { runId?: string; op: string; title: string; steps: OpStep[]; report: string; repo: string; forward?: boolean }): Prompt {
+  const L: string[] = [`Fixora${o.runId ? ` run ${o.runId}` : ""}: ${o.title}. Repository: ${o.repo}. Do exactly the steps below, in order; never improvise other calls or commands.`, ...(o.steps.some((s) => s.call) ? [CODEMODE_NOTE] : []), ...(o.forward ? [FORWARD_NOTE] : []), ""]
   o.steps.forEach((s, i) => {
     if (s.call) L.push(`${i + 1}. ${renderCall(s.call)}${s.note ? `\n   ${s.note}` : ""}`)
     else if (s.command) L.push(`${i + 1}. \`${s.command}\`${s.note ? ` — ${s.note}` : ""}`)
     else if (s.note) L.push(`${i + 1}. ${s.note}`)
   })
-  L.push("", `Finish by calling fixora_submit_ops ONCE with op "${o.op}"${o.runId ? `, runId "${o.runId}"` : ""}, ok true/false, \`results\` as described (${o.report}) and errors[] with the exact error of any step that failed. Then stop.`)
+  const finish = o.forward
+    ? `Finish by calling fixora_submit_ops ONCE with op "${o.op}"${o.runId ? `, runId "${o.runId}"` : ""}, ok true/false, \`results\` as described (${o.report}) and errors[] with the exact error of any step that failed. Forward the step's reply straight into \`results\` unchanged — do not read, summarise, or re-derive any field from it yourself. Then stop.`
+    : `Finish by calling fixora_submit_ops ONCE with op "${o.op}"${o.runId ? `, runId "${o.runId}"` : ""}, ok true/false, \`results\` as described (${o.report}) and errors[] with the exact error of any step that failed. Then stop.`
+  L.push("", finish)
   return { text: L.join("\n"), files: [], skills: [SKILLS.ops] }
 }
 
@@ -379,7 +395,8 @@ export interface RecoverPromptInput {
   remote: string
   /** Known from `.git/config`; when undefined the worker reads it with `git remote get-url`. */
   remoteUrl?: string
-  label: string
+  /** Undefined = every merge request (`--all`), narrowed to Fixora titles where the forge can search. */
+  label?: string
   plan: MrListPlan
   /** `git log` trailer lines go here (`<repo>/.dxcoder/fixora/recover/<requestId>.commits.txt`). */
   commitsFile: string
@@ -414,7 +431,7 @@ export function recoverScript(i: RecoverPromptInput): string {
 export function recoverPrompt(i: RecoverPromptInput): Prompt {
   const p = i.plan
   const L: string[] = [
-    `Fixora recover ${i.requestId}: list the merge requests Fixora opened in this repository (label \`${i.label}\`) and the Fixora commit trailers, then submit both with fixora_submit_recover. Repository: ${i.repo}. Do exactly the steps below, in order; change no input, add no filters, do not summarise or edit any reply.`,
+    `Fixora recover ${i.requestId}: list the merge requests Fixora opened in this repository (${i.label ? `label \`${i.label}\`` : "every merge request; Fixora picks its own by title and description"}) and the Fixora commit trailers, then submit both with fixora_submit_recover. Repository: ${i.repo}. Do exactly the steps below, in order; change no input, add no filters, do not summarise or edit any reply.`,
     ...(p.toolId ? [CODEMODE_NOTE, FORWARD_NOTE] : []),
     RETRY_NOTE,
     "",

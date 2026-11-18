@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { assertSafePush, branchFromTemplate, branchName, compareUrl, isProtectedBranch, parseRemote, slug, unknownBranchPlaceholders } from "../src/git.js"
-import { cliCreateCommand, githubCreateInput, gitlabCreateInput, mrProviderOrder, renderMrAttempts, renderMrOp, serviceMatchesHost, statusFromResult, urlFromResult } from "../src/mr.js"
+import { cliCreateCommand, githubCreateInput, gitlabCreateInput, mrProviderOrder, renderLabelSteps, renderMrAttempts, renderMrOp, serviceMatchesHost, statusFromResult, urlFromResult } from "../src/mr.js"
 import type { Services } from "../src/types.js"
 
 const fixture = (p: string) => JSON.parse(readFileSync(join(import.meta.dir, "fixtures", p), "utf8")) as unknown
@@ -76,6 +76,20 @@ describe("mr", () => {
     const mr = { title: "Guard nil", body: "b", draft: true, labels: ["fixora"], reviewers: ["bob"] }
     const attempts = renderMrAttempts({ order: ["gitlab-mcp", "glab", "url"], target, mr, services, toolProps: () => ({ projectId: {}, sourceBranch: {}, targetBranch: {}, title: {}, body: {}, draft: {} }), bodyFile: "/run/mr.md" })
     expect(attempts[0]).toMatchObject({ provider: "gitlab-mcp", toolId: "gitlab_create_merge_request", input: { projectId: "mobile/shop", sourceBranch: "fixora/x", targetBranch: "main", title: "Draft: Guard nil", body: "b", draft: true } })
+    // A create schema without a labels field drops the label (seen live): the label step adds it afterwards.
+    expect(attempts[0]!.input).not.toHaveProperty("labels")
+    const steps = renderLabelSteps({ order: ["gitlab-mcp", "glab", "url"], target, labels: ["fixora"], services, toolProps: () => ({}) })
+    expect(steps).toEqual([{ provider: "gitlab-mcp", command: "glab mr update '<id>' --label fixora" }])
+    // The schema's shape wins: array labels on create, `labels` on an update tool that has them.
+    const withArray = renderMrAttempts({ order: ["gitlab-mcp"], target, mr, services, toolProps: () => ({ project_id: {}, source_branch: {}, target_branch: {}, title: {}, description: {}, labels: { type: "array" } }), bodyFile: "/run/mr.md" })
+    expect(withArray[0]!.input).toMatchObject({ labels: ["fixora"], description: "b" })
+    const withString = renderMrAttempts({ order: ["gitlab-mcp"], target, mr, services, toolProps: () => ({ project_id: {}, title: {}, label: { type: "string" } }), bodyFile: "/run/mr.md" })
+    expect(withString[0]!.input).toMatchObject({ label: "fixora" })
+    const svc = { gitlab: { ...services.gitlab!, capabilities: { ...services.gitlab!.capabilities, updateMr: "gitlab_update_merge_request" } }, github: services.github }
+    const update = renderLabelSteps({ order: ["gitlab-mcp", "github-mcp"], target, labels: ["fixora", "crash"], services: svc, toolProps: (id) => (id === "gitlab_update_merge_request" ? { project_id: {}, merge_request_iid: {}, labels: { type: "array" } } : {}) })
+    expect(update[0]).toMatchObject({ provider: "gitlab-mcp", toolId: "gitlab_update_merge_request", input: { project_id: "mobile/shop", merge_request_iid: "<id>", labels: ["fixora", "crash"] } })
+    expect(update[1]).toEqual({ provider: "github-mcp", command: "gh pr edit '<id>' --add-label fixora --add-label crash" })
+    expect(renderLabelSteps({ order: ["glab", "gh"], target, labels: ["fixora"], services, toolProps: () => ({}) })).toEqual([])
     expect(attempts[1]!.command).toBe("glab mr create --source-branch fixora/x --target-branch main --title 'Draft: Guard nil' --description-file /run/mr.md --yes --remove-source-branch --draft --label fixora --reviewer bob")
     expect(attempts[2]!.url).toContain("/-/merge_requests/new?")
     expect(cliCreateCommand("gh", { ...target, remote: remoteGh }, mr, "/run/mr.md")).toBe("gh pr create --head fixora/x --base main --title 'Guard nil' --body-file /run/mr.md --draft --label fixora --reviewer bob")
@@ -98,5 +112,10 @@ describe("mr", () => {
     expect(statusFromResult({ state: "merged" })).toBe("merged")
     expect(statusFromResult({ state: "closed" })).toBe("closed")
     expect(statusFromResult({ state: "open", merged_at: null, draft: false })).toBe("open")
+    // A merged MR keeps its "Draft:" title and may still carry draft:true — merged must still win.
+    expect(statusFromResult({ state: "merged", title: "Draft: fix crash", draft: true })).toBe("merged")
+    expect(statusFromResult({ title: "Draft: fix crash", merged_at: "2026-11-18T00:00:00Z", draft: true })).toBe("merged")
+    // GitHub CLI shape (gh pr view --json state,isDraft,mergedAt).
+    expect(statusFromResult({ state: "MERGED", isDraft: true, mergedAt: "2026-11-18T00:00:00Z" })).toBe("merged")
   })
 })

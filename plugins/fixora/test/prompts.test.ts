@@ -103,10 +103,20 @@ describe("prompts", () => {
         { provider: "glab", command: "glab mr create --source-branch fixora/sentry-4523123-typeerror --target-branch main --title Guard --description-file /repo/.dxcoder/fixora/x/mr.md --yes --remove-source-branch --draft" },
         { provider: "url", url: "https://gitlab.example.com/mobile/shop/-/merge_requests/new?x" },
       ],
+      labels: ["fixora"],
+      labelSteps: [
+        { provider: "gitlab-mcp", toolId: "gitlab_update_merge_request", namespace: "gitlab", input: { project_id: "mobile/shop", merge_request_iid: "<id>", labels: ["fixora"] } },
+        { provider: "github-mcp", command: "gh pr edit '<id>' --add-label fixora" },
+      ],
       closeLoop: [{ call: { toolId: "jira_jira_add_comment", namespace: "jira_jira", input: { issue_key: "<key>", comment: "MR <mrUrl>" } } }],
       restore: ["git checkout main", "git stash pop stash@{n}"],
     })
     expect(p.skills).toEqual(["fixora-publish"])
+    // The label is checked right after the MR is created, per provider.
+    expect(p.text).toContain("make sure the merge request carries the label(s) `fixora`")
+    expect(p.text).toContain("tools.gitlab.update_merge_request")
+    expect(p.text).toContain("gh pr edit '<id>' --add-label fixora")
+    expect(p.text).toContain("A label the forge refuses")
     expect(p.files).toContain("commit-message.txt")
     expect(p.files).toContain("mr.md")
     expect(p.text).toContain("tools.jira_jira.search")

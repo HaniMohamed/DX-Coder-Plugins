@@ -33,7 +33,7 @@ export type Parsed =
   | { verb: "clean"; runId: string; remote: boolean }
   | { verb: "sync" }
   | { verb: "reset"; files: boolean }
-  | { verb: "recover"; dryRun: boolean; force: boolean; state: RecoverState; limit: number; label?: string }
+  | { verb: "recover"; dryRun: boolean; force: boolean; state: RecoverState; limit: number; label?: string; all: boolean }
   | { verb: "doctor"; all: boolean; probe: boolean; tool?: string }
   | { verb: "help" }
 
@@ -74,7 +74,7 @@ export const SUBCOMMANDS: Subcommand[] = [
   { verb: "clean", name: `${COMMAND}:clean`, args: "<runId> [--remote]", description: "restore the checkout, delete the local branch (and, after approval, the remote branch)" },
   { verb: "sync", name: `${COMMAND}:sync`, args: "", description: "refresh MR statuses" },
   { verb: "reset", name: `${COMMAND}:reset`, args: "[--files]", description: "forget every run, crash and cache record (after approval); --files also deletes <repo>/.dxcoder/fixora" },
-  { verb: "recover", name: `${COMMAND}:recover`, args: "[--dry-run] [--force] [--state all|open|merged|closed] [--limit N] [--label fixora]", description: "rebuild the run records from the merge requests Fixora opened (after a reset or on a new machine); --dry-run previews, --force overwrites known runs" },
+  { verb: "recover", name: `${COMMAND}:recover`, args: "[--dry-run] [--force] [--all] [--state all|open|merged|closed] [--limit N] [--label fixora]", description: "rebuild the run records from the merge requests Fixora opened (after a reset or on a new machine); --dry-run previews, --force overwrites known runs, --all also finds MRs that went out without the label" },
   { verb: "doctor", name: `${COMMAND}:doctor`, args: "[--all] [--probe] [--tool <id>]", description: "MCP servers / tools Fixora detects; --probe calls the crash source; --tool prints a tool's input schema" },
   { verb: "help", name: `${COMMAND}:help`, args: "", description: "show this usage" },
 ]
@@ -305,8 +305,10 @@ export function parseCommand(text: string): ParseResult {
       const limit = int(t.flags.get("limit"), "limit", errs, { min: 1 }) ?? 200
       const label = typeof t.flags.get("label") === "string" ? (t.flags.get("label") as string).trim() : undefined
       if (label !== undefined && !label) errs.push("--label needs a name")
+      const all = t.flags.has("all")
+      if (all && label !== undefined) errs.push("--all lists every merge request; drop --label")
       if (errs.length > 0) return fail(errs.join("; "))
-      return { verb: "recover", dryRun: flags.dryRun, force: flags.force, state: state!, limit, label }
+      return { verb: "recover", dryRun: flags.dryRun, force: flags.force, state: state!, limit, label, all }
     }
     case "doctor":
       return { verb: "doctor", all: t.flags.has("all"), probe: t.flags.has("probe"), tool: typeof t.flags.get("tool") === "string" ? (t.flags.get("tool") as string) : undefined }

@@ -176,10 +176,10 @@ export default Plugin.define({
         },
         "mr.sync": async (input) => ({ updated: await runSync(rt, { sessionID: (input as { sessionID?: string }).sessionID ?? "" }) }),
         "runs.recover": async (input) => {
-          const i = input as { sessionID?: string; dryRun?: boolean; force?: boolean }
+          const i = input as { sessionID?: string; dryRun?: boolean; force?: boolean; all?: boolean }
           try {
             rt.opts = readOpts()
-            const r = await runRecover(rt, { sessionID: i.sessionID ?? "", dryRun: i.dryRun, force: i.force })
+            const r = await runRecover(rt, { sessionID: i.sessionID ?? "", dryRun: i.dryRun, force: i.force, all: i.all })
             return { recovered: r.recovered.length, known: r.known.length, skipped: r.skipped.length, listed: r.listed, errors: r.errors, runIds: r.recovered.map((x) => x.runId) }
           } catch (error) {
             return { recovered: 0, known: 0, skipped: 0, listed: 0, errors: [describeError(error).split("\n")[0]!], runIds: [] }
@@ -335,7 +335,7 @@ export default Plugin.define({
                 await runReset(rt, { sessionID, files: parsed.files })
                 break
               case "recover":
-                await runRecover(rt, { sessionID, dryRun: parsed.dryRun, force: parsed.force, state: parsed.state, limit: parsed.limit, label: parsed.label })
+                await runRecover(rt, { sessionID, dryRun: parsed.dryRun, force: parsed.force, state: parsed.state, limit: parsed.limit, label: parsed.label, all: parsed.all })
                 break
               case "doctor":
                 await runDoctor(rt, { sessionID, all: parsed.all, probe: parsed.probe, tool: parsed.tool })

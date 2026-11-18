@@ -14,7 +14,7 @@ import { ApprovalRejected, approve, decideApproval } from "./gate.js"
 import { branchFromTemplate, branchName, compareUrl, parseRemote, slug, type ParsedRemote } from "./git.js"
 import { dedupeJql, jiraAvailable, jiraBaseUrl, jiraCommentInput, jiraCreateInput, jiraSearchInput, jiraTransitionsInput, schemaParamType } from "./jira.js"
 import { connected } from "./mcp.js"
-import { mrProviderOrder, renderMrAttempts, renderMrOp, type MrProvider } from "./mr.js"
+import { mrProviderOrder, renderLabelSteps, renderMrAttempts, renderMrOp, type MrProvider } from "./mr.js"
 import { fixFollowUpPrompt, nudgePrompt, opsPrompt, publishPrompt, renderTestFailureText, restorePlan, restoreSteps, SKILLS, workPrompt, type OpStep, type PublishPlan, type TicketPlan, type WorkStage } from "./prompts.js"
 import { appendLog, FixoraStop, notify, present, sourceContext, stageBegin, stageEnd, stageMark, toolProps, type Runtime } from "./progress.js"
 import { renderApprovalPreview, renderCommitMessage, renderCrashMarkdown, renderFinalReport, renderJiraComment, renderJiraIssue, renderMr, renderTriageCard, renderValidationCard } from "./render.js"
@@ -579,6 +579,8 @@ export class Pipeline {
       branch: run.branch!,
       target,
       attempts: wantMr && mrTarget ? renderMrAttempts({ order, target: mrTarget, mr: { ...mr, draft: this.opts.mr.draft, labels: this.opts.mr.labels, reviewers: this.opts.mr.reviewers }, services: this.rt.services, toolProps: (id) => toolProps(this.rt, id), bodyFile: mrBodyFile }) : [],
+      labels: this.opts.mr.labels,
+      labelSteps: wantMr && mrTarget ? renderLabelSteps({ order, target: mrTarget, labels: this.opts.mr.labels, services: this.rt.services, toolProps: (id) => toolProps(this.rt, id) }) : [],
       closeLoop,
       restore: restorePlan(run),
       committedSha: run.commitShas[run.commitShas.length - 1],

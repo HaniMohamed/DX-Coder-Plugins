@@ -32,7 +32,7 @@ Works on any codebase: Flutter/Dart, Kotlin/Java, Swift, JavaScript/TypeScript, 
 | `/fixora:doctor [--all] [--probe] [--tool <id>]` | Show the MCP servers and tools Fixora detects, which services it recognised, ignored legacy options, and the likely fix when a crash source is missing. `--all` lists every tool id; `--probe` has the agent make one real call per crash source and app and prints the raw reply; `--tool <id>` prints a tool's input schema. |
 | `/fixora:reset [--files]` | Forget every stored record (runs, crash index, cached crash lists, locks) after approval; `--files` also deletes `<repo>/.dxcoder/fixora`. Branches, commits, MRs and Jira tickets are never touched. Useful between test rounds. |
 | `/fixora:clean <runId> [--remote]` | Restore the checkout if a run left it on its branch, delete the local branch (and, after approval, the remote branch). |
-| `/fixora:recover [--dry-run] [--force] [--state all\|open\|merged\|closed] [--limit N] [--label fixora]` | Rebuild the run records from the merge requests Fixora opened: after a `reset`, on a new machine, or when the host's database was lost. See [Recovering runs from merge requests](#recovering-runs-from-merge-requests). |
+| `/fixora:recover [--dry-run] [--force] [--all] [--state all\|open\|merged\|closed] [--limit N] [--label fixora]` | Rebuild the run records from the merge requests Fixora opened: after a `reset`, on a new machine, or when the host's database was lost. `--all` also finds MRs that went out without the label. See [Recovering runs from merge requests](#recovering-runs-from-merge-requests). |
 
 Every verb is registered as its own command so the command palette lists them (`/fixora:status`, `/fixora:fix`, …); the long form `/fixora <verb> …` does the same thing.
 
@@ -53,7 +53,9 @@ and a footer with the run id and the fingerprint prefix; the commits carry `Fixo
 2. The plugin parses the descriptions (nothing is guessed: an MR whose title / description do not
    match Fixora's layout is listed under *Skipped*), keeps one MR per run (merged beats open beats
    closed; a restart's `-r2` branch supersedes the closed one), and skips runs already recorded unless
-   `--force`.
+   `--force`. `--all` drops the label filter and lists every merge request (narrowed to titles
+   containing *fixes crash* where the forge can search), for MRs that were opened without the label:
+   the label is never required to recognise a Fixora MR, only the title / description are.
 3. `--dry-run` shows the table and stops. Otherwise one `fixora.recover` approval precedes the write.
    Each recovered run is `done` with its MR, Jira, branch, root cause, files and review; timings,
    worker sessions, check results and the checkout state are not stored in an MR and stay empty
@@ -120,7 +122,7 @@ Steps are idempotent; `/fixora retry` resumes where a run stopped.
 | fix | agent (`fixora-fix`) | Minimal change plus a regression test in the checkout, the check commands run by the agent, then `git add -N . && git status --porcelain` and `git diff HEAD` submitted verbatim with the report. |
 | validate | plugin | Pure checks on the submitted status / diff: forbidden paths, file and line limits, secret scan, failed checks. Problems go back to the agent, up to `maxFixRounds`. |
 | review | agent (`fixora-review`) | A fresh, read-only reviewer session in the same checkout. A rejection goes back to the fixer with the findings, up to `maxReviewRounds`. |
-| publish | agent (`fixora-publish`) | After the publish decision (`fixora.publish`: one dialog for push + MR, skipped when confidence is at least `confidence.autoApprove`): the ticket, `git add -- <files>`, `git commit -F` with the prepared conventional message (`fix(<scope>): …`, `Fixora-Run` / `Fixora-Fingerprint` trailers), `git push -u` (never force, never the base branch), then the MR through the first provider that works: GitLab / GitHub MCP → `glab` / `gh` → compare URL. |
+| publish | agent (`fixora-publish`) | After the publish decision (`fixora.publish`: one dialog for push + MR, skipped when confidence is at least `confidence.autoApprove`): the ticket, `git add -- <files>`, `git commit -F` with the prepared conventional message (`fix(<scope>): …`, `Fixora-Run` / `Fixora-Fingerprint` trailers), `git push -u` (never force, never the base branch), then the MR through the first provider that works: GitLab / GitHub MCP → `glab` / `gh` → compare URL. The `mr.labels` (default `fixora`) go into the create call in the shape the tool's schema declares; when the create tool has no labels field (or it is GitHub), the agent adds them right after creation with the update tool or `glab mr update` / `gh pr edit`. |
 | close-loop | agent, inside the publish turn | Jira comment with the MR link and transition, optional note on the crash source. |
 | restore | agent, inside the publish turn | **On every exit path** (done, failed, rejected, blocked, cancelled): `git checkout <your previous branch>` and `git stash pop` of the Fixora stash. Failure paths run it as a separate step; if it fails, the final report prints the manual commands. One exception: a run that stops with its fix still uncommitted (fix timed out, checks blocked, review rejected, cancelled mid-fix) keeps the fix branch checked out and the stash untouched, so the half-done change never lands on your branch; `/fixora retry <runId> --from fix` continues there and `/fixora clean <runId>` puts your branch back. |
 

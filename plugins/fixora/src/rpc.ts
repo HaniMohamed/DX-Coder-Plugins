@@ -80,7 +80,7 @@ export const FixoraRpc = Rpc.define({
     "run.reject": { input: obj({ runId: S, gateId: S, feedback: S }, ["runId", "gateId"]), output: obj({ accepted: B }) },
     "crash.markFixed": { input: obj({ runId: S, release: S, platform: S }, ["runId", "release"]), output: obj({ ok: B }), errors: { not_found: obj({ runId: S }) } },
     "mr.sync": { input: obj({ sessionID: S }), output: obj({ updated: N }) },
-    "runs.recover": { input: obj({ sessionID: S, dryRun: B, force: B }), output: obj({ recovered: N, known: N, skipped: N, listed: N, errors: arr(S), runIds: arr(S) }, ["recovered", "errors"]) },
+    "runs.recover": { input: obj({ sessionID: S, dryRun: B, force: B, all: B }), output: obj({ recovered: N, known: N, skipped: N, listed: N, errors: arr(S), runIds: arr(S) }, ["recovered", "errors"]) },
     "report.get": { input: obj({ days: N }), output: any },
   },
   events: {
